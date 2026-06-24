@@ -57,6 +57,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
 EVENTS_ENDPOINT = os.environ.get("EVENTS_ENDPOINT", "http://governance:8000/events")
 EVENTS_TOPIC = os.environ.get("EVENTS_TOPIC", "dataset-events")
 RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
+MAX_EVENT_RECORDS = 1000  # cap the per-request reconcile fan-out (the endpoint is unauthenticated)
 # Short timeouts: notification wiring is best-effort; the reconcile timer (Stage 3) is the
 # authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
@@ -94,7 +95,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 _jwks = jwt.PyJWKClient(KEYCLOAK_JWKS)
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)  # Flask defaults app.logger to WARNING when debug=off
+POOL_MAX = 16
 _pool = None
+# ThreadedConnectionPool.getconn() RAISES when exhausted rather than waiting; the dev server
+# spawns unbounded request threads. This semaphore bounds concurrent borrowers to POOL_MAX so
+# an event/request burst degrades to latency, not 500s.
+_db_gate = threading.BoundedSemaphore(POOL_MAX)
 
 
 def connect_pool(retries=30, delay=1):
@@ -103,9 +109,7 @@ def connect_pool(retries=30, delay=1):
     last = None
     for _ in range(retries):
         try:
-            # Headroom over the dev server's threads + the reconcile timer; getconn raises
-            # (doesn't block) when exhausted, so size above realistic concurrency.
-            _pool = ThreadedConnectionPool(1, 16, dsn=DB_DSN)
+            _pool = ThreadedConnectionPool(1, POOL_MAX, dsn=DB_DSN)
             return
         except psycopg2.OperationalError as e:  # noqa: PERF203
             last = e
@@ -116,18 +120,19 @@ def connect_pool(retries=30, delay=1):
 
 @contextmanager
 def db(commit=False):
-    """A pooled connection + RealDict cursor. Per-operation, thread-safe (request threads
-    and the reconcile timer all borrow from the pool)."""
-    conn = _pool.getconn()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            yield cur
-        conn.commit() if commit else conn.rollback()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        _pool.putconn(conn)
+    """A pooled connection + RealDict cursor. Per-operation, thread-safe (request threads and
+    the reconcile timer all borrow from the pool); the gate bounds concurrency to the pool."""
+    with _db_gate:
+        conn = _pool.getconn()
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                yield cur
+            conn.commit() if commit else conn.rollback()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            _pool.putconn(conn)
 
 
 def init_db():
@@ -235,10 +240,10 @@ def _confined_prefix(prefix):
 
 
 def ensure_notifications():
-    """Wire RGW to push object create/remove events under datasets/ to our /events.
-    Best-effort + idempotent: governance owns freshness, so it configures its own event
-    subscription. If RGW lacks the notifications API, log and fall back to the reconcile
-    timer (Stage 3) — never crash startup."""
+    """Wire RGW to push object create/remove events under datasets/ to our /events. Returns
+    True if wired. Best-effort + idempotent: governance configures its own subscription; if
+    RGW isn't ready / lacks the notifications API, return False (the timer reconciles anyway,
+    and reconcile_loop re-arms) — never crash startup."""
     try:
         sns = boto3.client("sns", endpoint_url=RGW_ENDPOINT, aws_access_key_id=RGW_KEY,
                            aws_secret_access_key=RGW_SECRET, region_name="us-east-1",
@@ -256,8 +261,10 @@ def ensure_notifications():
             }]},
         )
         app.logger.info("RGW notifications wired: topic=%s -> %s", arn, EVENTS_ENDPOINT)
+        return True
     except Exception as e:  # noqa: BLE001
         app.logger.warning("RGW notification wiring failed (timer will still reconcile): %s", e)
+        return False
 
 
 # Lifecycle, expressed in SQL so the status transition reads `status` at write time under
@@ -312,23 +319,14 @@ def reconcile(name=None):
                             row["name"], r["old"], r["new"], count)
 
 
-def _dataset_for_key(key):
-    """The longest registered prefix the object key falls under (disambiguates nested
-    prefixes like datasets/projx/ vs datasets/projx/public/)."""
-    best = None
-    with db() as cur:
-        cur.execute("SELECT name, prefix FROM datasets")
-        for r in cur.fetchall():
-            if key.startswith(r["prefix"]) and (best is None or len(r["prefix"]) > len(best[1])):
-                best = (r["name"], r["prefix"])
-    return best[0] if best else None
-
-
-def reconcile_loop():
+def reconcile_loop(armed=False):
     """Periodic full sweep — convergence. Catches anything events missed (events are a
-    latency optimization, not the authority)."""
+    latency optimization, not the authority). Also re-arms the RGW subscription if it
+    didn't take at startup (e.g. RGW wasn't ready yet)."""
     while True:
         time.sleep(RECONCILE_INTERVAL)
+        if not armed:
+            armed = ensure_notifications()
         try:
             reconcile()
         except Exception as e:  # noqa: BLE001
@@ -366,14 +364,18 @@ def events():
     # reconcile, which reads storage truth itself; a missed/forged event is harmless and
     # self-heals on the next timer sweep. Unauthenticated by design (trusted-network dev).
     body = request.get_json(silent=True) or {}
-    records = body.get("Records", [])
+    records = body.get("Records", [])[:MAX_EVENT_RECORDS]  # bound the fan-out
+    with db() as cur:  # the registry once, not once per record
+        cur.execute("SELECT name, prefix FROM datasets")
+        registry = [(r["name"], r["prefix"]) for r in cur.fetchall()]
     touched = set()
     for rec in records:
         key = rec.get("s3", {}).get("object", {}).get("key", "")
         app.logger.info("EVENT %s key=%s", rec.get("eventName", "?"), key)
-        ds = _dataset_for_key(key)
-        if ds:
-            touched.add(ds)
+        # longest registered prefix the key falls under (disambiguates nested prefixes)
+        match = max((p for p in registry if key.startswith(p[1])), key=lambda p: len(p[1]), default=None)
+        if match:
+            touched.add(match[0])
         else:
             app.logger.info("EVENT key=%s is ungoverned (no registered dataset)", key)
     for ds in touched:
@@ -458,12 +460,12 @@ def discover():
 if __name__ == "__main__":
     connect_pool()
     init_db()
-    ensure_notifications()    # best-effort; the reconcile timer is the authority
+    armed = ensure_notifications()  # best-effort; the reconcile timer is the authority
     try:
         reconcile()           # startup sweep: classify seeded datasets (pending -> live/gone)
     except Exception as e:    # noqa: BLE001 — RGW trouble must not abort boot; the timer retries
         app.logger.warning("startup reconcile failed: %s", e)
-    threading.Thread(target=reconcile_loop, daemon=True).start()
+    threading.Thread(target=reconcile_loop, kwargs={"armed": armed}, daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
     # owns a connection pool and a single reconcile timer thread.
     app.run(host="0.0.0.0", port=8000, use_reloader=False)

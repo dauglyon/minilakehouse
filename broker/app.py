@@ -126,7 +126,7 @@ def vend():
 
     if not opa_allows(subject, groups, dataset):
         app.logger.info("DENY subject=%s groups=%s dataset=%s", subject, groups, dataset)
-        return jsonify({"error": "forbidden", "subject": subject, "dataset": dataset}), 403
+        return jsonify({"error": "forbidden"}), 403
 
     cr = _sts.assume_role(
         RoleArn=BLOB_ROLE_ARN, RoleSessionName=f"blob-{subject}"[:32],

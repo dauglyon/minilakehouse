@@ -44,8 +44,10 @@ SERVICE_PRINCIPAL = os.environ.get("SERVICE_PRINCIPAL", "trino_svc")
 AUDIENCE = os.environ.get("AUDIENCE", "polaris")
 KC_BASE = os.environ.get("KC_BASE", "")
 KC_REALM = os.environ.get("KC_REALM", "lakehouse")
-KC_ADMIN = os.environ.get("KC_ADMIN", "admin")
-KC_ADMIN_PASSWORD = os.environ.get("KC_ADMIN_PASSWORD", "admin")
+# A realm-scoped service account (has only `view-users` — NOT realm/master admin), used to
+# read the asserted user's group membership.
+SHIM_KC_CLIENT_ID = os.environ.get("SHIM_KC_CLIENT_ID", "idp-shim")
+SHIM_KC_SECRET = os.environ.get("SHIM_KC_SECRET", "")
 SHIM_TTL = int(os.environ.get("SHIM_TTL", "3600"))  # minted-token lifetime (seconds)
 KEY_PATH = os.environ.get("SHIM_KEY_PATH", "/keys/shim-key.pem")
 
@@ -106,6 +108,22 @@ _JWK = {
 }
 
 app = Flask(__name__)
+_kc = {"token": None, "exp": 0}  # cached service-account token
+
+
+def _kc_admin_token() -> str:
+    """Cached client-credentials token for the realm-scoped `idp-shim` service account
+    (view-users only). Refreshed shortly before expiry — not re-fetched per exchange."""
+    now = int(time.time())
+    if not _kc["token"] or now >= _kc["exp"]:
+        r = requests.post(
+            f"{KC_BASE}/realms/{KC_REALM}/protocol/openid-connect/token",
+            data={"grant_type": "client_credentials", "client_id": SHIM_KC_CLIENT_ID,
+                  "client_secret": SHIM_KC_SECRET}, timeout=5)
+        r.raise_for_status()
+        tok = r.json()
+        _kc["token"], _kc["exp"] = tok["access_token"], now + tok.get("expires_in", 60) - 30
+    return _kc["token"]
 
 
 def lookup_groups(username: str) -> list:
@@ -113,30 +131,13 @@ def lookup_groups(username: str) -> list:
     if not KC_BASE:
         return []
     try:
-        tok = requests.post(
-            f"{KC_BASE}/realms/master/protocol/openid-connect/token",
-            data={
-                "grant_type": "password",
-                "client_id": "admin-cli",
-                "username": KC_ADMIN,
-                "password": KC_ADMIN_PASSWORD,
-            },
-            timeout=5,
-        ).json()["access_token"]
-        h = {"Authorization": f"Bearer {tok}"}
-        users = requests.get(
-            f"{KC_BASE}/admin/realms/{KC_REALM}/users",
-            params={"username": username, "exact": "true"},
-            headers=h,
-            timeout=5,
-        ).json()
+        h = {"Authorization": f"Bearer {_kc_admin_token()}"}
+        users = requests.get(f"{KC_BASE}/admin/realms/{KC_REALM}/users",
+                             params={"username": username, "exact": "true"}, headers=h, timeout=5).json()
         if not users:
             return []
-        groups = requests.get(
-            f"{KC_BASE}/admin/realms/{KC_REALM}/users/{users[0]['id']}/groups",
-            headers=h,
-            timeout=5,
-        ).json()
+        groups = requests.get(f"{KC_BASE}/admin/realms/{KC_REALM}/users/{users[0]['id']}/groups",
+                              headers=h, timeout=5).json()
         return [g["name"] for g in groups]
     except Exception as e:  # noqa: BLE001 - best effort
         app.logger.warning("group lookup failed for %s: %s", username, e)

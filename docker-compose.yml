@@ -1,6 +1,6 @@
-# minilakehouse — Phase 0 spine (Flow B: OPA-gated Iceberg table access).
-# Stage A config: Polaris authentication=internal, authorization=opa (allow-all),
-# storage in static-cred mode (stsUnavailable). Stages B/C/D edit this file in place.
+# minilakehouse — a unified lakehouse PDP. One policy brain (OPA); every other service
+# either asks OPA (PEP) or obeys a credential it gated (vending). Flows A (discovery),
+# B (Iceberg tables via Trino->Polaris->OPA->RGW STS), C (blob datasets via the broker).
 
 services:
 
@@ -126,8 +126,9 @@ services:
       AUDIENCE: ${POLARIS_CLIENT_ID}
       KC_BASE: http://keycloak:8080
       KC_REALM: ${KC_REALM}
-      KC_ADMIN: ${KC_ADMIN}
-      KC_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+      # Realm-scoped service account (view-users only) for group lookup — NOT master admin.
+      SHIM_KC_CLIENT_ID: idp-shim
+      SHIM_KC_SECRET: ${SHIM_KC_SECRET}
     volumes:
       # Persist the signing key so a shim restart doesn't rotate it (which would invalidate
       # every token Trino holds + Polaris's cached JWKS, breaking the table plane).
@@ -254,7 +255,7 @@ services:
       polaris.oidc.principal-mapper.name-claim-path: principal_name
       polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
       polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
-      # --- authz: OPA from first boot, allow-all policy in Stage A ---
+      # --- authz: delegated to OPA (deny-by-default policy, served by governance) ---
       polaris.authorization.type: opa
       polaris.authorization.opa.policy-uri: http://opa:8181/v1/data/polaris/authz
       polaris.authorization.opa.auth.type: none
