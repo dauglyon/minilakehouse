@@ -73,3 +73,14 @@ JSON
 )
 echo ">>> ensuring role ${BLOB_ROLE}"
 ensure_role "$BLOB_ROLE" "$BLOB_TRUST" blobread "$BLOB_PERM"
+
+# --- Governance reader: a least-privilege S3 user the governance service uses to LIST
+# dataset prefixes (reconcile). It holds no rights of its own; the rgw-setup one-shot grants
+# it ListBucket on datasets/* via a bucket policy. So governance never holds the admin key. ---
+GR_UID="${GOVERNANCE_READER_UID:-governance-reader}"
+GR_KEY="${GOVERNANCE_READER_KEY:-governance-reader}"
+GR_SECRET="${GOVERNANCE_READER_SECRET:-governance-reader-secret}"
+echo ">>> ensuring reader user ${GR_UID}"
+radosgw-admin user info --uid="$GR_UID" >/dev/null 2>&1 \
+  || radosgw-admin user create --uid="$GR_UID" --display-name="Governance Reader" \
+       --access-key="$GR_KEY" --secret-key="$GR_SECRET"

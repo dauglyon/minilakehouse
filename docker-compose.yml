@@ -54,6 +54,23 @@ services:
         SELECT 'CREATE DATABASE governance' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'governance')\gexec
         EOSQL
 
+  rgw-setup:
+    # One-shot, admin-credentialed RGW config so the long-lived governance service never
+    # holds the admin key: grants governance-reader ListBucket on datasets/* (bucket policy)
+    # and wires bucket notifications -> governance /events. See governance/rgw_setup.py.
+    build: ./governance
+    depends_on:
+      ceph-setup:
+        condition: service_completed_successfully
+    environment:
+      RGW_ENDPOINT: http://ceph:8080
+      RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
+      RGW_SECRET_KEY: ${RGW_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      GOVERNANCE_READER_UID: governance-reader
+      EVENTS_ENDPOINT: http://governance:8000/events
+    command: ["python", "rgw_setup.py"]
+
   governance:
     # The PAP + dataset registry. Single source of truth: owns the registry + all grants
     # in a durable Postgres database, publishes them to OPA as a bundle, serves discovery
@@ -66,7 +83,7 @@ services:
         condition: service_healthy
       governance-bootstrap:
         condition: service_completed_successfully
-      ceph-setup:
+      rgw-setup:
         condition: service_completed_successfully
     environment:
       POLICY_DIR: /policies
@@ -75,14 +92,11 @@ services:
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
-      # Storage + freshness (Phase 3): governance lists dataset prefixes and wires its own
-      # RGW event subscription. Admin key here is for notification setup; Stage 3 adds a
-      # least-priv governance-reader for the reconcile lister.
+      # Least-privilege reader (ListBucket on datasets/* only) — NOT the RGW admin key.
       RGW_ENDPOINT: http://ceph:8080
-      RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
-      RGW_SECRET_KEY: ${RGW_SECRET_KEY}
+      RGW_ACCESS_KEY: ${GOVERNANCE_READER_KEY}
+      RGW_SECRET_KEY: ${GOVERNANCE_READER_SECRET}
       S3_BUCKET: ${S3_BUCKET}
-      EVENTS_ENDPOINT: http://governance:8000/events
     volumes:
       - ./opa:/policies:ro
       - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)

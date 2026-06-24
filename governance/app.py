@@ -49,15 +49,16 @@ REGO_FILES = ["policy.rego", "blob.rego"]
 # Both come from an authenticated steward but are still untrusted input — constrain them.
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
-# --- Storage / freshness (Phase 3) ---
+# --- Storage / freshness ---
+# Least-privilege reader creds (ListBucket on datasets/* via a bucket policy set by the
+# rgw-setup one-shot). Governance does NOT hold the RGW admin key; reconcile only lists.
 RGW_ENDPOINT = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
 RGW_KEY = os.environ.get("RGW_ACCESS_KEY", "")
 RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
-EVENTS_ENDPOINT = os.environ.get("EVENTS_ENDPOINT", "http://governance:8000/events")
-EVENTS_TOPIC = os.environ.get("EVENTS_TOPIC", "dataset-events")
 RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
 MAX_EVENT_RECORDS = 1000  # cap the per-request reconcile fan-out (the endpoint is unauthenticated)
+SEED_LOCK_KEY = 0x6D6C68  # advisory-lock key for the one-time registry seed ("mlh")
 # Short timeouts: notification wiring is best-effort; the reconcile timer (Stage 3) is the
 # authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
@@ -141,6 +142,8 @@ def init_db():
     with db(commit=True) as cur:
         cur.execute(SCHEMA)
     with db(commit=True) as cur:
+        # Serialize the check-then-seed so two instances starting together can't both seed.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (SEED_LOCK_KEY,))
         cur.execute("SELECT count(*) AS n FROM datasets")
         if cur.fetchone()["n"]:
             return
@@ -239,34 +242,6 @@ def _confined_prefix(prefix):
             and ".." not in prefix and "//" not in prefix)
 
 
-def ensure_notifications():
-    """Wire RGW to push object create/remove events under datasets/ to our /events. Returns
-    True if wired. Best-effort + idempotent: governance configures its own subscription; if
-    RGW isn't ready / lacks the notifications API, return False (the timer reconciles anyway,
-    and reconcile_loop re-arms) — never crash startup."""
-    try:
-        sns = boto3.client("sns", endpoint_url=RGW_ENDPOINT, aws_access_key_id=RGW_KEY,
-                           aws_secret_access_key=RGW_SECRET, region_name="us-east-1",
-                           config=_boto_cfg)
-        # RGW carries the HTTP push target in the topic's attributes.
-        arn = sns.create_topic(Name=EVENTS_TOPIC,
-                               Attributes={"push-endpoint": EVENTS_ENDPOINT})["TopicArn"]
-        _s3.put_bucket_notification_configuration(
-            Bucket=S3_BUCKET,
-            NotificationConfiguration={"TopicConfigurations": [{
-                "Id": "dataset-freshness",
-                "TopicArn": arn,
-                "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "datasets/"}]}},
-            }]},
-        )
-        app.logger.info("RGW notifications wired: topic=%s -> %s", arn, EVENTS_ENDPOINT)
-        return True
-    except Exception as e:  # noqa: BLE001
-        app.logger.warning("RGW notification wiring failed (timer will still reconcile): %s", e)
-        return False
-
-
 # Lifecycle, expressed in SQL so the status transition reads `status` at write time under
 # the row lock — no read-modify-write window where a concurrent reconcile (timer vs event)
 # loses the update or resurrects a gone dataset. Non-empty => live; empty => gone ONLY if it
@@ -319,14 +294,11 @@ def reconcile(name=None):
                             row["name"], r["old"], r["new"], count)
 
 
-def reconcile_loop(armed=False):
+def reconcile_loop():
     """Periodic full sweep — convergence. Catches anything events missed (events are a
-    latency optimization, not the authority). Also re-arms the RGW subscription if it
-    didn't take at startup (e.g. RGW wasn't ready yet)."""
+    latency optimization, not the authority)."""
     while True:
         time.sleep(RECONCILE_INTERVAL)
-        if not armed:
-            armed = ensure_notifications()
         try:
             reconcile()
         except Exception as e:  # noqa: BLE001
@@ -460,12 +432,11 @@ def discover():
 if __name__ == "__main__":
     connect_pool()
     init_db()
-    armed = ensure_notifications()  # best-effort; the reconcile timer is the authority
     try:
         reconcile()           # startup sweep: classify seeded datasets (pending -> live/gone)
     except Exception as e:    # noqa: BLE001 — RGW trouble must not abort boot; the timer retries
         app.logger.warning("startup reconcile failed: %s", e)
-    threading.Thread(target=reconcile_loop, kwargs={"armed": armed}, daemon=True).start()
+    threading.Thread(target=reconcile_loop, daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
     # owns a connection pool and a single reconcile timer thread.
     app.run(host="0.0.0.0", port=8000, use_reloader=False)
