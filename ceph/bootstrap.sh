@@ -6,9 +6,8 @@
 # against this RGW image). The bucket is created by the RGW admin user whose key
 # Polaris holds via AWS_ACCESS_KEY_ID/SECRET while storage is in static-cred mode.
 #
-# The Stage D STS portion (radosgw-admin role + policies, rgw_s3_auth_use_sts) runs
-# *inside* the ceph container (radosgw-admin is not in this client image) and is
-# added when Stage D is reached.
+# The STS portion (radosgw-admin roles + policies, rgw_s3_auth_use_sts) runs *inside* the
+# ceph container — radosgw-admin is not in this client image. See ceph/sts-bootstrap.sh.
 set -e
 
 mc alias set rgw "${MC_ENDPOINT}" "${MC_ACCESS_KEY}" "${MC_SECRET_KEY}"

@@ -5,24 +5,17 @@ package lakehouse.blob
 # never an enumerator. The broker already holds the dataset→prefix mapping (its registry)
 # and binds the prefix into the vended credential's session policy itself.
 #
-# Input:  {subject, groups, action: "read", dataset: "<name>"}
+# Input:  {subject, groups, action, dataset: "<name>"}
 # Output: allow = true|false
 #
-# Grants live in data.dataset_grants (opa/blob-data.json), published by governance.
+# Grants are group-based and published by governance in data.dataset_grants.groups (the
+# broker passes the user's REAL groups, since the client presented its own token).
 
 import future.keywords.if
 import future.keywords.in
 
 default allow := false
 
-# Granted directly to the subject.
-allow if {
-	input.dataset in object.get(data.dataset_grants.users, input.subject, [])
-}
-
-# Granted to one of the subject's groups. The broker can pass the user's REAL groups
-# here because the client presented its own token (unlike the Polaris path, where Polaris
-# filtered token groups against its grants).
 allow if {
 	some g in input.groups
 	input.dataset in object.get(data.dataset_grants.groups, g, [])
@@ -33,10 +26,6 @@ allow if {
 # (visible == true, allow == false) — the see-but-not-read model. Discovery (governance)
 # calls this per registry entry; OPA never enumerates.
 default visible := false
-
-visible if {
-	input.dataset in object.get(data.visibility_grants.users, input.subject, [])
-}
 
 visible if {
 	some g in input.groups
@@ -51,6 +40,5 @@ visible if {
 default allow_register := false
 
 allow_register if {
-	some g in input.groups
-	g == "stewards"
+	"stewards" in input.groups
 }

@@ -17,6 +17,8 @@ Flow:
 """
 import json
 import os
+import re
+from urllib.parse import quote
 
 import boto3
 import jwt
@@ -26,6 +28,7 @@ from flask import Flask, jsonify, request
 
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
+EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
 OPA_URL = os.environ["OPA_URL"]
 RGW_ENDPOINT = os.environ["RGW_ENDPOINT"]
 BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
@@ -34,8 +37,10 @@ BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
 GOVERNANCE_URL = os.environ["GOVERNANCE_URL"]
 TTL = int(os.environ.get("CRED_TTL_SECONDS", "900"))
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 _jwks = jwt.PyJWKClient(KEYCLOAK_JWKS)
+_http = requests.Session()
 _sts = boto3.client(
     "sts", endpoint_url=RGW_ENDPOINT, aws_access_key_id=BROKER_KEY,
     aws_secret_access_key=BROKER_SECRET, region_name="us-east-1",
@@ -46,19 +51,34 @@ app = Flask(__name__)
 
 
 def verify_user(token):
-    """Cryptographically verify the user's own Keycloak token. Returns (subject, groups)."""
+    """Cryptographically verify the caller's own Keycloak token -> (subject, groups). PyJWT
+    enforces signature + exp; we add issuer and azp (the token must have been issued through
+    our login client, not some other realm client)."""
     key = _jwks.get_signing_key_from_jwt(token).key
-    claims = jwt.decode(
-        token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
-        options={"verify_aud": False},  # broker accepts any audience from this realm
-    )
+    claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
+                        options={"verify_aud": False})
+    if claims.get("azp") != EXPECTED_AZP:
+        raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
     subject = claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
     groups = claims.get("principal_roles") or claims.get("groups") or []
     return subject, groups
 
 
+def authed_user():
+    """Verify the request's bearer token. Returns (subject, groups, None) on success, or
+    (None, None, error_response) for the caller to return as-is."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, None, (jsonify({"error": "missing bearer token"}), 401)
+    try:
+        return (*verify_user(auth[7:]), None)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("token verification failed: %s", e)
+        return None, None, (jsonify({"error": "invalid token"}), 401)
+
+
 def opa_allows(subject, groups, dataset):
-    r = requests.post(OPA_URL, json={"input": {
+    r = _http.post(OPA_URL, json={"input": {
         "subject": subject, "groups": groups, "action": "read", "dataset": dataset,
     }}, timeout=5)
     r.raise_for_status()
@@ -66,8 +86,10 @@ def opa_allows(subject, groups, dataset):
 
 
 def resolve_prefix(dataset):
-    """Resolve dataset -> prefix from the governance registry (single source of truth)."""
-    r = requests.get(f"{GOVERNANCE_URL}/datasets/{dataset}", timeout=5)
+    """Resolve dataset -> prefix from the governance registry (single source of truth).
+    The name is URL-encoded so it can't traverse to other governance routes (it's caller
+    input)."""
+    r = _http.get(f"{GOVERNANCE_URL}/datasets/{quote(dataset, safe='')}", timeout=5)
     if r.status_code == 404:
         return None
     r.raise_for_status()
@@ -91,16 +113,13 @@ def health():
 
 @app.post("/vend")
 def vend():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "missing bearer token"}), 401
-    try:
-        subject, groups = verify_user(auth[7:])
-    except Exception as e:  # noqa: BLE001
-        app.logger.warning("token verification failed: %s", e)
-        return jsonify({"error": "invalid token"}), 401
+    subject, groups, err = authed_user()
+    if err:
+        return err
 
     dataset = (request.get_json(silent=True) or {}).get("dataset")
+    if not isinstance(dataset, str) or not NAME_RE.match(dataset):
+        return jsonify({"error": "invalid dataset name"}), 400
     prefix = resolve_prefix(dataset)
     if prefix is None:
         return jsonify({"error": f"unknown dataset {dataset!r}"}), 404

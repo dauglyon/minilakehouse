@@ -1,34 +1,26 @@
 """
-governance — the PAP + dataset registry. The single source of truth (Postgres-backed).
+governance — the PAP + dataset registry, and the single source of truth (Postgres-backed).
 
-It is the descendant of minio_manager_service, but instead of mirroring policy into
-backends it FEEDS OPA: it owns the dataset registry + all grants and publishes them to
-OPA as a **bundle** (OPA pulls it). Durable, transactional state lives in a dedicated
-`governance` Postgres database (created by the governance-bootstrap one-shot, schema +
-seed managed here). It serves:
-  - /bundle.tar.gz  — the OPA bundle (rego policies + data derived from the registry)
-  - /discover       — Flow A: the metadata-VISIBILITY plane ("what exists that I could
-                      request"), filtered through OPA per-entry. Returns names, never bytes.
-  - /datasets/<n>   — dataset -> prefix, for the broker (single-sourced registry).
+It owns the dataset registry + all grants and FEEDS OPA a bundle (OPA pulls it); it does
+not mirror policy into backends. Durable state lives in a dedicated `governance` Postgres DB.
 
-Two truths, reconciled not merged (Phase 3): storage is truth for existence/stats; the
-registry is truth for meaning/grants. The `datasets` row carries both column groups, but
-they are written by disjoint paths — meaning/grants by ingest+seed, existence/stats by
-reconcile (added in Stage 3). The bundle is built from meaning/grants ONLY, so storage
-churn never moves OPA.
+Two truths, reconciled not merged: storage is truth for existence/stats; the registry is
+truth for meaning/grants. The `datasets` row carries both, written by disjoint paths —
+meaning/grants by ingest+seed, existence/stats by reconcile. The bundle is built from
+meaning/grants ONLY, so storage churn never moves OPA.
 
-Two permission planes live per dataset as separate grant sets:
-  visibility (may you SEE it exists)  vs  access (may you READ the bytes).
-So a dataset can be see-but-not-read (the Lake Formation model).
+Two permission planes per dataset, as separate grant sets: visibility (may you SEE it
+exists) vs access (may you READ the bytes) — so a dataset can be see-but-not-read.
 
-OPA is only ever a PREDICATE here: discovery enumerates the registry and asks OPA
-"may S see dataset X?" per entry. OPA never returns a list.
+OPA is only ever a PREDICATE: discovery enumerates the registry and asks OPA "may S see
+dataset X?" per entry. OPA never returns a list.
 """
 import gzip
 import io
 import json
 import logging
 import os
+import re
 import tarfile
 import threading
 import time
@@ -49,7 +41,13 @@ OPA_BASE = os.environ.get("OPA_BASE", "http://opa:8181")
 DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
+# Only tokens issued THROUGH our login client are accepted (azp), so a token minted for some
+# other realm client can't be replayed here as a user credential.
+EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
 REGO_FILES = ["policy.rego", "blob.rego"]
+# A dataset name is a bundle/JSON key and a SQL pk; a prefix becomes an STS resource ARN.
+# Both come from an authenticated steward but are still untrusted input — constrain them.
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 # --- Storage / freshness (Phase 3) ---
 RGW_ENDPOINT = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
@@ -63,8 +61,12 @@ RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
 # authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
                    retries={"max_attempts": 2})
+# One reusable client/session each (thread-safe), instead of rebuilding per reconcile/poll.
+_s3 = boto3.client("s3", endpoint_url=RGW_ENDPOINT, aws_access_key_id=RGW_KEY,
+                   aws_secret_access_key=RGW_SECRET, region_name="us-east-1", config=_boto_cfg)
+_http = requests.Session()
 
-# Full schema up front (incl. the existence/stats columns reconcile fills in Stage 3) so
+# Full schema up front (incl. the existence/stats columns reconcile fills in) so
 # CREATE TABLE IF NOT EXISTS never has to ALTER a table on an already-persisted volume.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
@@ -101,7 +103,9 @@ def connect_pool(retries=30, delay=1):
     last = None
     for _ in range(retries):
         try:
-            _pool = ThreadedConnectionPool(1, 8, dsn=DB_DSN)
+            # Headroom over the dev server's threads + the reconcile timer; getconn raises
+            # (doesn't block) when exhausted, so size above realistic concurrency.
+            _pool = ThreadedConnectionPool(1, 16, dsn=DB_DSN)
             return
         except psycopg2.OperationalError as e:  # noqa: PERF203
             last = e
@@ -113,7 +117,7 @@ def connect_pool(retries=30, delay=1):
 @contextmanager
 def db(commit=False):
     """A pooled connection + RealDict cursor. Per-operation, thread-safe (request threads
-    and, in Stage 3, the reconcile timer all borrow from the pool)."""
+    and the reconcile timer all borrow from the pool)."""
     conn = _pool.getconn()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -170,8 +174,8 @@ def derive_data():
     return {
         "grants": tg["grants"],
         "writers": tg["writers"],
-        "dataset_grants": {"groups": access_groups, "users": {}},
-        "visibility_grants": {"groups": vis_groups, "users": {}},
+        "dataset_grants": {"groups": access_groups},
+        "visibility_grants": {"groups": vis_groups},
     }
 
 
@@ -189,26 +193,45 @@ def build_bundle():
 
 
 def verify_user(token):
+    """Cryptographically verify the caller's own Keycloak token -> (subject, groups). PyJWT
+    enforces signature + exp; we add issuer and azp (the token must have been issued through
+    our login client, not some other realm client)."""
     key = _jwks.get_signing_key_from_jwt(token).key
     claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
                         options={"verify_aud": False})
+    if claims.get("azp") != EXPECTED_AZP:
+        raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
     subject = claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
     groups = claims.get("principal_roles") or claims.get("groups") or []
     return subject, groups
 
 
-def opa_pred(rule, subject, groups, dataset):
-    r = requests.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": {
-        "subject": subject, "groups": groups, "action": "read", "dataset": dataset,
+def authed_user():
+    """Verify the request's bearer token. Returns (subject, groups, None) on success, or
+    (None, None, error_response) for the caller to return as-is."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, None, (jsonify({"error": "missing bearer token"}), 401)
+    try:
+        return (*verify_user(auth[7:]), None)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("token verification failed: %s", e)
+        return None, None, (jsonify({"error": "invalid token"}), 401)
+
+
+def opa_pred(rule, subject, groups, dataset, action="read"):
+    r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": {
+        "subject": subject, "groups": groups, "action": action, "dataset": dataset,
     }}, timeout=5)
     r.raise_for_status()
     return r.json().get("result") is True
 
 
-def _s3():
-    return boto3.client("s3", endpoint_url=RGW_ENDPOINT, aws_access_key_id=RGW_KEY,
-                        aws_secret_access_key=RGW_SECRET, region_name="us-east-1",
-                        config=_boto_cfg)
+def _confined_prefix(prefix):
+    """A registrable prefix: under datasets/<segment>/, ends in /, no traversal/escape."""
+    return (isinstance(prefix, str) and prefix.startswith("datasets/")
+            and prefix.endswith("/") and prefix != "datasets/"
+            and ".." not in prefix and "//" not in prefix)
 
 
 def ensure_notifications():
@@ -223,7 +246,7 @@ def ensure_notifications():
         # RGW carries the HTTP push target in the topic's attributes.
         arn = sns.create_topic(Name=EVENTS_TOPIC,
                                Attributes={"push-endpoint": EVENTS_ENDPOINT})["TopicArn"]
-        _s3().put_bucket_notification_configuration(
+        _s3.put_bucket_notification_configuration(
             Bucket=S3_BUCKET,
             NotificationConfiguration={"TopicConfigurations": [{
                 "Id": "dataset-freshness",
@@ -237,10 +260,27 @@ def ensure_notifications():
         app.logger.warning("RGW notification wiring failed (timer will still reconcile): %s", e)
 
 
-def _stat_prefix(s3, prefix):
+# Lifecycle, expressed in SQL so the status transition reads `status` at write time under
+# the row lock — no read-modify-write window where a concurrent reconcile (timer vs event)
+# loses the update or resurrects a gone dataset. Non-empty => live; empty => gone ONLY if it
+# was live (was-populated-now-empty), else unchanged (pending stays pending, gone stays gone).
+_RECONCILE_SQL = """
+WITH prev AS (SELECT status AS old FROM datasets WHERE name = %(n)s FOR UPDATE)
+UPDATE datasets d SET
+    status = CASE WHEN %(c)s > 0 THEN 'live'
+                  WHEN d.status = 'live' THEN 'gone'
+                  ELSE d.status END,
+    object_count = %(c)s, total_bytes = %(t)s,
+    last_modified = %(m)s, last_reconciled = now()
+FROM prev WHERE d.name = %(n)s
+RETURNING prev.old AS old, d.status AS new
+"""
+
+
+def _stat_prefix(prefix):
     """List a dataset's prefix; stats come straight from the listing (no GetObject)."""
     count, total, last = 0, 0, None
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
+    for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for o in page.get("Contents", []):
             count += 1
             total += o["Size"]
@@ -249,44 +289,27 @@ def _stat_prefix(s3, prefix):
     return count, total, last
 
 
-def _next_status(current, count):
-    """Lifecycle: any non-empty prefix is live. An EMPTY prefix is `gone` ONLY if it was
-    live (was-populated-now-empty); a never-populated dataset stays `pending`, and a `gone`
-    one stays gone. So new/empty != dead, and discovery never advertises a dead dataset."""
-    if count > 0:
-        return "live"
-    if current == "live":
-        return "gone"
-    return current
-
-
 def reconcile(name=None):
     """The ONLY writer of the existence/stats columns. With `name`: just that dataset (the
     event path). Without: a full sweep (the timer). Storage is the truth here; the registry
     grants are untouched, so reconcile never moves OPA."""
     with db() as cur:
-        if name:
-            cur.execute("SELECT name, prefix, status FROM datasets WHERE name = %s", (name,))
-        else:
-            cur.execute("SELECT name, prefix, status FROM datasets")
+        # name=None => full sweep (NULL IS NULL matches every row); else just that dataset.
+        cur.execute("SELECT name, prefix FROM datasets WHERE (%s IS NULL OR name = %s)",
+                    (name, name))
         rows = cur.fetchall()
-    s3 = _s3()
     for row in rows:
         try:
-            count, total, last = _stat_prefix(s3, row["prefix"])
+            count, total, last = _stat_prefix(row["prefix"])
         except Exception as e:  # noqa: BLE001
             app.logger.warning("reconcile %s: list failed: %s", row["name"], e)
             continue
-        status = _next_status(row["status"], count)
         with db(commit=True) as cur:
-            cur.execute(
-                "UPDATE datasets SET status=%s, object_count=%s, total_bytes=%s, "
-                "last_modified=%s, last_reconciled=now() WHERE name=%s",
-                (status, count, total, last, row["name"]),
-            )
-        if status != row["status"]:
+            cur.execute(_RECONCILE_SQL, {"n": row["name"], "c": count, "t": total, "m": last})
+            r = cur.fetchone()
+        if r and r["old"] != r["new"]:
             app.logger.info("reconcile %s: %s -> %s (count=%s)",
-                            row["name"], row["status"], status, count)
+                            row["name"], r["old"], r["new"], count)
 
 
 def _dataset_for_key(key):
@@ -340,9 +363,8 @@ def dataset(name):
 @app.post("/events")
 def events():
     # RGW bucket-notification sink. Events carry NO authority — they only TRIGGER a
-    # reconcile (Stage 3), which reads storage truth itself; a missed/forged event is
-    # harmless and self-heals on the next timer sweep. Unauthenticated by design
-    # (trusted-network dev assumption). Stage 2: log; Stage 3: dispatch reconcile.
+    # reconcile, which reads storage truth itself; a missed/forged event is harmless and
+    # self-heals on the next timer sweep. Unauthenticated by design (trusted-network dev).
     body = request.get_json(silent=True) or {}
     records = body.get("Records", [])
     touched = set()
@@ -364,26 +386,31 @@ def register_dataset():
     # Register-at-ingest: a NEW dataset enters the registry with its human-supplied meaning
     # (name, prefix, description, grants). authN = the caller's own token; authZ = OPA
     # (the `stewards` capability lives in the published bundle, not hardcoded here).
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "missing bearer token"}), 401
-    try:
-        subject, groups = verify_user(auth[7:])
-    except Exception as e:  # noqa: BLE001
-        app.logger.warning("token verification failed: %s", e)
-        return jsonify({"error": "invalid token"}), 401
+    subject, groups, err = authed_user()
+    if err:
+        return err
 
     body = request.get_json(silent=True) or {}
     name, prefix = body.get("name"), body.get("prefix")
-    if not name or not prefix:
-        return jsonify({"error": "name and prefix are required"}), 400
+    # The credential the broker later vends is scoped by this PREFIX string, while OPA decides
+    # by NAME — so an unconfined/overlapping prefix would let a steward read another dataset's
+    # bytes. Confine it: under datasets/<segment>/, no escape, and no overlap with an existing
+    # dataset's prefix (string-containment either way).
+    if not name or not isinstance(name, str) or not NAME_RE.match(name):
+        return jsonify({"error": "name must match [A-Za-z0-9._-]{1,128}"}), 400
+    if not _confined_prefix(prefix):
+        return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
 
-    if not opa_pred("allow_register", subject, groups, name):
+    if not opa_pred("allow_register", subject, groups, name, action="register"):
         app.logger.info("DENY register subject=%s groups=%s name=%s", subject, groups, name)
-        return jsonify({"error": "forbidden", "subject": subject}), 403
+        return jsonify({"error": "forbidden"}), 403
 
     try:
         with db(commit=True) as cur:
+            cur.execute("SELECT prefix FROM datasets")
+            existing = [r["prefix"] for r in cur.fetchall()]
+            if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
+                return jsonify({"error": "prefix overlaps an existing dataset"}), 409
             cur.execute(
                 "INSERT INTO datasets (name, prefix, description, steward, visibility, access, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s, 'pending')",
@@ -391,7 +418,7 @@ def register_dataset():
                  body.get("visibility", []), body.get("access", [])),
             )
     except psycopg2.errors.UniqueViolation:
-        return jsonify({"error": "dataset already exists", "name": name}), 409
+        return jsonify({"error": "dataset already exists"}), 409
 
     # Synchronous reconcile: if the bytes are already uploaded, flip pending->live NOW so
     # the demo is deterministic (no wait for a timer tick). Grants reach OPA on its next
@@ -403,14 +430,9 @@ def register_dataset():
 
 @app.get("/discover")
 def discover():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"error": "missing bearer token"}), 401
-    try:
-        subject, groups = verify_user(auth[7:])
-    except Exception as e:  # noqa: BLE001
-        app.logger.warning("token verification failed: %s", e)
-        return jsonify({"error": "invalid token"}), 401
+    subject, groups, err = authed_user()
+    if err:
+        return err
 
     # Only LIVE datasets are advertised — discovery never shows a dead (gone) or not-yet-
     # populated (pending) dataset. Existence is storage truth (reconcile); visibility is
@@ -437,7 +459,10 @@ if __name__ == "__main__":
     connect_pool()
     init_db()
     ensure_notifications()    # best-effort; the reconcile timer is the authority
-    reconcile()               # startup sweep: classify seeded datasets (pending -> live/gone) now
+    try:
+        reconcile()           # startup sweep: classify seeded datasets (pending -> live/gone)
+    except Exception as e:    # noqa: BLE001 — RGW trouble must not abort boot; the timer retries
+        app.logger.warning("startup reconcile failed: %s", e)
     threading.Thread(target=reconcile_loop, daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
     # owns a connection pool and a single reconcile timer thread.

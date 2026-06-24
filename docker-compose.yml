@@ -120,7 +120,8 @@ services:
     environment:
       SHIM_ISSUER: http://idp-shim:9000
       TRINO_CLIENT_ID: ${TRINO_CLIENT_ID}
-      TRINO_CLIENT_SECRET: ${TRINO_CLIENT_SECRET}
+      # The engine-proof secret (distinct from the Keycloak client secret users log in with).
+      TRINO_CLIENT_SECRET: ${SHIM_ENGINE_SECRET}
       SERVICE_PRINCIPAL: trino_svc
       AUDIENCE: ${POLARIS_CLIENT_ID}
       KC_BASE: http://keycloak:8080
@@ -298,6 +299,9 @@ services:
     depends_on:
       polaris-setup:
         condition: service_completed_successfully
+    environment:
+      # Engine-proof secret for the idp-shim; referenced by iceberg.properties as ${ENV:...}.
+      SHIM_ENGINE_SECRET: ${SHIM_ENGINE_SECRET}
     volumes:
       - ./trino/etc/config.properties:/etc/trino/config.properties:ro
       - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro

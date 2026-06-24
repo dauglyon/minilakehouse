@@ -28,7 +28,7 @@ allow if {
 
 # Lane 2 — credential vend, gated on a read grant for the target table.
 allow if {
-	_is_delegation(input.action)
+	input.action in _delegation_ops
 	some t in input.resource.targets
 	t.type == "TABLE_LIKE"
 	_granted(input.actor.principal, _fqn(t))
@@ -50,8 +50,7 @@ allow if {
 # not exist yet, so Polaris's authz target is the NAMESPACE, not the table — there's no
 # table grant to check. Creating-and-vending is a namespace write, so it lives in the
 # writer lane (lane 4) below.
-_is_delegation(a) if { a == "LOAD_TABLE_WITH_READ_DELEGATION" }
-_is_delegation(a) if { a == "LOAD_TABLE_WITH_WRITE_DELEGATION" }
+_delegation_ops := {"LOAD_TABLE_WITH_READ_DELEGATION", "LOAD_TABLE_WITH_WRITE_DELEGATION"}
 
 _read_ops := {
 	"LIST_CATALOGS", "GET_CATALOG",

@@ -1,17 +1,11 @@
 """
-seed/ingest-demo.py — a governed ingest (Phase 3: register-at-ingest).
+seed/ingest-demo.py — a governed ingest (register-at-ingest).
 
-Shows how a NEW dataset is born: a steward uploads its objects, then registers it WITH ITS
-MEANING (name, prefix, description, grants — the part only a human can supply). Run it
-in-network (service hostnames, so the token issuer matches what governance validates):
+As steward `alice`, upload a dataset's objects then register it WITH ITS MEANING (name,
+prefix, description, grants — the part only a human supplies). Run in-network so the token
+issuer matches what governance validates:
 
     docker compose exec governance python /seed/ingest-demo.py
-
-It authenticates as `alice` (a member of the `stewards` group), uploads two blobs under
-datasets/projz/, then POSTs the registration to governance. Governance authorizes via OPA
-(the `stewards` capability in the published bundle), inserts the dataset as `pending`, and
-reconciles it to `live`. After OPA's next bundle poll, alice can discover and read projz
-through the broker — born WITH meaning, not guessed from storage.
 """
 import os
 

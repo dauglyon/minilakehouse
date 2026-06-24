@@ -13,7 +13,10 @@
 # deleted (namespaces first) and recreated, so the storage config is always current.
 set -e
 
-apk add --no-cache jq >/dev/null 2>&1 || true
+# jq is required below (it builds the catalog payload + parses teardown lists). Install it,
+# but tolerate it being preinstalled / the network being absent — only fail if it's truly missing.
+command -v jq >/dev/null 2>&1 || apk add --no-cache jq >/dev/null 2>&1
+command -v jq >/dev/null 2>&1 || { echo "ERROR: jq unavailable" >&2; exit 1; }
 
 POLARIS="http://polaris:8181"
 CAT_API="${POLARIS}/api/catalog/v1/${CATALOG_NAME}"

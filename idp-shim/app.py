@@ -157,6 +157,15 @@ def mint(principal_name: str, roles: list) -> str:
     return jwt.encode(claims, _priv_pem, algorithm="RS256", headers={"kid": _kid})
 
 
+def _token_response(access_token: str):
+    return jsonify({
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "expires_in": SHIM_TTL,  # match the minted token's actual lifetime
+        "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+    })
+
+
 def _client_ok() -> bool:
     cid = request.form.get("client_id")
     csec = request.form.get("client_secret")
@@ -189,21 +198,18 @@ def _caller_is_trusted_engine() -> bool:
 
 @app.get("/.well-known/openid-configuration")
 def discovery():
-    return jsonify(
-        {
-            "issuer": ISSUER,
-            "jwks_uri": f"{ISSUER}/certs",
-            "token_endpoint": f"{ISSUER}/token",
-            "authorization_endpoint": f"{ISSUER}/auth",
-            "response_types_supported": ["token"],
-            "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": ["RS256"],
-            "grant_types_supported": [
-                "client_credentials",
-                "urn:ietf:params:oauth:grant-type:token-exchange",
-            ],
-        }
-    )
+    return jsonify({
+        "issuer": ISSUER,
+        "jwks_uri": f"{ISSUER}/certs",
+        "token_endpoint": f"{ISSUER}/token",
+        "authorization_endpoint": f"{ISSUER}/auth",
+        "response_types_supported": ["token"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "grant_types_supported": [
+            "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange",
+        ],
+    })
 
 
 @app.get("/certs")
@@ -253,17 +259,6 @@ def token():
         return _token_response(mint(user, roles))
 
     return jsonify({"error": "unsupported_grant_type"}), 400
-
-
-def _token_response(access_token: str):
-    return jsonify(
-        {
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        }
-    )
 
 
 if __name__ == "__main__":
