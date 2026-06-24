@@ -1,0 +1,14 @@
+# OPA bundle mode (Phase 2): OPA pulls policy + data as a bundle from the governance
+# service, instead of loading hand-edited files from a mount. This makes governance the
+# single source of truth and keeps OPA read-only (no writable data API).
+services:
+  governance:
+    url: http://governance:8000
+
+bundles:
+  authz:
+    service: governance
+    resource: bundle.tar.gz
+    polling:
+      min_delay_seconds: 5
+      max_delay_seconds: 10

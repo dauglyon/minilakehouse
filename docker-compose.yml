@@ -1,0 +1,316 @@
+# minilakehouse — Phase 0 spine (Flow B: OPA-gated Iceberg table access).
+# Stage A config: Polaris authentication=internal, authorization=opa (allow-all),
+# storage in static-cred mode (stsUnavailable). Stages B/C/D edit this file in place.
+
+services:
+
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "15432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  keycloak:
+    image: ${KEYCLOAK_IMAGE}
+    command: ["start-dev", "--import-realm", "--health-enabled=true", "--features=token-exchange,admin-fine-grained-authz"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+    volumes:
+      - ./keycloak/realm-lakehouse.json:/opt/keycloak/data/import/realm-lakehouse.json:ro
+    ports:
+      - "18080:8080"
+    healthcheck:
+      test: "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"
+      interval: 5s
+      timeout: 2s
+      retries: 30
+
+  governance-bootstrap:
+    # One-shot: create the dedicated `governance` database in the existing Postgres
+    # server (idempotently). Mirrors polaris-bootstrap. There are no init scripts and the
+    # postgres_data volume persists across `down`, so the DB must be created at runtime —
+    # the \gexec trick CREATEs only when pg_database lacks it.
+    image: ${POSTGRES_IMAGE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        psql -h postgres -U ${POSTGRES_USER} -d ${POSTGRES_DB} -v ON_ERROR_STOP=1 <<'EOSQL'
+        SELECT 'CREATE DATABASE governance' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'governance')\gexec
+        EOSQL
+
+  governance:
+    # The PAP + dataset registry. Single source of truth: owns the registry + all grants
+    # in a durable Postgres database, publishes them to OPA as a bundle, serves discovery
+    # (Flow A) and dataset->prefix for the broker. See governance/app.py.
+    build: ./governance
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      governance-bootstrap:
+        condition: service_completed_successfully
+      ceph-setup:
+        condition: service_completed_successfully
+    environment:
+      POLICY_DIR: /policies
+      REGISTRY: /app/registry.json
+      OPA_BASE: http://opa:8181
+      GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
+      KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
+      # Storage + freshness (Phase 3): governance lists dataset prefixes and wires its own
+      # RGW event subscription. Admin key here is for notification setup; Stage 3 adds a
+      # least-priv governance-reader for the reconcile lister.
+      RGW_ENDPOINT: http://ceph:8080
+      RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
+      RGW_SECRET_KEY: ${RGW_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      EVENTS_ENDPOINT: http://governance:8000/events
+    volumes:
+      - ./opa:/policies:ro
+      - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)
+    ports:
+      - "19092:8000"
+
+  opa:
+    image: ${OPA_IMAGE}
+    # Bundle mode: OPA pulls policy + data from governance (single-sourced), instead of
+    # loading hand-edited files from a mount.
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=debug", "-c", "/config/opa.yaml"]
+    depends_on:
+      governance:
+        condition: service_healthy
+    volumes:
+      - ./opa/config.yaml:/config/opa.yaml:ro
+    ports:
+      - "18181:8181"
+    healthcheck:
+      # ?bundles -> 200 only once the governance bundle is activated, so dependents
+      # (Polaris) don't query OPA before its policy/data are loaded.
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8181/health?bundles"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  idp-shim:
+    # Trusted identity layer between Trino and Polaris. Trino points its OAuth
+    # token endpoint here; the shim mints real signed per-user tokens that Polaris
+    # validates (the shim is Polaris's OIDC issuer). See idp-shim/app.py.
+    build: ./idp-shim
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      SHIM_ISSUER: http://idp-shim:9000
+      TRINO_CLIENT_ID: ${TRINO_CLIENT_ID}
+      TRINO_CLIENT_SECRET: ${TRINO_CLIENT_SECRET}
+      SERVICE_PRINCIPAL: trino_svc
+      AUDIENCE: ${POLARIS_CLIENT_ID}
+      KC_BASE: http://keycloak:8080
+      KC_REALM: ${KC_REALM}
+      KC_ADMIN: ${KC_ADMIN}
+      KC_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+    volumes:
+      # Persist the signing key so a shim restart doesn't rotate it (which would invalidate
+      # every token Trino holds + Polaris's cached JWKS, breaking the table plane).
+      - shim_key:/keys
+    ports:
+      - "19090:9000"
+
+  broker:
+    # Blob vending broker (Phase 1, Flow C). The TRUE end-to-end plane: clients present
+    # their OWN Keycloak token, the broker verifies it, asks OPA yes/no on the named
+    # dataset, and vends an STS credential narrowed (session policy) to that dataset's
+    # prefix. See broker/app.py.
+    build: ./broker
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      ceph:
+        condition: service_healthy
+      opa:
+        condition: service_started
+      governance:
+        condition: service_healthy
+    environment:
+      KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
+      OPA_URL: http://opa:8181/v1/data/lakehouse/blob/allow
+      GOVERNANCE_URL: http://governance:8000
+      RGW_ENDPOINT: http://ceph:8080
+      BLOB_ROLE_ARN: ${BLOB_ROLE_ARN}
+      BUCKET: ${S3_BUCKET}
+      BLOB_BROKER_KEY: ${BLOB_BROKER_KEY}
+      BLOB_BROKER_SECRET: ${BLOB_BROKER_SECRET}
+    ports:
+      - "19091:9100"
+
+  ceph:
+    image: ${CEPH_IMAGE}
+    environment:
+      RGW_PORT: "8080"
+      RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
+      RGW_SECRET_KEY: ${RGW_SECRET_KEY}
+      RGW_STS_KEY: ${RGW_STS_KEY}
+    entrypoint: ["/bin/sh", "/rgw-entrypoint.sh"]
+    volumes:
+      - ./ceph/rgw-entrypoint.sh:/rgw-entrypoint.sh:ro
+      - ./ceph/sts-bootstrap.sh:/sts-bootstrap.sh:ro
+    ports:
+      - "19000:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5s bash -c ':> /dev/tcp/127.0.0.1/8080' || exit 1"]
+      interval: 5s
+      timeout: 8s
+      retries: 20
+
+  ceph-setup:
+    image: ${MC_IMAGE}
+    depends_on:
+      ceph:
+        condition: service_healthy
+    environment:
+      MC_ENDPOINT: http://ceph:8080
+      MC_ACCESS_KEY: ${RGW_ACCESS_KEY}
+      MC_SECRET_KEY: ${RGW_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: ["/bin/sh", "/ceph/bootstrap.sh"]
+    volumes:
+      - ./ceph/bootstrap.sh:/ceph/bootstrap.sh:ro
+      - ./seed/blobs:/blobs:ro
+
+  polaris-bootstrap:
+    image: ${POLARIS_ADMIN_IMAGE}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      polaris.persistence.type: relational-jdbc
+      quarkus.datasource.db-kind: postgresql
+      quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      quarkus.datasource.username: ${POSTGRES_USER}
+      quarkus.datasource.password: ${POSTGRES_PASSWORD}
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        java -jar /deployments/polaris-admin-tool.jar bootstrap --realm=${POLARIS_REALM} --credential=${POLARIS_REALM},${POLARIS_ROOT_CLIENT_ID},${POLARIS_ROOT_CLIENT_SECRET}
+        rc=$$?
+        if [ $$rc -eq 3 ]; then echo "Already bootstrapped — skipping (OK)"; exit 0; fi
+        exit $$rc
+
+  polaris:
+    image: ${POLARIS_IMAGE}
+    depends_on:
+      polaris-bootstrap:
+        condition: service_completed_successfully
+      opa:
+        condition: service_started
+      idp-shim:
+        condition: service_healthy
+    environment:
+      # --- persistence ---
+      polaris.persistence.type: relational-jdbc
+      quarkus.datasource.db-kind: postgresql
+      quarkus.datasource.jdbc.url: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      quarkus.datasource.username: ${POSTGRES_USER}
+      quarkus.datasource.password: ${POSTGRES_PASSWORD}
+      polaris.realm-context.realms: ${POLARIS_REALM}
+      # --- static S3 storage creds (RGW admin key); used while stsUnavailable ---
+      AWS_REGION: ${S3_REGION}
+      AWS_ACCESS_KEY_ID: ${RGW_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RGW_SECRET_KEY}
+      # --- authn: MIXED — internal root (admin/bootstrap/catalog) + external Keycloak
+      #     tokens (user-facing catalog ops). The external identity's principal name
+      #     comes from the token's principal_name claim; roles from principal_roles. ---
+      polaris.authentication.type: mixed
+      quarkus.oidc.tenant-enabled: "true"
+      # OIDC issuer = the idp-shim (NOT Keycloak directly): Polaris validates the
+      # real per-user tokens the shim mints for Trino-relayed requests.
+      quarkus.oidc.auth-server-url: http://idp-shim:9000
+      quarkus.oidc.discovery-enabled: "true"
+      quarkus.oidc.client-id: ${POLARIS_CLIENT_ID}
+      quarkus.oidc.roles.role-claim-path: principal_roles
+      # No id-claim-path: external principals are federated by NAME only (the default
+      # mapper returns an empty principal-id when id-claim-path is unset). Setting it to
+      # a non-numeric claim like `sub` makes Polaris try to parse the UUID as a long.
+      polaris.oidc.principal-mapper.name-claim-path: principal_name
+      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
+      polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
+      # --- authz: OPA from first boot, allow-all policy in Stage A ---
+      polaris.authorization.type: opa
+      polaris.authorization.opa.policy-uri: http://opa:8181/v1/data/polaris/authz
+      polaris.authorization.opa.auth.type: none
+      # --- feature flags (S3 + non-TLS RGW + OPA-preview readiness) ---
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\"]"
+      # RGW speaks http (no TLS) in this dev image, so allow the "insecure" S3 FileIO.
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      polaris.readiness.ignore-severe-issues: "true"
+      quarkus.otel.sdk.disabled: "true"
+    ports:
+      - "8181:8181"
+      - "18185:8182"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  polaris-setup:
+    image: ${CURL_IMAGE}
+    depends_on:
+      polaris:
+        condition: service_healthy
+      ceph-setup:
+        condition: service_completed_successfully
+    environment:
+      POLARIS_REALM: ${POLARIS_REALM}
+      POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
+      POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+      CATALOG_NAME: ${CATALOG_NAME}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ENDPOINT: http://ceph:8080
+      S3_REGION: ${S3_REGION}
+      STS_ROLE_ARN: ${STS_ROLE_ARN}
+    entrypoint: ["/bin/sh", "/polaris/bootstrap.sh"]
+    volumes:
+      - ./polaris/bootstrap.sh:/polaris/bootstrap.sh:ro
+
+  trino:
+    image: ${TRINO_IMAGE}
+    depends_on:
+      polaris-setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./trino/etc/config.properties:/etc/trino/config.properties:ro
+      - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./seed:/seed:ro
+    ports:
+      - "8083:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  postgres_data:
+  shim_key:

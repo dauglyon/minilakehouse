@@ -1,0 +1,29 @@
+{
+  "table_grants": {
+    "grants": { "alice": { "read": ["db.t1"] } },
+    "writers": ["alice"]
+  },
+  "datasets": {
+    "projx-public": {
+      "prefix": "datasets/projx/public/",
+      "description": "projx public data",
+      "steward": "alice",
+      "visibility": ["jgi-writers"],
+      "access": ["jgi-writers"]
+    },
+    "projx-private": {
+      "prefix": "datasets/projx/private/",
+      "description": "projx private data",
+      "steward": "alice",
+      "visibility": ["jgi-writers"],
+      "access": []
+    },
+    "projy-secret": {
+      "prefix": "datasets/projy/secret/",
+      "description": "projy secret data",
+      "steward": "bob",
+      "visibility": ["bob-only"],
+      "access": ["bob-only"]
+    }
+  }
+}
