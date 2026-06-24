@@ -32,13 +32,15 @@ visible if {
 	input.dataset in object.get(data.visibility_grants.groups, g, [])
 }
 
-# --- Governed ingest (Phase 3): "may S register a new dataset?" ---
-# Register-at-ingest is authorized by OPA too (single-sourced policy), not hardcoded in
-# governance. The steward CAPABILITY is group membership; the per-dataset `steward` field
-# (who owns it) is recorded separately by governance. A stricter model would scope which
-# prefixes a steward may claim — here any member of `stewards` may register.
+# --- Governed ingest: "may S register a new dataset at input.prefix?" ---
+# Two-part, single-sourced in OPA: the `stewards` group is the CAPABILITY to register at
+# all, and register_grants.groups scopes WHERE — the prefix must sit under a root one of the
+# caller's groups owns. So a steward can't claim another tenant's namespace.
 default allow_register := false
 
 allow_register if {
 	"stewards" in input.groups
+	some g in input.groups
+	some root in object.get(data.register_grants.groups, g, [])
+	startswith(input.prefix, root)
 }

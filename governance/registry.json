@@ -3,6 +3,9 @@
     "grants": { "alice": { "read": ["db.t1"] } },
     "writers": ["alice"]
   },
+  "register_grants": {
+    "jgi-writers": ["datasets/projx/", "datasets/projz/"]
+  },
   "datasets": {
     "projx-public": {
       "prefix": "datasets/projx/public/",

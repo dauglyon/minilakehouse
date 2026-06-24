@@ -90,6 +90,10 @@ CREATE TABLE IF NOT EXISTS table_grants (
     writers TEXT[] NOT NULL DEFAULT '{}',
     CONSTRAINT table_grants_singleton CHECK (id = 1)
 );
+CREATE TABLE IF NOT EXISTS register_grants (
+    grp      TEXT PRIMARY KEY,
+    prefixes TEXT[] NOT NULL DEFAULT '{}'   -- prefix roots this group may register under
+);
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -162,6 +166,9 @@ def init_db():
             "ON CONFLICT (id) DO NOTHING",
             (json.dumps(tg.get("grants", {})), tg.get("writers", [])),
         )
+        for grp, prefixes in reg.get("register_grants", {}).items():
+            cur.execute("INSERT INTO register_grants (grp, prefixes) VALUES (%s, %s) "
+                        "ON CONFLICT (grp) DO NOTHING", (grp, prefixes))
         app.logger.info("seeded governance registry from %s", REGISTRY_PATH)
 
 
@@ -179,11 +186,14 @@ def derive_data():
                 vis_groups.setdefault(g, []).append(row["name"])
         cur.execute("SELECT grants, writers FROM table_grants WHERE id = 1")
         tg = cur.fetchone() or {"grants": {}, "writers": []}
+        cur.execute("SELECT grp, prefixes FROM register_grants")
+        reg_groups = {r["grp"]: r["prefixes"] for r in cur.fetchall()}
     return {
         "grants": tg["grants"],
         "writers": tg["writers"],
         "dataset_grants": {"groups": access_groups},
         "visibility_grants": {"groups": vis_groups},
+        "register_grants": {"groups": reg_groups},
     }
 
 
@@ -227,10 +237,11 @@ def authed_user():
         return None, None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_pred(rule, subject, groups, dataset, action="read"):
-    r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": {
-        "subject": subject, "groups": groups, "action": action, "dataset": dataset,
-    }}, timeout=5)
+def opa_pred(rule, subject, groups, dataset, action="read", prefix=None):
+    inp = {"subject": subject, "groups": groups, "action": action, "dataset": dataset}
+    if prefix is not None:
+        inp["prefix"] = prefix
+    r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": inp}, timeout=5)
     r.raise_for_status()
     return r.json().get("result") is True
 
@@ -375,8 +386,8 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
 
-    if not opa_pred("allow_register", subject, groups, name, action="register"):
-        app.logger.info("DENY register subject=%s groups=%s name=%s", subject, groups, name)
+    if not opa_pred("allow_register", subject, groups, name, action="register", prefix=prefix):
+        app.logger.info("DENY register subject=%s groups=%s prefix=%s", subject, groups, prefix)
         return jsonify({"error": "forbidden"}), 403
 
     try:
