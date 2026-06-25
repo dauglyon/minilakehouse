@@ -1,206 +1,241 @@
-# minilakehouse — Phase 0
+# minilakehouse
 
-A docker-compose prototype proving **Flow B**: OPA-gated Iceberg table access through
-Trino → Polaris → Ceph RGW, with per-table STS credential vending and **real per-user
-identity** reaching the policy engine.
+An experimental **unified lakehouse Policy Decision Point (PDP)**: one external policy brain
+(OPA) answers every authorization question, and every other service either *asks* OPA (a PEP)
+or *obeys* a short-lived credential OPA gated (vending). OPA sits on the **decision path,
+never the byte path**.
 
-See `DESIGN.md` for the architecture and `idp-shim/app.py` for the identity layer.
+It collapses what is usually four drifting authorization layers (object-store IAM, catalog
+RBAC, an engine plugin, per-service interceptors) into a single source of truth — across both
+**Iceberg tables** (Trino → Polaris → Ceph RGW STS) and **non-tabular blob datasets** (a
+vending broker) — with a real **metadata-visibility plane** (see-but-not-read) and a
+**governed registry** kept honest against storage.
 
-## What it proves
+> A working `docker-compose` prototype. Dev-environment only: plaintext/no-TLS and dev
+> credentials in `.env`. `DESIGN.md` has the full architecture and rationale.
 
-A user queries an Iceberg table through Trino. Their **real identity** reaches OPA (the
-one policy brain), OPA decides, and Polaris vends a short-lived, per-table STS
-credential that Trino uses to read the files directly from RGW.
+## Contents
 
-- **alice** is granted `db.t1` → her query returns rows.
-- **bob** is not → his query is denied at the credential vend; no credential is issued.
+- [The idea](#the-idea)
+- [Components](#components)
+- [Run it](#run-it)
+- [Flow A — discovery (see-but-not-read)](#flow-a--discovery-see-but-not-read)
+- [Flow B — Iceberg tables](#flow-b--iceberg-tables)
+- [Flow C — blob datasets](#flow-c--blob-datasets)
+- [Registry freshness & governed ingest](#registry-freshness--governed-ingest)
+- [Security model](#security-model)
+- [Limitations](#limitations)
 
-OPA is consulted **once, at the vend** — never on the byte path.
+## The idea
 
-## The pieces
+Three roles, in XACML terms:
+
+- **PDP** — OPA. Answers "is this allowed?" for one named resource at a time. It is a
+  **predicate, never an enumerator**: it says yes/no on a resource you name, it never returns
+  a list.
+- **PAP** — the **governance** service. The single source of truth: it owns the dataset
+  registry and all grants, and **publishes them to OPA as a bundle** (OPA pulls it). Nothing
+  edits OPA directly.
+- **PEP** — Polaris, Trino, the broker. They ask the PDP, then enforce — either by refusing,
+  or by vending a credential scoped to exactly what was allowed.
+
+Two independent permission **planes** per dataset:
+
+- **visibility** — may you *see it exists*? (discovery, Flow A)
+- **access** — may you *read the bytes*? (vending, Flows B/C)
+
+So a dataset can be **see-but-not-read** (the Lake Formation model): `alice` can discover
+`projx-private` exists but cannot read it.
+
+**Why the idp-shim exists (tables):** Trino can only *assert* the end user (an unsigned note
+Keycloak won't trust), so a real per-user token can't reach Polaris through Trino directly.
+The shim is the one trusted place that converts "our Trino says this is alice" into a real
+signed alice token. Polaris/OPA then enforce on the real identity — so the (open) Polaris API
+has no skeleton key. The **broker (blobs)** needs no shim: the client presents its *own*
+Keycloak token, which the broker verifies cryptographically — true end-to-end, no engine in
+the byte path.
+
+## Components
 
 | Service | Role |
 |---|---|
-| **keycloak** | OIDC identity provider (users alice/bob, groups) |
-| **idp-shim** | Trusted identity layer: turns Trino's per-user assertion into a real signed token Polaris accepts. Polaris's OIDC issuer. |
-| **governance** | The PAP + dataset registry (single source of truth), **Postgres-backed**. Owns the registry + all grants, publishes them to OPA as a bundle, serves discovery (Flow A) + dataset→prefix, **keeps the registry fresh** (RGW events + a reconcile timer) and accepts **governed ingest** (`POST /datasets`, OPA-gated). |
-| **opa** | The Policy Decision Point. Pulls policy + data from governance as a bundle (`opa/policy.rego`, `opa/blob.rego` + grants derived from the registry). |
-| **polaris** | Iceberg REST catalog. Authorizer delegates to OPA; vends per-table STS. Holds only identities, no rules. |
+| **keycloak** | OIDC identity provider (users `alice`/`bob`, groups, the engine + shim service accounts). |
+| **idp-shim** | Trusted identity layer for the table plane: turns Trino's per-user assertion into a real signed token Polaris validates. Polaris's OIDC issuer. |
+| **governance** | The PAP + dataset registry (single source of truth), Postgres-backed. Publishes grants to OPA as a bundle, serves discovery (Flow A) + dataset→prefix, keeps the registry fresh (RGW events + a reconcile timer), and accepts governed ingest (`POST /datasets`). |
+| **opa** | The PDP. Pulls policy + data from governance as a bundle (`opa/policy.rego` = tables, `opa/blob.rego` = blobs; grants derived from the registry). |
+| **polaris** | Iceberg REST catalog. Delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **trino** | Query engine. Reads tables via Polaris with vended credentials. |
-| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA, vends a credential scoped to one dataset's prefix. The true end-to-end plane. |
+| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA, vends a credential scoped to one dataset's prefix. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
 | **postgres** | Polaris metastore **and** the durable `governance` registry database. |
 
-Why the shim exists: Trino can only *assert* the end user (an unsigned note Keycloak
-won't trust), so a real per-user token can't reach Polaris through Trino directly. The
-shim is the one trusted place that converts "our Trino says this is alice" into a real
-signed alice token. Polaris/OPA then enforce on the real identity — so the (open)
-Polaris API has no skeleton key.
+A one-shot `rgw-setup` configures bucket notifications + a least-privilege bucket policy at
+startup, so the long-lived governance service never holds the RGW admin key.
 
 ## Run it
 
 ```bash
-docker compose up -d --build          # ~all services build/pull and come up
+docker compose up -d --build      # build/pull and start everything
+docker compose ps                 # wait until all services are healthy
 
-# wait until everything is healthy
-docker compose ps
-
-# seed the demo table once, as its owner alice (a "writer" in opa/data.json).
-# NOTE: you can't seed as `root` through Trino — the idp-shim refuses to mint a
-# token for the internal admin (the engine must not be able to assert root).
+# Seed the demo Iceberg table once, as its owner alice. (You cannot seed as root — the
+# idp-shim refuses to mint a token for the internal admin, so the engine can't assert it.)
 docker compose exec -T trino trino --user alice -f /seed/seed-table.sql
 ```
 
-## The demo
+**About the demos below:** the discovery/blob demos present a user's *own* Keycloak token to
+governance/the broker, which validate the token's issuer. Run them **in-network** (service
+hostnames) so the issuer matches — the snippets use `docker compose exec` from inside a
+container that already has `requests`/`boto3`. (A token fetched from the host `localhost` port
+has a different issuer and would be rejected.)
+
+## Flow A — discovery (see-but-not-read)
+
+*"What exists that I could request?"* — separate from "what can I read." Governance
+enumerates its registry and filters each entry through OPA's **visibility** predicate,
+returning names only (never bytes or credentials).
+
+```bash
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id="trino",
+    client_secret="trino-secret", username=u, password=u)).json()["access_token"]
+for u in ("alice", "bob"):
+    seen = requests.get("http://governance:8000/discover",
+                        headers={"Authorization": f"Bearer {tok(u)}"}).json()["visible"]
+    print(f"{u} sees:", [(e["name"], e["can_read"]) for e in seen])
+PY
+#  alice sees: [('projx-private', False), ('projx-public', True)]
+#         ^ projx-private is VISIBLE but can_read=False — see-but-not-read
+#  bob   sees: []
+#         ^ projy-secret is invisible to everyone outside its group
+```
+
+OPA is a **predicate** here: governance asks "may S *see* dataset X?" per entry. It never
+returns the inventory.
+
+## Flow B — Iceberg tables
+
+A user queries an Iceberg table through Trino. Their **real identity** (via the idp-shim)
+reaches OPA; OPA decides; Polaris vends a short-lived, per-table STS credential that Trino
+uses to read the files directly from RGW. OPA is consulted **once, at the vend** — never on
+the byte path.
 
 ```bash
 # ALLOW — alice is granted db.t1
 docker compose exec -T trino trino --user alice --execute "SELECT * FROM iceberg.db.t1"
-#  -> returns: 1
+#  -> 1
 
-# DENY — bob has no grant; denied at the credential vend
+# DENY — bob has no grant; denied at the credential vend (no credential is issued)
 docker compose exec -T trino trino --user bob --execute "SELECT * FROM iceberg.db.t1"
 #  -> Query failed: Failed to load table: t1 in db namespace
 
 # See OPA decide, on the real per-user identity:
 docker compose logs opa | grep LOAD_TABLE_WITH
-#  -> alice ... "result":{"allow":true}   |   bob ... "result":{"allow":false}
+#  -> alice ... "allow":true   |   bob ... "allow":false
 ```
 
-To change who can read what, edit `opa/data.json` (OPA hot-reloads via `--watch`) —
-the rules live entirely in OPA, never in Polaris.
+## Flow C — blob datasets
 
-## Flow C — blob datasets (the true end-to-end plane)
-
-Phase 1 adds the plane tables can't give you: **non-tabular data, accessed by a client
-presenting its *own* token to a broker — no engine in the byte path**, so it's safe even
-against a compromised engine. The broker verifies the user's token, asks OPA the yes/no
-question, and vends a credential **narrowed to exactly the requested dataset's prefix**.
-
-`alice` (group `jgi-writers`) is granted `projx-public` but not `projx-private`; `bob`
-neither. (Grants in `opa/blob-data.json`; the dataset→prefix registry in
-`broker/datasets.json`.)
+The plane tables can't give you: **non-tabular data, accessed by a client presenting its own
+token to a broker — no engine in the byte path**, so it's safe even against a compromised
+engine. The broker verifies the token, asks OPA the yes/no question, and vends a credential
+**narrowed to exactly the requested dataset's prefix**.
 
 ```bash
-# get alice's OWN Keycloak token (real signed token; the broker verifies it)
-ALICE=$(curl -s http://localhost:18080/realms/lakehouse/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=trino -d client_secret=trino-secret \
-  -d username=alice -d password=alice | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
-
-# ALLOW — alice may read projx-public; broker returns a scoped, temporary credential
-curl -s http://localhost:19091/vend -H "Authorization: Bearer $ALICE" \
-  -H 'Content-Type: application/json' -d '{"dataset":"projx-public"}'
-#  -> {"access_key_id":...,"session_token":...,"prefix":"datasets/projx/public/",...}
-#     Those creds read datasets/projx/public/* but are DENIED datasets/projx/private/* by RGW.
-
-# DENY — alice is not granted projx-private  (and bob is granted nothing)
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost:19091/vend \
-  -H "Authorization: Bearer $ALICE" -H 'Content-Type: application/json' \
-  -d '{"dataset":"projx-private"}'        # -> 403
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id="trino",
+    client_secret="trino-secret", username=u, password=u)).json()["access_token"]
+def vend(u, ds): return requests.post("http://broker:9100/vend",
+    headers={"Authorization": f"Bearer {tok(u)}"}, json={"dataset": ds}).status_code
+print("alice projx-public :", vend("alice", "projx-public"))    # 200 -> scoped temp creds
+print("alice projx-private:", vend("alice", "projx-private"))   # 403 -> visible but not readable
+print("bob   projx-public :", vend("bob",   "projx-public"))    # 403 -> bob is granted nothing
+PY
 ```
 
-OPA is consulted as a **predicate** — "may this subject read this named dataset?" → yes/no.
-It never enumerates paths; the broker owns the dataset→prefix mapping and binds the prefix
-into the credential's session policy itself.
+The returned credential reads `datasets/projx/public/*` but is **denied** sibling prefixes by
+RGW — the broker binds the dataset→prefix mapping into the credential's session policy itself.
+OPA never sees a path; it answers only "may S read dataset X?".
 
-## Flow A — discovery (the metadata-visibility plane)
-
-The other half of governance: **"what exists that I could request"**, separate from
-"what I can read." The **governance** service owns a dataset registry
-(`governance/registry.json`) with two independent grant sets per dataset — `visibility`
-(may you *see* it exists) and `access` (may you *read* it). Discovery enumerates the
-registry and filters each entry through OPA's *visibility* predicate. The point is
-**see-but-not-read**: `alice` can discover `projx-private` exists, but cannot read it.
-
-```bash
-ALICE=$(curl -s http://localhost:18080/realms/lakehouse/protocol/openid-connect/token \
-  -d grant_type=password -d client_id=trino -d client_secret=trino-secret \
-  -d username=alice -d password=alice | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
-
-curl -s http://localhost:19092/discover -H "Authorization: Bearer $ALICE" | python3 -m json.tool
-#  -> projx-public  (can_read: true)
-#     projx-private (can_read: FALSE  <- visible, but not readable)
-#     (projy-secret is absent — alice can't even see it exists)
-```
-
-Discovery returns **names, never bytes or credentials** — to actually read, the client
-goes to the broker (Flow C), which independently enforces the *access* plane. So
-requesting `projx-private` from the broker returns 403 even though alice can see it.
-
-OPA is, again, a **predicate** — governance asks "may this subject *see* dataset X?"
-per registry entry; OPA never returns the inventory. Governance is the single source of
-truth: it owns the registry + all grants and **publishes them to OPA as a bundle** (OPA
-pulls it; the `opa/*.json` files are gone).
-
-## Registry freshness + governed ingest (Phase 3)
+## Registry freshness & governed ingest
 
 The registry is the **mutable single source of truth**, so it lives in a real datastore (a
-`governance` Postgres database) and is kept **honest against storage**. Two truths,
-reconciled not merged: storage owns *existence/stats*, the registry owns *meaning/grants*.
+`governance` Postgres database) and is kept **honest against storage**. Two truths, reconciled
+not merged: storage owns *existence/stats*, the registry owns *meaning/grants*.
 
-- **Freshness.** `reconcile()` lists a dataset's prefix and sets `status`:
-  non-empty → `live`; emptied-after-being-live → `gone`. Discovery advertises only `live`
-  datasets — never a dead one. It runs on a timer (convergence) **and** is triggered by RGW
-  bucket notifications (near-real-time). Events carry no authority; a missed one self-heals
-  on the next sweep.
-- **Register-at-ingest.** A *new* dataset is born through a governed write path that
-  registers it **with its meaning** — only a human can supply name/boundary/grants. The
-  endpoint is authenticated by the caller's own token and **authorized by OPA** (the
-  `stewards` capability lives in the bundle, not in governance).
-
-Demos run **in-network** (service hostnames), so the token issuer matches what governance
-validates:
+- **Freshness.** `reconcile()` lists a dataset's prefix and sets `status`: non-empty → `live`;
+  emptied-after-being-live → `gone`. Discovery advertises only `live` datasets. It runs on a
+  timer (convergence) **and** is triggered by RGW bucket notifications (near-real-time); a
+  missed event self-heals on the next sweep.
+- **Register-at-ingest.** A *new* dataset is born through a governed write path that registers
+  it **with its meaning** (name, prefix, description, grants — only a human can supply these).
+  Authenticated by the caller's own token, **authorized by OPA**: the steward must be in the
+  `stewards` group *and* the prefix must sit under a root their group owns.
 
 ```bash
-# governed ingest of a NEW dataset `projz`, as alice (a steward): upload + register
+# Governed ingest of a NEW dataset projz, as alice (a steward who owns datasets/projz/):
 docker compose exec governance python /seed/ingest-demo.py
 #  -> uploaded 2 objects under datasets/projz/
 #     register: 201 {'name': 'projz', 'ok': True, 'registered_by': 'alice'}
 
-# within one OPA bundle poll (≤10s) alice can discover AND read projz:
+# Within one OPA bundle poll (<=10s) alice can discover AND read projz; she is DENIED
+# registering under another group's namespace:
 docker compose exec -T governance python - <<'PY'
-import requests
-KC="http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-t=requests.post(KC,data=dict(grant_type="password",client_id="trino",client_secret="trino-secret",username="alice",password="alice")).json()["access_token"]
-h={"Authorization":f"Bearer {t}"}
-print("discover:",[e["name"] for e in requests.get("http://governance:8000/discover",headers=h).json()["visible"]])
-print("vend projz:",requests.post("http://broker:9100/vend",headers=h,json={"dataset":"projz"}).status_code)
+import time, requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+t = requests.post(KC, data=dict(grant_type="password", client_id="trino",
+    client_secret="trino-secret", username="alice", password="alice")).json()["access_token"]
+h = {"Authorization": f"Bearer {t}"}
+time.sleep(10)
+print("discover:", [e["name"] for e in requests.get("http://governance:8000/discover", headers=h).json()["visible"]])
+print("vend projz:", requests.post("http://broker:9100/vend", headers=h, json={"dataset": "projz"}).status_code)
+print("register under datasets/projy/ (not owned):",
+      requests.post("http://governance:8000/datasets", headers=h,
+                    json={"name": "x", "prefix": "datasets/projy/x/"}).status_code)
 PY
 #  -> discover: ['projx-private', 'projx-public', 'projz']
 #     vend projz: 200
-
-# freshness: delete projz's objects -> within a tick it flips to `gone` and leaves discovery;
-# re-add an object -> `live` again. A reconcile timer converges even if an event is dropped.
+#     register under datasets/projy/ (not owned): 403
 ```
 
-`bob` (not in `stewards`) is denied at registration (`POST /datasets` → 403) — ingest authz
-is the same OPA brain that gates reads.
+Delete `projz`'s objects and within a tick it flips to `gone` and leaves discovery; re-add one
+and it returns `live`. `bob` (not a steward) is denied registration entirely.
 
-## Security model (after the post-audit hardening)
+## Security model
 
-- **idp-shim is not a minting oracle.** Token-exchange requires the caller to prove it
-  is the engine (the trino client secret, or a service token the shim already issued),
-  and the shim refuses to mint reserved principals (`root`, `trino_svc`) — so the engine
-  can relay end users but never escalate to admin.
-- **OPA denies by default.** Four lanes: `root` (admin), the credential vend (gated on a
-  per-table grant), read-only/metadata ops (any authed principal), and write/DDL ops
-  (`writers` only). Everything else — principal/role/grant/catalog/policy/credential
-  management — is root-only. So `bob`, denied data, also cannot drop the catalog or
-  create principals.
-- **STS role is least-privilege.** Specific object/bucket actions (no `s3:*`), scoped to
-  the `warehouse/` prefix, so a missing per-table session policy fails to the warehouse,
-  not the whole bucket (and can't reach future blob datasets).
+- **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across both
+  planes. Tables (`opa/policy.rego`): `root` / per-table vend grant / read-only metadata (any
+  authed principal — this is the *visibility* half of see-but-not-read for tables) / writes &
+  DDL (`writers`). Blobs (`opa/blob.rego`): `allow` (read) / `visible` (see) / `allow_register`
+  (ingest), all group-based and published by governance.
+- **Real, end-to-end identity.** Tables: the idp-shim converts Trino's assertion into a signed
+  token Polaris validates — its signing key is **persisted** (a restart doesn't rotate it and
+  break every cached token), it **refuses reserved principals** (`root`, `trino_svc`), and the
+  engine proves itself with a **dedicated secret** distinct from the Keycloak client secret end
+  users log in with (so a logged-in user can't drive the shim to mint arbitrary identities).
+  Blobs: the broker verifies the user's **own** token (no engine in the byte path).
+- **Least privilege on every credential.** STS roles use specific actions (no `s3:*`), prefix-
+  scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further per
+  request to one dataset prefix. The long-lived governance service holds only a **read-only RGW
+  reader** (ListBucket on `datasets/*`, via a bucket policy) and a **realm-scoped `view-users`
+  Keycloak service account** — never an admin key. Admin-only RGW setup runs in a one-shot.
+- **Governed ingest is scoped.** A steward may register only under a prefix their group owns
+  (per-group ownership in OPA), prefixes are confined to `datasets/<...>/` (no traversal), and
+  the overlap check + insert are serialized so two registrations can't claim overlapping
+  prefixes.
 
-## Notes / prototype limitations
+## Limitations
 
-- The idp-shim's "is the engine" check is the trino client secret; production must bind
-  it to the engine more strongly (mTLS / network policy). The end-user subject it relays
-  is still the engine's (trusted) assertion — see DESIGN §9b on the trust boundary.
-- Decisions key on the username (`actor.principal`). Group-based rules need governance
-  to publish group membership into OPA's data (not into Polaris).
-- `writers` is a coarse global list (a writer may write any namespace); a real model
+- The shim trusts the engine's *asserted* end-user subject; binding "this caller is our engine"
+  to the transport (mTLS / network policy) is future work — the engine proof is a shared secret
+  today (`DESIGN.md` §9b on the trust boundary).
+- Table-plane `writers` is a coarse global list (a writer may write any namespace); a real model
   would scope it per-namespace.
-- Metadata visibility (listing) is open by design; data is protected by the vend gate.
-  A separate metadata-visibility plane is a later phase.
-- Plaintext/no-TLS, hardcoded dev secrets, OPA debug API exposed — all prototype-only.
-- Re-running the `polaris-setup` one-shot drops & recreates the catalog (re-seed after).
+- No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
+  its bytes vanished). Discovery is blob-only; table discovery is via the catalog's own listing.
+- Plaintext/no-TLS, dev credentials in `.env`, the OPA debug API exposed — all dev-only.
+- Re-running the `polaris-setup` one-shot drops & recreates the catalog (re-seed the table after).

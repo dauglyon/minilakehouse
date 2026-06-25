@@ -18,8 +18,11 @@ KC = os.environ.get("KC_TOKEN_URL",
 GOV = os.environ.get("GOVERNANCE_URL", "http://governance:8000")
 RGW = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
 BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
-AK = os.environ.get("RGW_ACCESS_KEY", "test_access_key")
-SK = os.environ.get("RGW_SECRET_KEY", "test_access_secret")
+# The steward's WRITE step uses the dev admin key — deliberately its OWN env var, not
+# RGW_ACCESS_KEY, so running this inside the governance container does NOT inherit
+# governance's read-only reader creds. (A real steward would write with a scoped credential.)
+AK = os.environ.get("INGEST_S3_KEY", "test_access_key")
+SK = os.environ.get("INGEST_S3_SECRET", "test_access_secret")
 PREFIX = "datasets/projz/"
 
 
