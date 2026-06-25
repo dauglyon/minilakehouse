@@ -48,6 +48,9 @@ REGO_FILES = ["policy.rego", "blob.rego"]
 # A dataset name is a bundle/JSON key and a SQL pk; a prefix becomes an STS resource ARN.
 # Both come from an authenticated steward but are still untrusted input — constrain them.
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# A prefix must be datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
+# policy-size limit and restricted so no control/space/unicode reaches the ARN.
+PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}/$")
 
 # --- Storage / freshness ---
 # Least-privilege reader creds (ListBucket on datasets/* via a bucket policy set by the
@@ -167,8 +170,11 @@ def init_db():
             (json.dumps(tg.get("grants", {})), tg.get("writers", [])),
         )
         for grp, prefixes in reg.get("register_grants", {}).items():
+            # Roots MUST end in / — the ownership boundary is startswith(prefix, root), so a
+            # missing slash would let `datasets/projx` own `datasets/projxEVIL/`.
+            roots = [p if p.endswith("/") else p + "/" for p in prefixes]
             cur.execute("INSERT INTO register_grants (grp, prefixes) VALUES (%s, %s) "
-                        "ON CONFLICT (grp) DO NOTHING", (grp, prefixes))
+                        "ON CONFLICT (grp) DO NOTHING", (grp, roots))
         app.logger.info("seeded governance registry from %s", REGISTRY_PATH)
 
 
@@ -247,9 +253,8 @@ def opa_pred(rule, subject, groups, dataset, action="read", prefix=None):
 
 
 def _confined_prefix(prefix):
-    """A registrable prefix: under datasets/<segment>/, ends in /, no traversal/escape."""
-    return (isinstance(prefix, str) and prefix.startswith("datasets/")
-            and prefix.endswith("/") and prefix != "datasets/"
+    """A registrable prefix: datasets/<segment>/, bounded safe charset, no traversal/escape."""
+    return (isinstance(prefix, str) and PREFIX_RE.match(prefix) is not None
             and ".." not in prefix and "//" not in prefix)
 
 
@@ -347,7 +352,10 @@ def events():
     # reconcile, which reads storage truth itself; a missed/forged event is harmless and
     # self-heals on the next timer sweep. Unauthenticated by design (trusted-network dev).
     body = request.get_json(silent=True) or {}
-    records = body.get("Records", [])[:MAX_EVENT_RECORDS]  # bound the fan-out
+    records = body.get("Records", [])
+    if len(records) > MAX_EVENT_RECORDS:  # bound the fan-out; the timer reconcile covers the rest
+        app.logger.warning("/events: truncating %d records to %d", len(records), MAX_EVENT_RECORDS)
+        records = records[:MAX_EVENT_RECORDS]
     with db() as cur:  # the registry once, not once per record
         cur.execute("SELECT name, prefix FROM datasets")
         registry = [(r["name"], r["prefix"]) for r in cur.fetchall()]

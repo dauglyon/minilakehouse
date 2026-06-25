@@ -29,6 +29,7 @@ import base64
 import hashlib
 import logging
 import os
+import threading
 import time
 
 import jwt  # PyJWT (with cryptography for RS256)
@@ -109,13 +110,20 @@ _JWK = {
 
 app = Flask(__name__)
 _kc = {"token": None, "exp": 0}  # cached service-account token
+_kc_lock = threading.Lock()
 
 
 def _kc_admin_token() -> str:
     """Cached client-credentials token for the realm-scoped `idp-shim` service account
-    (view-users only). Refreshed shortly before expiry — not re-fetched per exchange."""
+    (view-users only). Refreshed under a lock shortly before expiry — not per exchange, and
+    not racily by concurrent threads."""
     now = int(time.time())
-    if not _kc["token"] or now >= _kc["exp"]:
+    if _kc["token"] and now < _kc["exp"]:
+        return _kc["token"]
+    with _kc_lock:
+        now = int(time.time())
+        if _kc["token"] and now < _kc["exp"]:  # another thread refreshed while we waited
+            return _kc["token"]
         r = requests.post(
             f"{KC_BASE}/realms/{KC_REALM}/protocol/openid-connect/token",
             data={"grant_type": "client_credentials", "client_id": SHIM_KC_CLIENT_ID,
@@ -123,7 +131,7 @@ def _kc_admin_token() -> str:
         r.raise_for_status()
         tok = r.json()
         _kc["token"], _kc["exp"] = tok["access_token"], now + tok.get("expires_in", 60) - 30
-    return _kc["token"]
+        return _kc["token"]
 
 
 def lookup_groups(username: str) -> list:
@@ -139,8 +147,10 @@ def lookup_groups(username: str) -> list:
         groups = requests.get(f"{KC_BASE}/admin/realms/{KC_REALM}/users/{users[0]['id']}/groups",
                               headers=h, timeout=5).json()
         return [g["name"] for g in groups]
-    except Exception as e:  # noqa: BLE001 - best effort
-        app.logger.warning("group lookup failed for %s: %s", username, e)
+    except Exception as e:  # noqa: BLE001
+        # Fail SAFE: no groups -> no OPA grants -> deny. A lookup blip can only under-
+        # privilege a user for one request (never over-grant); logged, not silent.
+        app.logger.warning("group lookup failed for %s (minting with no roles): %s", username, e)
         return []
 
 

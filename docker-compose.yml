@@ -68,6 +68,9 @@ services:
       RGW_SECRET_KEY: ${RGW_SECRET_KEY}
       S3_BUCKET: ${S3_BUCKET}
       GOVERNANCE_READER_UID: governance-reader
+      # Reader creds too, so the one-shot can confirm the reader can actually list before exiting.
+      GOVERNANCE_READER_KEY: ${GOVERNANCE_READER_KEY}
+      GOVERNANCE_READER_SECRET: ${GOVERNANCE_READER_SECRET}
       EVENTS_ENDPOINT: http://governance:8000/events
     command: ["python", "rgw_setup.py"]
 
