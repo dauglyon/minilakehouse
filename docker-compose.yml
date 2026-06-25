@@ -176,7 +176,6 @@ services:
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       OPA_URL: http://opa:8181/v1/data/lakehouse/blob/allow
-      GOVERNANCE_URL: http://governance:8000
       RGW_ENDPOINT: http://ceph:8080
       BLOB_ROLE_ARN: ${BLOB_ROLE_ARN}
       BUCKET: ${S3_BUCKET}

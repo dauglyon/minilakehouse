@@ -4,29 +4,30 @@
     "writers": ["alice"]
   },
   "register_grants": {
-    "jgi-writers": ["datasets/projx/", "datasets/projz/"]
+    "jgi-writers": ["datasets/projx/", "datasets/projz/"],
+    "projw-team": ["datasets/projw/"]
   },
-  "datasets": {
-    "projx-public": {
+  "datasets": [
+    {
       "prefix": "datasets/projx/public/",
       "description": "projx public data",
       "steward": "alice",
       "visibility": ["jgi-writers"],
       "access": ["jgi-writers"]
     },
-    "projx-private": {
+    {
       "prefix": "datasets/projx/private/",
       "description": "projx private data",
       "steward": "alice",
       "visibility": ["jgi-writers"],
       "access": []
     },
-    "projy-secret": {
+    {
       "prefix": "datasets/projy/secret/",
       "description": "projy secret data",
       "steward": "bob",
       "visibility": ["bob-only"],
       "access": ["bob-only"]
     }
-  }
+  ]
 }

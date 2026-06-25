@@ -5,6 +5,7 @@
   "registrationAllowed": false,
   "groups": [
     { "name": "jgi-writers", "path": "/jgi-writers" },
+    { "name": "projw-team", "path": "/projw-team" },
     { "name": "no-access", "path": "/no-access" },
     { "name": "stewards", "path": "/stewards" }
   ],
@@ -32,6 +33,18 @@
         { "type": "password", "value": "bob", "temporary": false }
       ],
       "groups": ["/no-access"]
+    },
+    {
+      "username": "carol",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Carol",
+      "lastName": "ProjW",
+      "email": "carol@example.org",
+      "credentials": [
+        { "type": "password", "value": "carol", "temporary": false }
+      ],
+      "groups": ["/projw-team", "/stewards"]
     },
     {
       "username": "service-account-idp-shim",

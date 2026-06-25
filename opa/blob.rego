@@ -1,11 +1,10 @@
 package lakehouse.blob
 
 # Blob-plane access predicate (Flow C: blob datasets). The broker asks ONLY "may this subject
-# read this named dataset?" → yes/no. There is NO path logic here: OPA is a predicate,
-# never an enumerator. The broker resolves the dataset→prefix mapping (from governance) and
-# binds the prefix into the vended credential's session policy itself.
+# read this dataset?" → yes/no. There is NO path logic here: OPA is a predicate, never an
+# enumerator. `dataset` is the dataset's id (a tenant-qualified name like projx/public).
 #
-# Input:  {subject, groups, action, dataset: "<name>"}
+# Input:  {subject, groups, action, dataset: "<id>"}
 # Output: allow = true|false
 #
 # Grants are group-based and published by governance in data.dataset_grants.groups (the

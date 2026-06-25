@@ -45,7 +45,7 @@ Two independent permission **planes** per dataset:
 - **access** — may you *read the bytes*? (vending, Flows B/C)
 
 So a dataset can be **see-but-not-read** (the Lake Formation model): `alice` can discover
-`projx-private` exists but cannot read it.
+`projx/private` exists but cannot read it.
 
 **Why the idp-shim exists (tables):** Trino can only *assert* the end user (an unsigned note
 Keycloak won't trust), so a real per-user token can't reach Polaris through Trino directly.
@@ -93,7 +93,8 @@ has a different issuer and would be rejected.)
 
 *"What exists that I could request?"* — separate from "what can I read." Governance
 enumerates its registry and filters each entry through OPA's **visibility** predicate,
-returning names only (never bytes or credentials).
+returning dataset **ids** only (never bytes or credentials). A dataset's id is the
+tenant-qualified slice of its prefix: `datasets/projx/public/` → `projx/public`.
 
 ```bash
 docker compose exec -T governance python - <<'PY'
@@ -104,10 +105,10 @@ def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id=
 for u in ("alice", "bob"):
     seen = requests.get("http://governance:8000/discover",
                         headers={"Authorization": f"Bearer {tok(u)}"}).json()["visible"]
-    print(f"{u} sees:", [(e["name"], e["can_read"]) for e in seen])
+    print(f"{u} sees:", [(e["id"], e["can_read"]) for e in seen])
 PY
-#  alice sees: [('projx-private', False), ('projx-public', True)]
-#         ^ projx-private is VISIBLE but can_read=False — see-but-not-read
+#  alice sees: [('projx/private', False), ('projx/public', True)]
+#         ^ projx/private is VISIBLE but can_read=False — see-but-not-read
 #  bob   sees: []
 #         ^ bob is in no group with a visibility grant, so he sees nothing
 ```
@@ -151,15 +152,15 @@ def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id=
     client_secret="trino-secret", username=u, password=u)).json()["access_token"]
 def vend(u, ds): return requests.post("http://broker:9100/vend",
     headers={"Authorization": f"Bearer {tok(u)}"}, json={"dataset": ds}).status_code
-print("alice projx-public :", vend("alice", "projx-public"))    # 200 -> scoped temp creds
-print("alice projx-private:", vend("alice", "projx-private"))   # 403 -> visible but not readable
-print("bob   projx-public :", vend("bob",   "projx-public"))    # 403 -> bob is granted nothing
+print("alice projx/public :", vend("alice", "projx/public"))    # 200 -> scoped temp creds
+print("alice projx/private:", vend("alice", "projx/private"))   # 403 -> visible but not readable
+print("bob   projx/public :", vend("bob",   "projx/public"))    # 403 -> bob is granted nothing
 PY
 ```
 
 The returned credential reads `datasets/projx/public/*` but is **denied** sibling prefixes by
-RGW — the broker binds the dataset→prefix mapping into the credential's session policy itself.
-OPA never sees a path; it answers only "may S read dataset X?".
+RGW — the broker derives the prefix from the id (`datasets/<id>/`) and binds it into the
+credential's session policy itself. OPA never sees a path; it answers only "may S read X?".
 
 ## Registry freshness & governed ingest
 
@@ -172,15 +173,15 @@ not merged: storage owns *existence/stats*, the registry owns *meaning/grants*.
   timer (convergence) **and** is triggered by RGW bucket notifications (near-real-time); a
   missed event self-heals on the next sweep.
 - **Register-at-ingest.** A *new* dataset is born through a governed write path that registers
-  it **with its meaning** (name, prefix, description, grants — only a human can supply these).
-  Authenticated by the caller's own token, **authorized by OPA**: the steward must be in the
-  `stewards` group *and* the prefix must sit under a root their group owns.
+  it **with its meaning** (prefix, description, grants — only a human can supply these; the id
+  derives from the prefix). Authenticated by the caller's own token, **authorized by OPA**: the
+  steward must be in the `stewards` group *and* the prefix must sit under a root one of their groups owns.
 
 ```bash
-# Governed ingest of a NEW dataset projz, as alice (a steward who owns datasets/projz/):
+# Governed ingest of a NEW dataset, as alice (a steward who owns datasets/projz/):
 docker compose exec governance python /seed/ingest-demo.py
 #  -> uploaded 2 objects under datasets/projz/
-#     register: 201 {'name': 'projz', 'ok': True, 'registered_by': 'alice'}
+#     register: 201 {'id': 'projz', 'ok': True, 'registered_by': 'alice'}
 
 # Within one OPA bundle poll (<=10s) alice can discover AND read projz; she is DENIED
 # registering under another group's namespace:
@@ -191,19 +192,23 @@ t = requests.post(KC, data=dict(grant_type="password", client_id="trino",
     client_secret="trino-secret", username="alice", password="alice")).json()["access_token"]
 h = {"Authorization": f"Bearer {t}"}
 time.sleep(10)
-print("discover:", [e["name"] for e in requests.get("http://governance:8000/discover", headers=h).json()["visible"]])
+print("discover:", [e["id"] for e in requests.get("http://governance:8000/discover", headers=h).json()["visible"]])
 print("vend projz:", requests.post("http://broker:9100/vend", headers=h, json={"dataset": "projz"}).status_code)
-print("register under datasets/projy/ (not owned):",
+print("register under datasets/projw/ (not owned):",
       requests.post("http://governance:8000/datasets", headers=h,
-                    json={"name": "x", "prefix": "datasets/projy/x/"}).status_code)
+                    json={"prefix": "datasets/projw/x/"}).status_code)
 PY
-#  -> discover: ['projx-private', 'projx-public', 'projz']
+#  -> discover: ['projx/private', 'projx/public', 'projz']
 #     vend projz: 200
-#     register under datasets/projy/ (not owned): 403
+#     register under datasets/projw/ (not owned): 403
 ```
 
 Delete `projz`'s objects and within a tick it flips to `gone` and leaves discovery; re-add one
 and it returns `live`. `bob` (not a steward) is denied registration entirely.
+
+Because an id is the prefix's tenant slice, two stewards in different groups can each register
+a dataset called `results` (`projx/results` and `projw/results`) — names never collide across
+tenants, and neither can see the other's.
 
 ## Security model
 
@@ -223,10 +228,12 @@ and it returns `live`. `bob` (not a steward) is denied registration entirely.
   request to one dataset prefix. The long-lived governance service holds only a **read-only RGW
   reader** (ListBucket on `datasets/*`, via a bucket policy) and a **realm-scoped `view-users`
   Keycloak service account** — never an admin key. Admin-only RGW setup runs in a one-shot.
-- **Governed ingest is scoped.** A steward may register only under a prefix their group owns
-  (per-group ownership in OPA), prefixes are confined to `datasets/<...>/` (no traversal), and
+- **Governed ingest is scoped.** A steward may register only under a prefix one of their groups
+  owns (per-group ownership in OPA), prefixes are confined to `datasets/<...>/` (no traversal), and
   the overlap check + insert are serialized so two registrations can't claim overlapping
   prefixes.
+- **Tenant-scoped identity.** Dataset ids are derived from per-tenant prefixes, not a global
+  name, so names never collide across tenants and a registration leaks nothing cross-tenant.
 
 ## Limitations
 

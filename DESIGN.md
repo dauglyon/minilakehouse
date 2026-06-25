@@ -69,7 +69,7 @@ files/blobs over S3) under the *same* governance model as tables.
    • Postgres-backed dataset registry  ──►   • predicate over published grants:
      + table grants                            allow / visible / allow_register (blobs),
    • publishes a signed-pull bundle            table lanes (root/vend/read/write)
-   • serves discovery + dataset→prefix       • never enumerates; answers yes/no
+   • serves discovery (Flow A)               • never enumerates; answers yes/no
    • keeps the registry fresh vs storage
 
  ENFORCEMENT (PEPs — ask POLICY, then act)
@@ -89,7 +89,7 @@ files/blobs over S3) under the *same* governance model as tables.
 |-----------|------|
 | **Keycloak** | OIDC IdP — users (`alice`/`bob`), groups, and two service accounts (the engine login client, and a realm-scoped `view-users` account the shim uses). |
 | **idp-shim** | The trusted identity layer for the table plane. Trino can only *assert* the end user (an unsigned note); the shim converts that into a real signed per-user token Polaris validates. Polaris's OIDC issuer. |
-| **governance** | PAP + dataset registry, Postgres-backed. Owns the registry + all grants, publishes them to OPA as a bundle, serves discovery and dataset→prefix, keeps the registry fresh, and accepts governed ingest. Holds only a least-privilege RGW reader. |
+| **governance** | PAP + dataset registry, Postgres-backed. Owns the registry + all grants, publishes them to OPA as a bundle, serves discovery, keeps the registry fresh, and accepts governed ingest. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP. Pulls policy + data from governance as a bundle (authenticated). A predicate: `opa/policy.rego` (tables), `opa/blob.rego` (blobs). |
 | **Polaris** | Iceberg REST catalog. Its Authorizer delegates `loadTable` to OPA; vends per-table STS. Holds identities, no rules. |
 | **broker** | Blob vending bridge: verifies the client's own token, asks OPA, `AssumeRole`s a credential scoped to one dataset prefix. No engine in the byte path. |
@@ -133,9 +133,9 @@ output → true | false
 
 It is a **predicate, never an enumerator**. For discovery, governance enumerates its registry
 itself and calls the predicate per candidate; OPA never returns the inventory. For access, OPA
-answers yes/no on the *named* resource, and the caller binds the resource's prefix into the
-credential. The bundle data is built from the registry's *meaning/grants* only, so storage
-churn never changes what OPA decides.
+answers yes/no on the dataset id, and the caller derives the prefix (`datasets/<id>/`) and
+binds it into the credential. The bundle data is built from the registry's *meaning/grants*
+only, so storage churn never changes what OPA decides.
 
 ## 6. Non-tabular data & registry freshness
 
@@ -166,9 +166,9 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   notifications (near-real-time). Events carry no authority — they only *trigger* a reconcile,
   which reads storage truth itself, so a missed or forged event self-heals on the next sweep.
 - **Register-at-ingest** brings *new* datasets in: a steward uploads objects, then registers
-  the dataset with its meaning (name, prefix, description, grants — only a human can supply
-  these). There is no auto-discovery of datasets from raw storage: a dataset's boundary and
-  meaning are human, not derivable from objects.
+  the dataset with its meaning (prefix, description, grants — only a human can supply these;
+  its id derives from the prefix). There is no auto-discovery of datasets from raw storage: a
+  dataset's boundary and meaning are human, not derivable from objects.
 
 ## 7. Credential vending
 
@@ -204,7 +204,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   (`ListBucket` on `datasets/*`, via a bucket policy) and a realm-scoped `view-users` Keycloak
   service account — never an admin key. Admin-only RGW setup runs in the `rgw-setup` one-shot.
 - **Governed ingest is scoped.** A steward must be in the `stewards` group *and* the prefix
-  must sit under a root their group owns (per-group ownership in OPA). Prefixes are confined
+  must sit under a root one of their groups owns (per-group ownership in OPA). Prefixes are confined
   to `datasets/<...>/` with no traversal, and the overlap-check + insert are serialized (an
   advisory lock) so two registrations can't claim overlapping prefixes.
 - **Bundle pull is authenticated.** The bundle is the full grant model, so OPA presents a

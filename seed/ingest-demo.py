@@ -1,9 +1,9 @@
 """
 seed/ingest-demo.py — a governed ingest (register-at-ingest).
 
-As steward `alice`, upload a dataset's objects then register it WITH ITS MEANING (name,
-prefix, description, grants — the part only a human supplies). Run in-network so the token
-issuer matches what governance validates:
+As steward `alice`, upload a dataset's objects then register it WITH ITS MEANING (prefix,
+description, grants — the part only a human supplies; the id derives from the prefix). Run
+in-network so the token issuer matches what governance validates:
 
     docker compose exec governance python /seed/ingest-demo.py
 """
@@ -46,13 +46,12 @@ def main():
     # 2. register the dataset WITH ITS MEANING, as a steward
     tok = token("alice")
     r = requests.post(f"{GOV}/datasets", headers={"Authorization": f"Bearer {tok}"}, json={
-        "name": "projz",
         "prefix": PREFIX,
         "description": "projz ingested dataset",
         "visibility": ["jgi-writers"],
         "access": ["jgi-writers"],
     })
-    print("register:", r.status_code, r.json())
+    print("register:", r.status_code, r.json())   # -> id "projz" (derived from the prefix)
     if r.status_code == 409:
         print("(projz already registered — re-run is a no-op)")
     else:

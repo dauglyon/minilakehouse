@@ -8,7 +8,7 @@ no engine in the byte path, safe even against a compromised engine.
 
 Flow:
   1. verify the user's token            -> subject + groups
-  2. resolve dataset -> prefix          (from governance's registry over HTTP; NOT OPA)
+  2. derive prefix from the dataset id  (datasets/<id>/ — a pure derivation, NOT OPA)
   3. ask OPA the predicate "may S read dataset X?"  -> yes/no   (OPA never enumerates)
   4. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to the
      dataset's prefix (the role permits datasets/*; the session policy narrows; the
@@ -18,7 +18,6 @@ Flow:
 import json
 import os
 import re
-from urllib.parse import quote
 
 import boto3
 import jwt
@@ -35,9 +34,9 @@ BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
 BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
-GOVERNANCE_URL = os.environ["GOVERNANCE_URL"]
 TTL = int(os.environ.get("CRED_TTL_SECONDS", "900"))
-NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# A dataset id is a tenant-qualified name (e.g. projx/public); the prefix is derived from it.
+ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 
 _jwks = jwt.PyJWKClient(KEYCLOAK_JWKS)
 _http = requests.Session()
@@ -87,17 +86,6 @@ def opa_allows(subject, groups, dataset):
     return r.json().get("result") is True
 
 
-def resolve_prefix(dataset):
-    """Resolve dataset -> prefix from the governance registry (single source of truth).
-    The name is URL-encoded so it can't traverse to other governance routes (it's caller
-    input)."""
-    r = _http.get(f"{GOVERNANCE_URL}/datasets/{quote(dataset, safe='')}", timeout=5)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    return r.json()["prefix"]
-
-
 def session_policy(prefix):
     return json.dumps({"Version": "2012-10-17", "Statement": [
         {"Effect": "Allow", "Action": ["s3:GetObject"],
@@ -120,13 +108,10 @@ def vend():
         return err
 
     dataset = (request.get_json(silent=True) or {}).get("dataset")
-    if not isinstance(dataset, str) or not NAME_RE.match(dataset):
-        return jsonify({"error": "invalid dataset name"}), 400
-    prefix = resolve_prefix(dataset)
-    if prefix is None:
-        return jsonify({"error": f"unknown dataset {dataset!r}"}), 404
-    # Defense-in-depth: governance confines prefixes at registration, but this prefix is
-    # about to become an STS resource ARN, so refuse independently if it isn't confined.
+    if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
+        return jsonify({"error": "invalid dataset id"}), 400
+    prefix = f"datasets/{dataset}/"
+    # the prefix becomes an STS ARN below; refuse if the derivation isn't confined
     if not (prefix.startswith("datasets/") and prefix.endswith("/") and ".." not in prefix):
         app.logger.error("refusing unconfined prefix for %s: %r", dataset, prefix)
         return jsonify({"error": "internal error"}), 500

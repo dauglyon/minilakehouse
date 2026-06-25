@@ -48,12 +48,16 @@ BUNDLE_TOKEN = os.environ.get("BUNDLE_TOKEN", "")
 # other realm client can't be replayed here as a user credential.
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
 REGO_FILES = ["policy.rego", "blob.rego"]
-# A dataset name is a bundle/JSON key and a SQL pk; a prefix becomes an STS resource ARN.
-# Both come from an authenticated steward but are still untrusted input — constrain them.
-NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-# A prefix must be datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
+# A prefix becomes an STS resource ARN; it's from an authenticated steward but still
+# untrusted. Confine it: datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
 # policy-size limit and restricted so no control/space/unicode reaches the ARN.
 PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}/$")
+
+
+def derive_id(prefix):
+    """A dataset's id is its prefix without the `datasets/` root and trailing slash:
+    `datasets/projx/public/` -> `projx/public`."""
+    return prefix[len("datasets/"):-1]
 
 # --- Storage / freshness ---
 # Least-privilege reader creds (ListBucket on datasets/* via a bucket policy set by the
@@ -79,8 +83,8 @@ _http = requests.Session()
 # CREATE TABLE IF NOT EXISTS never has to ALTER a table on an already-persisted volume.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS datasets (
-    name            TEXT PRIMARY KEY,
-    prefix          TEXT NOT NULL,
+    id              TEXT PRIMARY KEY,        -- derive_id(prefix): the tenant-qualified identity
+    prefix          TEXT UNIQUE NOT NULL,    -- storage location; one dataset per prefix
     description     TEXT,
     steward         TEXT,
     visibility      TEXT[] NOT NULL DEFAULT '{}',
@@ -160,13 +164,13 @@ def init_db():
             return
         with open(REGISTRY_PATH) as f:
             reg = json.load(f)
-        for name, d in reg.get("datasets", {}).items():
+        for d in reg.get("datasets", []):
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
-                raise ValueError(f"registry.json: bad prefix for {name!r}: {d['prefix']!r}")
+                raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                "INSERT INTO datasets (name, prefix, description, steward, visibility, access) "
-                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING",
-                (name, d["prefix"], d.get("description"), d.get("steward"),
+                "INSERT INTO datasets (id, prefix, description, steward, visibility, access) "
+                "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
                  d.get("visibility", []), d.get("access", [])),
             )
         tg = reg.get("table_grants", {})
@@ -190,12 +194,12 @@ def derive_data():
     reconcile (which only touches existence/stats) never moves OPA."""
     access_groups, vis_groups = {}, {}
     with db() as cur:
-        cur.execute("SELECT name, visibility, access FROM datasets")
+        cur.execute("SELECT id, visibility, access FROM datasets")
         for row in cur.fetchall():
             for g in row["access"]:
-                access_groups.setdefault(g, []).append(row["name"])
+                access_groups.setdefault(g, []).append(row["id"])
             for g in row["visibility"]:
-                vis_groups.setdefault(g, []).append(row["name"])
+                vis_groups.setdefault(g, []).append(row["id"])
         cur.execute("SELECT grants, writers FROM table_grants WHERE id = 1")
         tg = cur.fetchone() or {"grants": {}, "writers": []}
         cur.execute("SELECT grp, prefixes FROM register_grants")
@@ -271,14 +275,14 @@ def _confined_prefix(prefix):
 # loses the update or resurrects a gone dataset. Non-empty => live; empty => gone ONLY if it
 # was live (was-populated-now-empty), else unchanged (pending stays pending, gone stays gone).
 _RECONCILE_SQL = """
-WITH prev AS (SELECT status AS old FROM datasets WHERE name = %(n)s FOR UPDATE)
+WITH prev AS (SELECT status AS old FROM datasets WHERE id = %(n)s FOR UPDATE)
 UPDATE datasets d SET
     status = CASE WHEN %(c)s > 0 THEN 'live'
                   WHEN d.status = 'live' THEN 'gone'
                   ELSE d.status END,
     object_count = %(c)s, total_bytes = %(t)s,
     last_modified = %(m)s, last_reconciled = now()
-FROM prev WHERE d.name = %(n)s
+FROM prev WHERE d.id = %(n)s
 RETURNING prev.old AS old, d.status AS new
 """
 
@@ -295,27 +299,27 @@ def _stat_prefix(prefix):
     return count, total, last
 
 
-def reconcile(name=None):
-    """The ONLY writer of the existence/stats columns. With `name`: just that dataset (the
+def reconcile(ds_id=None):
+    """The ONLY writer of the existence/stats columns. With `ds_id`: just that dataset (the
     event path). Without: a full sweep (the timer). Storage is the truth here; the registry
     grants are untouched, so reconcile never moves OPA."""
     with db() as cur:
-        # name=None => full sweep (NULL IS NULL matches every row); else just that dataset.
-        cur.execute("SELECT name, prefix FROM datasets WHERE (%s IS NULL OR name = %s)",
-                    (name, name))
+        # ds_id=None => full sweep (NULL IS NULL matches every row); else just that dataset.
+        cur.execute("SELECT id, prefix FROM datasets WHERE (%s IS NULL OR id = %s)",
+                    (ds_id, ds_id))
         rows = cur.fetchall()
     for row in rows:
         try:
             count, total, last = _stat_prefix(row["prefix"])
         except Exception as e:  # noqa: BLE001
-            app.logger.warning("reconcile %s: list failed: %s", row["name"], e)
+            app.logger.warning("reconcile %s: list failed: %s", row["id"], e)
             continue
         with db(commit=True) as cur:
-            cur.execute(_RECONCILE_SQL, {"n": row["name"], "c": count, "t": total, "m": last})
+            cur.execute(_RECONCILE_SQL, {"n": row["id"], "c": count, "t": total, "m": last})
             r = cur.fetchone()
         if r and r["old"] != r["new"]:
             app.logger.info("reconcile %s: %s -> %s (count=%s)",
-                            row["name"], r["old"], r["new"], count)
+                            row["id"], r["old"], r["new"], count)
 
 
 def reconcile_loop():
@@ -332,9 +336,9 @@ def reconcile_loop():
 @app.get("/health")
 def health():
     with db() as cur:
-        cur.execute("SELECT name FROM datasets ORDER BY name")
-        names = [r["name"] for r in cur.fetchall()]
-    return jsonify({"ok": True, "datasets": names})
+        cur.execute("SELECT id FROM datasets ORDER BY id")
+        ids = [r["id"] for r in cur.fetchall()]
+    return jsonify({"ok": True, "datasets": ids})
 
 
 @app.get("/bundle.tar.gz")
@@ -344,16 +348,8 @@ def bundle():
     return app.response_class(build_bundle(), mimetype="application/gzip")
 
 
-@app.get("/datasets/<name>")
-def dataset(name):
-    # Prefix is stable meaning; the broker (a SEPARATE access plane) resolves it regardless
-    # of status — a transiently-empty dataset must not 404 the broker.
-    with db() as cur:
-        cur.execute("SELECT prefix FROM datasets WHERE name = %s", (name,))
-        row = cur.fetchone()
-    if not row:
-        return jsonify({"error": "unknown dataset"}), 404
-    return jsonify({"prefix": row["prefix"]})
+# No dataset->prefix endpoint: prefix = "datasets/<id>/" is a pure derivation the broker does
+# locally (exposing it would leak the existence of datasets a caller can't see).
 
 
 @app.post("/events")
@@ -367,8 +363,8 @@ def events():
         app.logger.warning("/events: truncating %d records to %d", len(records), MAX_EVENT_RECORDS)
         records = records[:MAX_EVENT_RECORDS]
     with db() as cur:  # the registry once, not once per record
-        cur.execute("SELECT name, prefix FROM datasets")
-        registry = [(r["name"], r["prefix"]) for r in cur.fetchall()]
+        cur.execute("SELECT id, prefix FROM datasets")
+        registry = [(r["id"], r["prefix"]) for r in cur.fetchall()]
     touched = set()
     for rec in records:
         key = rec.get("s3", {}).get("object", {}).get("key", "")
@@ -386,56 +382,49 @@ def events():
 
 @app.post("/datasets")
 def register_dataset():
-    # Register-at-ingest: a NEW dataset enters the registry with its human-supplied meaning
-    # (name, prefix, description, grants). authN = the caller's own token; authZ = OPA
-    # (the `stewards` capability lives in the published bundle, not hardcoded here).
+    # Register a new dataset. The steward supplies the PREFIX (which they own); the id is
+    # derived from it. authN = the caller's token; authZ = OPA's allow_register.
     subject, groups, err = authed_user()
     if err:
         return err
 
     body = request.get_json(silent=True) or {}
-    name, prefix = body.get("name"), body.get("prefix")
-    # The credential the broker later vends is scoped by this PREFIX string, while OPA decides
-    # by NAME — so an unconfined/overlapping prefix would let a steward read another dataset's
-    # bytes. Confine it: under datasets/<segment>/, no escape, and no overlap with an existing
-    # dataset's prefix (string-containment either way).
-    if not name or not isinstance(name, str) or not NAME_RE.match(name):
-        return jsonify({"error": "name must match [A-Za-z0-9._-]{1,128}"}), 400
+    prefix = body.get("prefix")
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
+    ds_id = derive_id(prefix)
 
-    if not opa_pred("allow_register", subject, groups, name, action="register", prefix=prefix):
+    if not opa_pred("allow_register", subject, groups, ds_id, action="register", prefix=prefix):
         app.logger.info("DENY register subject=%s groups=%s prefix=%s", subject, groups, prefix)
         return jsonify({"error": "forbidden"}), 403
 
     try:
         with db(commit=True) as cur:
-            # Serialize registrations: the overlap check + insert must be atomic, else two
-            # concurrent overlapping prefixes both pass the check (and the broker would then
-            # vend a credential over another dataset's bytes). The lock is held to commit.
+            # Serialize: the overlap check + insert must be atomic, else two concurrent
+            # overlapping prefixes both pass. The lock is held to commit.
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (REGISTER_LOCK_KEY,))
             cur.execute("SELECT prefix FROM datasets")
             existing = [r["prefix"] for r in cur.fetchall()]
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
-                return jsonify({"error": "prefix overlaps an existing dataset"}), 409
+                return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                "INSERT INTO datasets (name, prefix, description, steward, visibility, access, status) "
+                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s, 'pending')",
-                (name, prefix, body.get("description"), subject,
+                (ds_id, prefix, body.get("description"), subject,
                  body.get("visibility", []), body.get("access", [])),
             )
     except psycopg2.errors.UniqueViolation:
-        return jsonify({"error": "dataset already exists"}), 409
+        return jsonify({"error": "dataset unavailable"}), 409
 
-    # The dataset is registered; classify it now (pending->live if its bytes already exist)
-    # so callers see it immediately. Best-effort: a slow/absent RGW must not fail a committed
+    # The dataset is registered; classify it now (pending->live if its bytes already exist) so
+    # callers see it immediately. Best-effort: a slow/absent RGW must not fail a committed
     # registration — the periodic timer will classify it regardless.
     try:
-        reconcile(name)
+        reconcile(ds_id)
     except Exception as e:  # noqa: BLE001
-        app.logger.warning("post-register reconcile failed (timer will classify %s): %s", name, e)
-    app.logger.info("REGISTER subject=%s name=%s prefix=%s", subject, name, prefix)
-    return jsonify({"ok": True, "name": name, "registered_by": subject}), 201
+        app.logger.warning("post-register reconcile failed (timer will classify %s): %s", ds_id, e)
+    app.logger.info("REGISTER subject=%s id=%s prefix=%s", subject, ds_id, prefix)
+    return jsonify({"ok": True, "id": ds_id, "registered_by": subject}), 201
 
 
 @app.get("/discover")
@@ -448,19 +437,19 @@ def discover():
     # populated (pending) dataset. Existence is storage truth (reconcile); visibility is
     # the OPA predicate below. Discovery = OPA-visible ∩ live.
     with db() as cur:
-        cur.execute("SELECT name, description, steward FROM datasets WHERE status = 'live' ORDER BY name")
+        cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' ORDER BY id")
         rows = cur.fetchall()
 
     visible = []
     for row in rows:
-        name = row["name"]
+        ds_id = row["id"]
         # PREDICATE per entry — OPA never returns the inventory; governance builds it.
-        if opa_pred("visible", subject, groups, name):
+        if opa_pred("visible", subject, groups, ds_id):
             visible.append({
-                "name": name,
+                "id": ds_id,
                 "description": row["description"],
                 "steward": row["steward"],
-                "can_read": opa_pred("allow", subject, groups, name),
+                "can_read": opa_pred("allow", subject, groups, ds_id),
             })
     return jsonify({"subject": subject, "visible": visible})
 
