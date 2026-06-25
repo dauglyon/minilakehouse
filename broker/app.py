@@ -50,6 +50,8 @@ _sts = boto3.client(
 app = Flask(__name__)
 
 
+# NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
+# separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token):
     """Cryptographically verify the caller's own Keycloak token -> (subject, groups). PyJWT
     enforces signature + exp; we add issuer and azp (the token must have been issued through
