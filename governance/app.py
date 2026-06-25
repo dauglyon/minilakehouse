@@ -61,7 +61,8 @@ RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
 RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
 MAX_EVENT_RECORDS = 1000  # cap the per-request reconcile fan-out (the endpoint is unauthenticated)
-SEED_LOCK_KEY = 0x6D6C68  # advisory-lock key for the one-time registry seed ("mlh")
+SEED_LOCK_KEY = 0x6D6C68      # advisory-lock key for the one-time registry seed ("mlh")
+REGISTER_LOCK_KEY = 0x6D6C72  # advisory-lock key serializing register-at-ingest ("mlr")
 # Short timeouts: notification wiring is best-effort; the reconcile timer (Stage 3) is the
 # authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
@@ -157,6 +158,8 @@ def init_db():
         with open(REGISTRY_PATH) as f:
             reg = json.load(f)
         for name, d in reg.get("datasets", {}).items():
+            if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
+                raise ValueError(f"registry.json: bad prefix for {name!r}: {d['prefix']!r}")
             cur.execute(
                 "INSERT INTO datasets (name, prefix, description, steward, visibility, access) "
                 "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (name) DO NOTHING",
@@ -400,6 +403,10 @@ def register_dataset():
 
     try:
         with db(commit=True) as cur:
+            # Serialize registrations: the overlap check + insert must be atomic, else two
+            # concurrent overlapping prefixes both pass the check (and the broker would then
+            # vend a credential over another dataset's bytes). The lock is held to commit.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (REGISTER_LOCK_KEY,))
             cur.execute("SELECT prefix FROM datasets")
             existing = [r["prefix"] for r in cur.fetchall()]
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):

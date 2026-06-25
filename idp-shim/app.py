@@ -54,10 +54,9 @@ KEY_PATH = os.environ.get("SHIM_KEY_PATH", "/keys/shim-key.pem")
 
 logging.basicConfig(level=logging.INFO)
 
-# Principals the engine may NOT assert via token-exchange. The engine is trusted to
-# speak for end users, never to escalate to the internal admin or its own service
-# identity. (trino_svc == SERVICE_PRINCIPAL below.)
-RESERVED_PRINCIPALS = {"root", "trino_svc"}
+# Principals the engine may NOT assert via token-exchange. The engine is trusted to speak
+# for end users, never to escalate to the internal admin or its own service identity.
+RESERVED_PRINCIPALS = {"root", SERVICE_PRINCIPAL}
 
 def _load_or_create_key_pem() -> bytes:
     """Load the signing key from disk; generate + persist it on first run. The key MUST
@@ -202,11 +201,6 @@ def _valid_service_bearer() -> bool:
     return claims.get("principal_name") == SERVICE_PRINCIPAL
 
 
-def _caller_is_trusted_engine() -> bool:
-    # Either the client secret, or a valid service token the shim itself issued.
-    return _client_ok() or _valid_service_bearer()
-
-
 @app.get("/.well-known/openid-configuration")
 def discovery():
     return jsonify({
@@ -262,7 +256,7 @@ def token():
                 app.logger.warning("could not decode subject_token: %s", e)
         if not user:
             return jsonify({"error": "invalid_request", "error_description": "no subject"}), 400
-        if user in RESERVED_PRINCIPALS or user == SERVICE_PRINCIPAL:
+        if user in RESERVED_PRINCIPALS:
             app.logger.warning("refusing to mint reserved principal via exchange: %s", user)
             return jsonify({"error": "invalid_request", "error_description": "subject not allowed"}), 403
         roles = lookup_groups(user)
