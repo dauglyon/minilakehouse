@@ -8,7 +8,7 @@ no engine in the byte path, safe even against a compromised engine.
 
 Flow:
   1. verify the user's token            -> subject + groups
-  2. resolve dataset -> prefix          (the broker's static registry; NOT OPA)
+  2. resolve dataset -> prefix          (from governance's registry over HTTP; NOT OPA)
   3. ask OPA the predicate "may S read dataset X?"  -> yes/no   (OPA never enumerates)
   4. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to the
      dataset's prefix (the role permits datasets/*; the session policy narrows; the

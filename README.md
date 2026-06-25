@@ -238,4 +238,7 @@ and it returns `live`. `bob` (not a steward) is denied registration entirely.
 - No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
   its bytes vanished). Discovery is blob-only; table discovery is via the catalog's own listing.
 - Plaintext/no-TLS, dev credentials in `.env`, the OPA debug API exposed — all dev-only.
-- Re-running the `polaris-setup` one-shot drops & recreates the catalog (re-seed the table after).
+- RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the
+  `projx` demo blobs are re-seeded automatically, but re-seed the table (the command above)
+  and re-run the ingest demo for `projz`. (Re-running the `polaris-setup` one-shot likewise
+  drops & recreates the catalog — re-seed the table after.)
