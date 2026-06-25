@@ -112,6 +112,9 @@ services:
     # Bundle mode: OPA pulls policy + data from governance (single-sourced), instead of
     # loading hand-edited files from a mount.
     command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=debug", "-c", "/config/opa.yaml"]
+    environment:
+      # The bundle-pull bearer; config.yaml references it as ${BUNDLE_TOKEN} (single-sourced).
+      BUNDLE_TOKEN: ${BUNDLE_TOKEN}
     depends_on:
       governance:
         condition: service_healthy

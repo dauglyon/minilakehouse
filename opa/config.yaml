@@ -1,13 +1,14 @@
 # OPA bundle mode: OPA pulls policy + data as a bundle from the governance service, instead
 # of loading hand-edited files from a mount. This makes governance the single source of truth
 # and keeps OPA read-only (no writable data API). The bundle carries the entire grant model,
-# so the pull is authenticated with a shared bearer (must match BUNDLE_TOKEN in governance).
+# so the pull is authenticated with a shared bearer — sourced from the BUNDLE_TOKEN env var
+# (set in .env, the same value governance checks) rather than hardcoded here.
 services:
   governance:
     url: http://governance:8000
     credentials:
       bearer:
-        token: bundle-pull-secret
+        token: ${BUNDLE_TOKEN}
 bundles:
   authz:
     service: governance
