@@ -1,5 +1,5 @@
 """
-broker — the blob vending broker (Phase 1, Flow C). The TRUE end-to-end plane.
+broker — the blob vending broker (Flow C: blob datasets). The true end-to-end plane.
 
 A client presents its OWN Keycloak token and names a dataset. Unlike the idp-shim (which
 trusts the engine's *assertion* of a user), the broker has the user's real token, so it
@@ -125,12 +125,18 @@ def vend():
     prefix = resolve_prefix(dataset)
     if prefix is None:
         return jsonify({"error": f"unknown dataset {dataset!r}"}), 404
+    # Defense-in-depth: governance confines prefixes at registration, but this prefix is
+    # about to become an STS resource ARN, so refuse independently if it isn't confined.
+    if not (prefix.startswith("datasets/") and prefix.endswith("/") and ".." not in prefix):
+        app.logger.error("refusing unconfined prefix for %s: %r", dataset, prefix)
+        return jsonify({"error": "internal error"}), 500
 
     if not opa_allows(subject, groups, dataset):
         app.logger.info("DENY subject=%s groups=%s dataset=%s", subject, groups, dataset)
         return jsonify({"error": "forbidden"}), 403
 
     cr = _sts.assume_role(
+        # STS caps the session-name length; truncate so a long username can't fail AssumeRole.
         RoleArn=BLOB_ROLE_ARN, RoleSessionName=f"blob-{subject}"[:32],
         Policy=session_policy(prefix), DurationSeconds=TTL,
     )["Credentials"]

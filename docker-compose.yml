@@ -93,6 +93,7 @@ services:
       REGISTRY: /app/registry.json
       OPA_BASE: http://opa:8181
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
+      BUNDLE_TOKEN: ${BUNDLE_TOKEN}   # bearer OPA must present to pull the policy bundle
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       # Least-privilege reader (ListBucket on datasets/* only) — NOT the RGW admin key.
@@ -154,7 +155,7 @@ services:
       - "19090:9000"
 
   broker:
-    # Blob vending broker (Phase 1, Flow C). The TRUE end-to-end plane: clients present
+    # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
     # their OWN Keycloak token, the broker verifies it, asks OPA yes/no on the named
     # dataset, and vends an STS credential narrowed (session policy) to that dataset's
     # prefix. See broker/app.py.

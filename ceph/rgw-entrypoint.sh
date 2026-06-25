@@ -17,7 +17,7 @@ if ! grep -q 'rgw_sts_key' /etc/ceph/ceph.conf; then
   sed -i "s|\[client.rgw.test\]|[client.rgw.test]\n    rgw_sts_key = ${RGW_STS_KEY}\n    rgw_s3_auth_use_sts = true|" /etc/ceph/ceph.conf
 fi
 
-# Phase 3 (freshness): this image's ceph.conf explicitly narrows the enabled APIs to
+# Bucket notifications (registry freshness): this image's ceph.conf explicitly narrows the enabled APIs to
 # `rgw enable apis = s3, admin, iam, sts` — which DROPS `notifications` (present in the
 # compiled default). Bucket notifications + the SNS topic API need it, so append it.
 # (Ceph treats `rgw enable apis` and `rgw_enable_apis` as the same key.)

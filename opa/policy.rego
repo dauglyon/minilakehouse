@@ -1,20 +1,22 @@
 package polaris.authz
 
-# Phase 0 policy (Stage C + M1 hardening). Deny by default; four allow lanes:
+# Deny by default; four allow lanes:
 #
 #  1. root            — the internal admin principal (bootstrap, principal/grant mgmt).
 #                       NOT assertable via the engine (the idp-shim refuses sub=root).
 #  2. credential vend — LOAD/CREATE table WITH_*_DELEGATION hands out an STS credential
 #                       for a table's files; gated on a per-table grant keyed by the
 #                       real end-user principal.
-#  3. read-only ops   — metadata/listing; expose no bytes → any authenticated principal.
+#  3. read-only ops   — metadata/listing; any authenticated principal. (Table metadata can
+#                       include a file's storage location, but never bytes — reading bytes
+#                       needs lane 2's vended credential.)
 #  4. write / DDL ops — create/update/drop of tables, namespaces, views → "writers"
 #                       only. Admin ops (principal/role/grant/catalog/policy/credential
 #                       management) are in NO lane → root-only by default.
 #
 # Anything not named in a lane is denied for non-root (so bob — no grants, not a writer
 # — cannot read data, nor drop the catalog, nor create principals). Grants + writers
-# live in data (opa/data.json), published by governance, never copied into Polaris.
+# live in OPA's data, published by governance as a bundle, never copied into Polaris.
 
 import future.keywords.if
 import future.keywords.in
@@ -81,12 +83,13 @@ _write_ops := {
 	"CREATE_VIEW", "DROP_VIEW", "REPLACE_VIEW", "RENAME_VIEW",
 }
 
-# Table FQN = "<namespace>.<table>", read from the resource hierarchy Polaris sends.
-_fqn(t) := sprintf("%s.%s", [ns, t.name]) if {
-	some p in t.parents
-	p.type == "NAMESPACE"
-	ns := p.name
-}
+# Table FQN "<ns...>.<table>", from the resource hierarchy Polaris sends. Built from ALL
+# namespace levels in order, so a nested namespace (a.db.t1) yields one deterministic key —
+# not multiple values, which would make this function conflict (eval error) at the vend.
+_fqn(t) := concat(".", array.concat(
+	[p.name | some p in t.parents; p.type == "NAMESPACE"],
+	[t.name],
+))
 
 _granted(principal, tbl) if {
 	tbl in object.get(data.grants, [principal, "read"], [])

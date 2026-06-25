@@ -109,7 +109,7 @@ PY
 #  alice sees: [('projx-private', False), ('projx-public', True)]
 #         ^ projx-private is VISIBLE but can_read=False — see-but-not-read
 #  bob   sees: []
-#         ^ projy-secret is invisible to everyone outside its group
+#         ^ bob is in no group with a visibility grant, so he sees nothing
 ```
 
 OPA is a **predicate** here: governance asks "may S *see* dataset X?" per entry. It never
@@ -232,7 +232,7 @@ and it returns `live`. `bob` (not a steward) is denied registration entirely.
 
 - The shim trusts the engine's *asserted* end-user subject; binding "this caller is our engine"
   to the transport (mTLS / network policy) is future work — the engine proof is a shared secret
-  today (`DESIGN.md` §9b on the trust boundary).
+  today. See the trust-boundary discussion in `DESIGN.md`.
 - Table-plane `writers` is a coarse global list (a writer may write any namespace); a real model
   would scope it per-namespace.
 - No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because

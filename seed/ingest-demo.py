@@ -53,7 +53,10 @@ def main():
         "access": ["jgi-writers"],
     })
     print("register:", r.status_code, r.json())
-    r.raise_for_status()
+    if r.status_code == 409:
+        print("(projz already registered — re-run is a no-op)")
+    else:
+        r.raise_for_status()
 
 
 if __name__ == "__main__":

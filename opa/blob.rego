@@ -1,6 +1,6 @@
 package lakehouse.blob
 
-# Blob-plane access predicate (Phase 1, Flow C). The broker asks ONLY "may this subject
+# Blob-plane access predicate (Flow C: blob datasets). The broker asks ONLY "may this subject
 # read this named dataset?" → yes/no. There is NO path logic here: OPA is a predicate,
 # never an enumerator. The broker already holds the dataset→prefix mapping (its registry)
 # and binds the prefix into the vended credential's session policy itself.
@@ -21,7 +21,7 @@ allow if {
 	input.dataset in object.get(data.dataset_grants.groups, g, [])
 }
 
-# --- Metadata-visibility plane (Phase 2, Flow A): "may S SEE this dataset exists?" ---
+# --- Metadata-visibility plane (Flow A: discovery): "may S SEE this dataset exists?" ---
 # A SEPARATE predicate over visibility_grants. A dataset can be visible-but-not-readable
 # (visible == true, allow == false) — the see-but-not-read model. Discovery (governance)
 # calls this per registry entry; OPA never enumerates.

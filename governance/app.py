@@ -41,6 +41,9 @@ OPA_BASE = os.environ.get("OPA_BASE", "http://opa:8181")
 DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
+# Shared bearer OPA presents to pull /bundle.tar.gz — the bundle is the full grant model, so
+# it isn't world-readable on the network. Empty = no check (dev fallback).
+BUNDLE_TOKEN = os.environ.get("BUNDLE_TOKEN", "")
 # Only tokens issued THROUGH our login client are accepted (azp), so a token minted for some
 # other realm client can't be replayed here as a user credential.
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
@@ -61,9 +64,9 @@ RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
 RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
 MAX_EVENT_RECORDS = 1000  # cap the per-request reconcile fan-out (the endpoint is unauthenticated)
-SEED_LOCK_KEY = 0x6D6C68      # advisory-lock key for the one-time registry seed ("mlh")
-REGISTER_LOCK_KEY = 0x6D6C72  # advisory-lock key serializing register-at-ingest ("mlr")
-# Short timeouts: notification wiring is best-effort; the reconcile timer (Stage 3) is the
+SEED_LOCK_KEY = 0x6D6C68      # arbitrary fixed key: serialize the one-time registry seed
+REGISTER_LOCK_KEY = 0x6D6C72  # arbitrary fixed key: serialize register-at-ingest
+# Short timeouts: storage calls are best-effort; the periodic reconcile timer is the
 # authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
                    retries={"max_attempts": 2})
@@ -336,6 +339,8 @@ def health():
 
 @app.get("/bundle.tar.gz")
 def bundle():
+    if BUNDLE_TOKEN and request.headers.get("Authorization") != f"Bearer {BUNDLE_TOKEN}":
+        return jsonify({"error": "unauthorized"}), 401
     return app.response_class(build_bundle(), mimetype="application/gzip")
 
 
@@ -422,10 +427,13 @@ def register_dataset():
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset already exists"}), 409
 
-    # Synchronous reconcile: if the bytes are already uploaded, flip pending->live NOW so
-    # the demo is deterministic (no wait for a timer tick). Grants reach OPA on its next
-    # bundle poll (≤ poll interval).
-    reconcile(name)
+    # The dataset is registered; classify it now (pending->live if its bytes already exist)
+    # so callers see it immediately. Best-effort: a slow/absent RGW must not fail a committed
+    # registration — the periodic timer will classify it regardless.
+    try:
+        reconcile(name)
+    except Exception as e:  # noqa: BLE001
+        app.logger.warning("post-register reconcile failed (timer will classify %s): %s", name, e)
     app.logger.info("REGISTER subject=%s name=%s prefix=%s", subject, name, prefix)
     return jsonify({"ok": True, "name": name, "registered_by": subject}), 201
 

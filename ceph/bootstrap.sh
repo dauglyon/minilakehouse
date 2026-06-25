@@ -1,5 +1,5 @@
 #!/bin/sh
-# Ceph RGW bootstrap — Stage A (static-cred portion).
+# Ceph RGW bootstrap — create the warehouse bucket and seed demo blobs (the mc-client part).
 #
 # Creates the warehouse bucket using the `mc` (MinIO) client, which talks to RGW
 # reliably (the aws-cli v2.34 high-level/s3api commands hit an internal parse bug
@@ -13,7 +13,7 @@ set -e
 mc alias set rgw "${MC_ENDPOINT}" "${MC_ACCESS_KEY}" "${MC_SECRET_KEY}"
 mc mb --ignore-existing "rgw/${S3_BUCKET}"
 
-# Phase 1 (Flow C): seed demo blob datasets under datasets/projx/{public,private}/.
+# Seed the demo blob datasets (Flow C) under datasets/projx/{public,private}/.
 if [ -d /blobs ]; then
   echo "Seeding demo blobs into ${S3_BUCKET}/datasets/ ..."
   mc cp --recursive /blobs/ "rgw/${S3_BUCKET}/datasets/"
