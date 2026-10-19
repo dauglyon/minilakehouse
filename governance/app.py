@@ -1,27 +1,26 @@
 """
 governance — the PAP + dataset registry, and the single source of truth (Postgres-backed).
 
-It owns the dataset registry + all grants and FEEDS OPA a bundle (OPA pulls it); it does
-not mirror policy into backends. Durable state lives in a dedicated `governance` Postgres DB.
+It owns the dataset registry + all grants; OPA holds none. Every caller, governance included,
+sends OPA only who is asking and what they name; OPA's rules fetch the grants they need from
+the /internal/* lookups here, at decision time. Durable state lives in a dedicated
+`governance` Postgres DB.
 
 Two truths, reconciled not merged: storage is truth for existence/stats; the registry is
 truth for meaning/grants. The `datasets` row carries both, written by disjoint paths —
-meaning/grants by ingest+seed, existence/stats by reconcile. The bundle is built from
-meaning/grants ONLY, so storage churn never moves OPA.
+meaning/grants by ingest+seed, existence/stats by reconcile. Entries served to OPA carry
+meaning/grants only, so storage churn never changes a decision.
 
 Two permission planes per dataset, as separate grant sets: visibility (may you SEE it
 exists) vs access (may you READ the bytes) — so a dataset can be see-but-not-read.
 
-OPA is only ever a PREDICATE: discovery enumerates the registry and asks OPA "may S see
-dataset X?" per entry. OPA never returns a list.
+Governance builds every list; OPA only says which of the candidates it was given pass.
 """
-import gzip
-import io
+import hmac
 import json
 import logging
 import os
 import re
-import tarfile
 import threading
 import time
 from contextlib import contextmanager
@@ -35,19 +34,17 @@ from flask import Flask, jsonify, request
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
-POLICY_DIR = os.environ.get("POLICY_DIR", "/policies")
 REGISTRY_PATH = os.environ.get("REGISTRY", "/app/registry.json")
 OPA_BASE = os.environ.get("OPA_BASE", "http://opa:8181")
 DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
-# Shared bearer OPA presents to pull /bundle.tar.gz — the bundle is the full grant model, so
-# it isn't world-readable on the network. Empty = no check (dev fallback).
-BUNDLE_TOKEN = os.environ.get("BUNDLE_TOKEN", "")
+# Bearer OPA presents to /internal/*. Those return any entry's grants, including datasets the
+# person can't see, so they are closed to everyone else.
+ENTRY_TOKEN = os.environ["ENTRY_TOKEN"]
 # Only tokens issued THROUGH our login client are accepted (azp), so a token minted for some
 # other realm client can't be replayed here as a user credential.
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
-REGO_FILES = ["policy.rego", "blob.rego"]
 # A prefix becomes an STS resource ARN; it's from an authenticated steward but still
 # untrusted. Confine it: datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
 # policy-size limit and restricted so no control/space/unicode reaches the ARN.
@@ -188,42 +185,10 @@ def init_db():
         app.logger.info("seeded governance registry from %s", REGISTRY_PATH)
 
 
-def derive_data():
-    """Turn the registry into the OPA `data` document — meaning/grants ONLY (both planes,
-    both flows). Deliberately status-agnostic: a pending/gone dataset keeps its grants, so
-    reconcile (which only touches existence/stats) never moves OPA."""
-    access_groups, vis_groups = {}, {}
-    with db() as cur:
-        cur.execute("SELECT id, visibility, access FROM datasets")
-        for row in cur.fetchall():
-            for g in row["access"]:
-                access_groups.setdefault(g, []).append(row["id"])
-            for g in row["visibility"]:
-                vis_groups.setdefault(g, []).append(row["id"])
-        cur.execute("SELECT grants, writers FROM table_grants WHERE id = 1")
-        tg = cur.fetchone() or {"grants": {}, "writers": []}
-        cur.execute("SELECT grp, prefixes FROM register_grants")
-        reg_groups = {r["grp"]: r["prefixes"] for r in cur.fetchall()}
-    return {
-        "grants": tg["grants"],
-        "writers": tg["writers"],
-        "dataset_grants": {"groups": access_groups},
-        "visibility_grants": {"groups": vis_groups},
-        "register_grants": {"groups": reg_groups},
-    }
-
-
-def build_bundle():
-    """An OPA bundle: the .rego policies + a data.json generated from the registry."""
-    data = json.dumps(derive_data()).encode()
-    raw = io.BytesIO()
-    with tarfile.open(fileobj=raw, mode="w") as tar:
-        for rego in REGO_FILES:
-            tar.add(os.path.join(POLICY_DIR, rego), arcname=rego)
-        ti = tarfile.TarInfo("data.json")
-        ti.size = len(data)
-        tar.addfile(ti, io.BytesIO(data))
-    return gzip.compress(raw.getvalue())
+def _entry(row):
+    """The meaning/grants half of a datasets row — what OPA decides over."""
+    return {"id": row["id"], "prefix": row["prefix"],
+            "visibility": row["visibility"], "access": row["access"]}
 
 
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
@@ -255,13 +220,18 @@ def authed_user():
         return None, None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_pred(rule, subject, groups, dataset, action="read", prefix=None):
-    inp = {"subject": subject, "groups": groups, "action": action, "dataset": dataset}
-    if prefix is not None:
-        inp["prefix"] = prefix
+def opa(rule, inp):
+    """Evaluate one lakehouse.blob rule; returns its result."""
     r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": inp}, timeout=5)
     r.raise_for_status()
-    return r.json().get("result") is True
+    return r.json().get("result")
+
+
+def internal_caller():
+    """None if the request carries ENTRY_TOKEN, else the 401 to return."""
+    if hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {ENTRY_TOKEN}"):
+        return None
+    return jsonify({"error": "unauthorized"}), 401
 
 
 def _confined_prefix(prefix):
@@ -341,15 +311,59 @@ def health():
     return jsonify({"ok": True, "datasets": ids})
 
 
-@app.get("/bundle.tar.gz")
-def bundle():
-    if BUNDLE_TOKEN and request.headers.get("Authorization") != f"Bearer {BUNDLE_TOKEN}":
-        return jsonify({"error": "unauthorized"}), 401
-    return app.response_class(build_bundle(), mimetype="application/gzip")
+# Grant lookups for OPA's rules (opa/governance.rego), behind ENTRY_TOKEN.
 
 
-# No dataset->prefix endpoint: prefix = "datasets/<id>/" is a pure derivation the broker does
-# locally (exposing it would leak the existence of datasets a caller can't see).
+@app.post("/internal/datasets")
+def internal_datasets():
+    # {id: entry} for the named ids that exist; an unknown id is simply absent.
+    if err := internal_caller():
+        return err
+    ids = (request.get_json(silent=True) or {}).get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        return jsonify({"error": "ids must be a list of strings"}), 400
+    with db() as cur:
+        cur.execute("SELECT id, prefix, visibility, access FROM datasets WHERE id = ANY(%s)",
+                    (ids,))
+        rows = cur.fetchall()
+    return jsonify({"entries": {r["id"]: _entry(r) for r in rows}})
+
+
+@app.get("/internal/register-grants")
+def internal_register_grants():
+    if err := internal_caller():
+        return err
+    with db() as cur:
+        cur.execute("SELECT grp, prefixes FROM register_grants")
+        rows = cur.fetchall()
+    return jsonify({r["grp"]: r["prefixes"] for r in rows})
+
+
+@app.get("/internal/tables/<fqn>")
+def internal_table(fqn):
+    # Principals holding see and read on the table (table grants are per principal: Polaris's
+    # OPA input names the principal but carries no groups). Unknown table = nobody.
+    if err := internal_caller():
+        return err
+    entry = {"id": fqn, "see": [], "read": []}
+    with db() as cur:
+        cur.execute("SELECT p.key AS principal, p.value AS g FROM table_grants, "
+                    "jsonb_each(grants) AS p WHERE id = 1", ())
+        for r in cur.fetchall():
+            for grant in ("see", "read"):
+                if fqn in r["g"].get(grant, []):
+                    entry[grant].append(r["principal"])
+    return jsonify(entry)
+
+
+@app.get("/internal/table-writers")
+def internal_table_writers():
+    if err := internal_caller():
+        return err
+    with db() as cur:
+        cur.execute("SELECT writers FROM table_grants WHERE id = 1")
+        row = cur.fetchone()
+    return jsonify({"writers": row["writers"] if row else []})
 
 
 @app.post("/events")
@@ -394,7 +408,7 @@ def register_dataset():
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
 
-    if not opa_pred("allow_register", subject, groups, ds_id, action="register", prefix=prefix):
+    if opa("allow_register", {"subject": subject, "groups": groups, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s groups=%s prefix=%s", subject, groups, prefix)
         return jsonify({"error": "forbidden"}), 403
 
@@ -440,17 +454,12 @@ def discover():
         cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' ORDER BY id")
         rows = cur.fetchall()
 
-    visible = []
-    for row in rows:
-        ds_id = row["id"]
-        # PREDICATE per entry — OPA never returns the inventory; governance builds it.
-        if opa_pred("visible", subject, groups, ds_id):
-            visible.append({
-                "id": ds_id,
-                "description": row["description"],
-                "steward": row["steward"],
-                "can_read": opa_pred("allow", subject, groups, ds_id),
-            })
+    # One decision over every candidate id; OPA returns which pass, governance builds the list.
+    res = opa("discover", {"subject": subject, "groups": groups,
+                           "datasets": [r["id"] for r in rows]})
+    seen, reads = set(res["visible"]), set(res["readable"])
+    visible = [{"id": r["id"], "description": r["description"], "steward": r["steward"],
+                "can_read": r["id"] in reads} for r in rows if r["id"] in seen]
     return jsonify({"subject": subject, "visible": visible})
 
 

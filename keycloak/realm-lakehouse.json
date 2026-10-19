@@ -45,12 +45,6 @@
         { "type": "password", "value": "carol", "temporary": false }
       ],
       "groups": ["/projw-team", "/stewards"]
-    },
-    {
-      "username": "service-account-idp-shim",
-      "enabled": true,
-      "serviceAccountClientId": "idp-shim",
-      "clientRoles": { "realm-management": ["view-users"] }
     }
   ],
   "clients": [
@@ -66,6 +60,7 @@
       "redirectUris": ["*"],
       "webOrigins": ["*"],
       "fullScopeAllowed": true,
+      "attributes": { "standard.token.exchange.enabled": "true" },
       "protocolMappers": [
         {
           "name": "principal_name",
@@ -114,16 +109,6 @@
       "protocol": "openid-connect",
       "bearerOnly": true,
       "publicClient": false
-    },
-    {
-      "clientId": "idp-shim",
-      "enabled": true,
-      "protocol": "openid-connect",
-      "publicClient": false,
-      "secret": "shim-kc-secret",
-      "serviceAccountsEnabled": true,
-      "standardFlowEnabled": false,
-      "directAccessGrantsEnabled": false
     }
   ]
 }

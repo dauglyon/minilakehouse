@@ -89,9 +89,10 @@ esac
 
 # Register the bare external principals (names only — no roles, no grants). Polaris
 # requires every external identity to exist as a managed principal; OPA holds all the
-# rules, so these are pure identity records. trino_svc is the engine's service identity
-# (granted nothing in OPA); alice/bob are the end users.
-for p in trino_svc alice bob; do
+# rules, so these are pure identity records. service-account-trino is the Keycloak service
+# account Trino uses for its own catalog calls (granted nothing in OPA); alice/bob are the
+# end users.
+for p in service-account-trino alice bob; do
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${MGMT}/principals" \
     -H "${AUTH}" -H "Content-Type: application/json" -H "${RH}" \
     -d "{\"principal\":{\"name\":\"${p}\",\"type\":\"USER\"}}")

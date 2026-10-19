@@ -1,45 +1,64 @@
 package lakehouse.blob
 
-# Blob-plane access predicate (Flow C: blob datasets). The broker asks ONLY "may this subject
-# read this dataset?" → yes/no. There is NO path logic here: OPA is a predicate, never an
-# enumerator. `dataset` is the dataset's id (a tenant-qualified name like projx/public).
+# Blob-plane rules (Flows A and C, and registration). Callers send the person's subject and
+# groups and the dataset ids or prefix they name; the rules fetch entries and ownership from
+# governance (lakehouse.governance), once per decision.
 #
-# Input:  {subject, groups, action, dataset: "<id>"}
-# Output: allow = true|false
+#   vend            input {subject, groups, dataset: id}       broker: {allow, prefix} for one dataset
+#   discover        input {subject, groups, datasets: [id]}    governance: {visible: [id], readable: [id]}
+#   allow_register  input {subject, groups, prefix}            governance: may register at prefix
 #
-# Grants are group-based and published by governance in data.dataset_grants.groups (the
-# broker passes the user's REAL groups, since the client presented its own token).
+# An entry is {id, prefix, visibility: [group], access: [group]}. A dataset can be
+# visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
+# so it is denied exactly as a dataset the caller has no grant on.
 
+import data.lakehouse.governance
+import future.keywords.contains
 import future.keywords.if
 import future.keywords.in
 
-default allow := false
+# The broker scopes its session policy to the returned prefix: the folder the dataset was
+# registered with, which is the folder its grants were written for.
+default vend := {"allow": false}
 
-allow if {
-	some g in input.groups
-	input.dataset in object.get(data.dataset_grants.groups, g, [])
+vend := {"allow": true, "prefix": e.prefix} if {
+	e := _entries[input.dataset]
+	_reads(e)
 }
 
-# --- Metadata-visibility plane (Flow A: discovery): "may S SEE this dataset exists?" ---
-# A SEPARATE predicate over visibility_grants. A dataset can be visible-but-not-readable
-# (visible == true, allow == false) — the see-but-not-read model. Discovery (governance)
-# calls this per registry entry; OPA never enumerates.
-default visible := false
+discover := {"visible": visible, "readable": readable}
 
-visible if {
+visible contains id if {
+	some id, e in _entries
 	some g in input.groups
-	input.dataset in object.get(data.visibility_grants.groups, g, [])
+	g in e.visibility
 }
 
-# --- Governed ingest: "may S register a new dataset at input.prefix?" ---
-# Two-part, single-sourced in OPA: the `stewards` group is the CAPABILITY to register at
-# all, and register_grants.groups scopes WHERE — the prefix must sit under a root one of the
-# caller's groups owns. So a steward can't claim another tenant's namespace.
+readable contains id if {
+	some id, e in _entries
+	_reads(e)
+}
+
+# Governed ingest. The `stewards` group is the capability to register at all; ownership
+# ({group: [prefix root]}) scopes where — the prefix must sit under a root one of the caller's
+# groups owns, so a steward can't claim another tenant's namespace.
 default allow_register := false
 
 allow_register if {
 	"stewards" in input.groups
+	owned := governance.get("/internal/register-grants")
 	some g in input.groups
-	some root in object.get(data.register_grants.groups, g, [])
+	some root in object.get(owned, g, [])
 	startswith(input.prefix, root)
+}
+
+_ids := input.datasets if input.datasets
+else := [input.dataset]
+
+# {id: entry} for the ids named in the input that exist.
+_entries := governance.post("/internal/datasets", {"ids": _ids}).entries
+
+_reads(e) if {
+	some g in input.groups
+	g in e.access
 }

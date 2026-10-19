@@ -37,9 +37,9 @@ files/blobs over S3) under the *same* governance model as tables.
 
 ## 2. Principles
 
-1. **Policy is external and single-sourced.** One service (governance) owns the grant model
-   and publishes it to **OPA**, the one PDP. Nothing re-decides or mirrors policy into a
-   backend.
+1. **Policy is external and single-sourced.** One service (governance) holds the only copy
+   of the grant model; **OPA**, the one PDP, holds the rules and receives the relevant entry
+   with each decision. Nothing re-decides or mirrors policy into a backend.
 2. **Two permission planes** (the AWS Lake Formation model): **metadata-visibility** (may you
    *see a thing exists*?) drives discovery; **data-access** (may you *read the bytes*?) drives
    vending. A dataset can be visible-but-not-readable (*see-but-not-read*).
@@ -60,17 +60,17 @@ files/blobs over S3) under the *same* governance model as tables.
 
 ```
  IDENTITY
-   Keycloak (OIDC) — users, groups, service accounts.
-   idp-shim        — turns Trino's per-user assertion into a real signed token Polaris
-                     validates (it is Polaris's OIDC issuer). The one trusted converter.
+   Keycloak (OIDC) — users, groups, the engine's service account. The only token issuer.
+   Trino           — authenticates each user's Keycloak token and forwards that same token
+                     to Polaris as the bearer (extra credential `token`), unexchanged.
 
  POLICY (control plane — decides, never touches bytes)
    governance (PAP)                          OPA (PDP)
-   • Postgres-backed dataset registry  ──►   • predicate over published grants:
-     + table grants                            allow / visible / allow_register (blobs),
-   • publishes a signed-pull bundle            table lanes (root/vend/read/write)
-   • serves discovery (Flow A)               • never enumerates; answers yes/no
-   • keeps the registry fresh vs storage
+   • Postgres-backed dataset registry  ◄──   • rules only, no grants: vend / discover /
+     + table grants (the only copy)            allow_register (blobs), table lanes
+   • serves grants to OPA (/internal/*)        (root/vend/read/write)
+   • serves discovery (Flow A)               • every rule fetches the grants it needs
+   • keeps the registry fresh vs storage       from governance, per decision
 
  ENFORCEMENT (PEPs — ask POLICY, then act)
    TABLES                                    BLOBS / FILES
@@ -87,12 +87,13 @@ files/blobs over S3) under the *same* governance model as tables.
 
 | Component | Role |
 |-----------|------|
-| **Keycloak** | OIDC IdP — users (`alice`/`bob`), groups, and two service accounts (the engine login client, and a realm-scoped `view-users` account the shim uses). |
-| **idp-shim** | The trusted identity layer for the table plane. Trino can only *assert* the end user (an unsigned note); the shim converts that into a real signed per-user token Polaris validates. Polaris's OIDC issuer. |
-| **governance** | PAP + dataset registry, Postgres-backed. Owns the registry + all grants, publishes them to OPA as a bundle, serves discovery, keeps the registry fresh, and accepts governed ingest. Holds only a least-privilege RGW reader. |
-| **OPA** | The PDP. Pulls policy + data from governance as a bundle (authenticated). A predicate: `opa/policy.rego` (tables), `opa/blob.rego` (blobs). |
-| **Polaris** | Iceberg REST catalog. Its Authorizer delegates `loadTable` to OPA; vends per-table STS. Holds identities, no rules. |
-| **broker** | Blob vending bridge: verifies the client's own token, asks OPA, `AssumeRole`s a credential scoped to one dataset prefix. No engine in the byte path. |
+| **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`), groups, and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
+| **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
+| **governance** | PAP + dataset registry, Postgres-backed. Holds the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, and accepts governed ingest. Holds only a least-privilege RGW reader. |
+| **OPA** | The PDP. Loads only the rules from `opa/`: `policy.rego` (tables), `blob.rego` (blobs), and `governance.rego`, the one fetch every rule uses to get grants from governance. |
+| **gate** | Proxy between Trino and Polaris. Repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata. Holds no permissions; Polaris and OPA decide both attempts. |
+| **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
+| **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision. No engine in the byte path. |
 | **Ceph RGW** | Object store + native STS + bucket notifications. Enforces the vended credential. |
 | **Postgres** | Polaris metastore and the durable `governance` registry database. |
 | **rgw-setup** (one-shot) | Admin-credentialed startup step: sets the bucket policy granting the governance reader `ListBucket` on `datasets/*`, and wires bucket notifications — so the long-lived governance service never holds the admin key. |
@@ -101,41 +102,52 @@ files/blobs over S3) under the *same* governance model as tables.
 
 **Flow A — discovery ("what can I see?")** — returns names, no credentials.
 1. Client presents its own token to governance.
-2. Governance enumerates its registry and, per entry, asks OPA the *visibility* predicate.
+2. Governance sends the ids of every live dataset to OPA in one decision; OPA fetches their
+   entries and returns the ids the caller may see and the ids the caller may read.
 3. Returns the visible names + descriptions (annotated with `can_read`). No bytes.
    (Tables are additionally listable via Polaris's own catalog metadata; the registry covers
    blobs and is kept fresh against storage.)
 
 **Flow B — read a table** — lazy, per-table.
-1. Trino → Polaris `loadTable(X)`, carrying the real per-user identity (via the idp-shim).
-2. Polaris's Authorizer asks OPA: may this user read X?
+1. The user connects to Trino with their Keycloak token and attaches the same token as the
+   extra credential `token`. Trino → Polaris `loadTable(X)` with that token as the bearer.
+2. Polaris's Authorizer asks OPA: may this user read X? OPA fetches X's readers from
+   governance.
 3. On allow, Polaris mints a per-table STS credential scoped to X's files.
 4. Trino reads X's files from RGW directly — no OPA, no broker on the byte path.
 
 **Flow C — read a blob dataset** — lazy, per-dataset, true end-to-end.
 1. Client presents its **own** Keycloak token to the broker, naming dataset X.
 2. The broker cryptographically verifies the token → subject + groups.
-3. The broker asks OPA the predicate: may this subject read X?
-4. On allow, the broker `AssumeRole`s with an inline session policy scoped to X's prefix
+3. The broker asks OPA: may this subject read X? OPA fetches X's entry from governance and
+   returns allow plus X's registered prefix. An unknown X gets the same 403 as a denied one.
+4. On allow, the broker `AssumeRole`s with an inline session policy scoped to that prefix
    (narrowing a broad role; the client can't widen it).
 5. The client reads those objects from RGW directly — no engine in the byte path.
 
 ## 5. The OPA contract
 
 OPA never derives identity: the trusted caller verifies the token and passes the subject +
-groups in `input`. OPA combines `input` with `data` (the grants governance publishes) and the
-Rego policy, and returns a **boolean**:
+groups in `input`, with the ids it names and never a grant. OPA holds the rules and no
+grants; every rule that needs one fetches it from governance through `opa/governance.rego`,
+at decision time, so a grant change applies at the next decision.
 
 ```
-input  → { subject, groups, action, dataset }     (blobs)
-output → true | false
+rule            caller      input                              fetches                      result
+vend            broker      {subject, groups, dataset: id}     POST /internal/datasets      {allow, prefix}
+discover        governance  {subject, groups, datasets: [id]}  POST /internal/datasets      {visible: [id], readable: [id]}
+allow_register  governance  {subject, groups, prefix}          GET /internal/register-grants  true | false
+table lanes     Polaris     {actor, action, resource}          GET /internal/tables/<fqn>,  true | false
+                                                                 /internal/table-writers
 ```
 
-It is a **predicate, never an enumerator**. For discovery, governance enumerates its registry
-itself and calls the predicate per candidate; OPA never returns the inventory. For access, OPA
-answers yes/no on the dataset id, and the caller derives the prefix (`datasets/<id>/`) and
-binds it into the credential. The bundle data is built from the registry's *meaning/grants*
-only, so storage churn never changes what OPA decides.
+One path for every caller because it is the only one Polaris can use: Polaris builds its own
+input and cannot attach an entry. Each decision makes at most one fetch; a failed fetch
+denies. Measured: a one-table `SELECT` makes one governance read, a denied one two (Polaris
+retries a denied write-credential load as a read-credential load), and a discovery or vend
+request one. Governance builds every candidate list and OPA says which candidates pass.
+Entries carry only the registry's *meaning/grants*, so storage churn never changes a
+decision.
 
 ## 6. Non-tabular data & registry freshness
 
@@ -187,28 +199,30 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 ## 8. Security model
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across
-  both planes. Tables (`policy.rego`): `root` / per-table vend grant / read-only metadata /
-  writer DDL — anything unnamed is root-only. Blobs (`blob.rego`): `allow` (read) / `visible`
+  both planes. Tables (`policy.rego`): `root` / read-credential vend (`read`) / viewing a
+  table (`see` or `read`) / catalog listings (anyone) / writes, DDL and read-write
+  credentials (`writers`) — anything unnamed is root-only. Blobs (`blob.rego`): `allow` (read) / `visible`
   (see) / `allow_register` (ingest), all group-based.
-- **Real, end-to-end identity.** Tables: the idp-shim converts Trino's assertion into a signed
-  token Polaris validates — its signing key is *persisted* (a restart doesn't rotate it and
-  invalidate cached tokens), it refuses reserved principals (`root`, the service principal),
-  and the engine proves itself with a *dedicated* secret distinct from the Keycloak client
-  secret end users log in with (so a logged-in user can't drive the shim to mint arbitrary
-  identities). Blobs: the broker verifies the user's *own* token — no engine in the byte path.
-- **Token checks.** Governance and the broker verify signature, issuer, and expiry, and pin
-  `azp` to the login client (so a token minted for another realm client can't be replayed).
+- **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
+  Tables: Trino authenticates the token and relays it to Polaris unchanged; Trino's username
+  is the token's `principal_name`, and Trino's default access control refuses impersonation,
+  so a client cannot run as someone else. The engine holds no credential that names a user:
+  its own service account is granted nothing. Blobs: the broker verifies the user's *own*
+  token — no engine in the byte path.
+- **Token checks.** Trino and Polaris verify signature, issuer, expiry, and audience
+  `polaris`. Governance and the broker verify signature, issuer, and expiry, and pin `azp` to
+  the login client (so a token minted for another realm client can't be replayed).
+- **Grant lookups are closed.** `/internal/*` returns grants for datasets the user cannot
+  see, so it requires a bearer (`ENTRY_TOKEN`) held only by OPA.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`),
   prefix-scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further
   per request. The long-lived governance service holds only a read-only RGW reader
-  (`ListBucket` on `datasets/*`, via a bucket policy) and a realm-scoped `view-users` Keycloak
-  service account — never an admin key. Admin-only RGW setup runs in the `rgw-setup` one-shot.
+  (`ListBucket` on `datasets/*`, via a bucket policy) — never an admin key. Admin-only RGW
+  setup runs in the `rgw-setup` one-shot.
 - **Governed ingest is scoped.** A steward must be in the `stewards` group *and* the prefix
   must sit under a root one of their groups owns (per-group ownership in OPA). Prefixes are confined
   to `datasets/<...>/` with no traversal, and the overlap-check + insert are serialized (an
   advisory lock) so two registrations can't claim overlapping prefixes.
-- **Bundle pull is authenticated.** The bundle is the full grant model, so OPA presents a
-  shared bearer to pull it (the link is also internal/trusted-network).
 
 ## 9. Prior art
 
@@ -240,6 +254,7 @@ reference (the sections above are current-state).
   which Keycloak refuses and Polaris's authenticator rejects. The **idp-shim** is the one
   trusted place that turns "our Trino asserts alice" into a real signed alice token. The
   `trino_svc` service principal it uses for non-user calls is granted nothing in OPA.
+  (Superseded by the extra-credential path below; the shim is removed.)
 - **The shim's signing key must persist.** It originally generated the key in memory at every
   start, so any shim restart rotated it and invalidated every token Trino held *and* Polaris's
   cached JWKS — silently breaking the table plane until both refreshed. The key now loads from
@@ -261,6 +276,20 @@ reference (the sections above are current-state).
   created via the SNS/S3 API (boto3) — `radosgw-admin` has no `topic create`. RGW data here is
   ephemeral (no volume), so it re-bootstraps on container *recreate* — the table re-seed and
   blob re-seed are expected post-`up` steps.
+- **The engine relays the user's token instead of naming the user.** Trino copies a query's
+  extra credentials into its per-user Iceberg catalog session, and the Iceberg REST client
+  sends a credential named `token` as the bearer before attempting any exchange (read in the
+  Trino 484 and Iceberg 1.12.0 sources). So Polaris validates Keycloak tokens directly, the
+  shim and its signing key are gone, and the engine can no longer mint anyone. Trino 484 is
+  pinned because its catalog session cache key includes the query id, so each query uses the
+  token attached to it. Extra credentials are not part of Trino's serialized query info,
+  unlike the username.
+- **Grants left OPA.** OPA used to pull every grant from governance as a bundle, so a change
+  waited for the next poll and OPA held a copy of the whole grant model. Now governance holds
+  the only copy, callers send OPA only ids, and every rule fetches what it needs with
+  `http.send`. Callers passing the entry themselves was tried first and dropped: Polaris
+  cannot attach one, so tables needed a second path. The cost is a governance read per
+  decision, and a governance outage denies every read.
 - **Post-audit hardening** (a security review caught these): the shim's token-exchange
   requires the caller to prove it's the engine and refuses reserved principals; the OPA policy
   is deny-by-default with explicit lanes; STS roles are least-privilege. A later pass added
@@ -269,20 +298,37 @@ reference (the sections above are current-state).
 
 ## 11. Limitations & deferred work
 
-- The shim trusts the engine's *asserted* end-user subject; binding "this caller is our
-  engine" to the transport (mTLS / network policy) is deferred — the engine proof is a shared
-  secret today.
+- Trino keeps a user's token alive by token exchange (standard exchange, enabled for the
+  `trino` client in the realm file) while the user's Keycloak login session is active: an
+  exchange does not count as activity, so refresh stops once that session idles out (30
+  minutes by default), and a query fails at its next Polaris call after that. Each refresh
+  first fails six times (Iceberg authenticates its first attempt with the user's bearer,
+  which Keycloak rejects) and then succeeds with the engine's client credential, logging four
+  retry warnings.
+- Table listings are not trimmed, so every table's name is visible to everyone. The gate
+  (`gate/app.py`) does one thing so far: Trino asks for a credential on every table load and
+  Polaris refuses the whole load without one, so the gate repeats a refused load once
+  without the credential request. A person with `see` and no `read` can then DESCRIBE a
+  table through Trino; reading it fails at storage. Polaris is still reachable directly. A query run without the `token` extra credential falls back to exchanging
+  Trino's unsigned assertion, which Keycloak refuses.
+- Polaris maps an external token's `principal_name` onto the principal of the same name, so
+  Keycloak must have no user named `root` (Polaris's internal admin).
+- Every decision reads governance: a governance outage denies every read, and table checks
+  are uncached.
 - Table-plane `writers` is a coarse global list (a writer may write any namespace); a real
   model would scope it per-namespace.
 - No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
   its bytes vanished). Discovery is blob-only; table discovery rides Polaris's own listing.
-- Dev-environment only: plaintext/no-TLS, dev credentials in `.env`, the OPA debug image, and
-  unauthenticated `/events` (trusted-network).
+- Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
+  token only over TLS; the container generates a self-signed keystore at each start), dev
+  credentials in `.env`, the OPA debug image, and unauthenticated `/events`
+  (trusted-network).
 
 ## Glossary
 
 - **PDP** — Policy Decision Point (OPA): answers "is this allowed?"
-- **PAP** — Policy Administration Point (governance): owns and publishes the grants.
+- **PAP** — Policy Administration Point (governance): owns the grants and serves them to
+  each decision.
 - **PEP** — Policy Enforcement Point (Polaris, the broker): asks the PDP, then enforces.
 - **Vending** — minting a short-lived, scoped storage credential (STS).
 - **Metadata-visibility plane** — permission to *see a thing exists*.

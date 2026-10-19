@@ -22,7 +22,10 @@ services:
 
   keycloak:
     image: ${KEYCLOAK_IMAGE}
-    command: ["start-dev", "--import-realm", "--health-enabled=true", "--features=token-exchange,admin-fine-grained-authz"]
+    # Standard token exchange (on by default) lets the `trino` client trade a user's
+    # still-valid token for a fresh one; Trino's Iceberg client uses it to refresh a query's
+    # token before expiry. Enabled per client in the realm file.
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_ADMIN}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
@@ -76,8 +79,8 @@ services:
 
   governance:
     # The PAP + dataset registry. Single source of truth: owns the registry + all grants
-    # in a durable Postgres database, publishes them to OPA as a bundle, serves discovery
-    # (Flow A) and dataset->prefix for the broker. See governance/app.py.
+    # in a durable Postgres database; OPA's rules fetch them from /internal/* per decision.
+    # Serves discovery (Flow A). See governance/app.py.
     build: ./governance
     depends_on:
       keycloak:
@@ -89,11 +92,10 @@ services:
       rgw-setup:
         condition: service_completed_successfully
     environment:
-      POLICY_DIR: /policies
       REGISTRY: /app/registry.json
       OPA_BASE: http://opa:8181
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
-      BUNDLE_TOKEN: ${BUNDLE_TOKEN}   # bearer OPA must present to pull the policy bundle
+      ENTRY_TOKEN: ${ENTRY_TOKEN}   # bearer OPA must present to /internal/*
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       # Least-privilege reader (ListBucket on datasets/* only) — NOT the RGW admin key.
@@ -102,60 +104,28 @@ services:
       RGW_SECRET_KEY: ${GOVERNANCE_READER_SECRET}
       S3_BUCKET: ${S3_BUCKET}
     volumes:
-      - ./opa:/policies:ro
       - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)
     ports:
       - "19092:8000"
 
   opa:
     image: ${OPA_IMAGE}
-    # Bundle mode: OPA pulls policy + data from governance (single-sourced), instead of
-    # loading hand-edited files from a mount.
-    command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=debug", "-c", "/config/opa.yaml"]
+    # Policy only, from the mount. OPA holds no grants: its rules fetch them from governance
+    # per decision (opa/governance.rego).
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=debug", "/policies"]
     environment:
-      # The bundle-pull bearer; config.yaml references it as ${BUNDLE_TOKEN} (single-sourced).
-      BUNDLE_TOKEN: ${BUNDLE_TOKEN}
-    depends_on:
-      governance:
-        condition: service_healthy
+      # Read by opa/governance.rego through opa.runtime().env.
+      GOVERNANCE_URL: http://governance:8000
+      ENTRY_TOKEN: ${ENTRY_TOKEN}
     volumes:
-      - ./opa/config.yaml:/config/opa.yaml:ro
+      - ./opa:/policies:ro
     ports:
       - "18181:8181"
     healthcheck:
-      # ?bundles -> 200 only once the governance bundle is activated, so dependents
-      # (Polaris) don't query OPA before its policy/data are loaded.
-      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8181/health?bundles"]
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8181/health"]
       interval: 5s
       timeout: 3s
       retries: 20
-
-  idp-shim:
-    # Trusted identity layer between Trino and Polaris. Trino points its OAuth
-    # token endpoint here; the shim mints real signed per-user tokens that Polaris
-    # validates (the shim is Polaris's OIDC issuer). See idp-shim/app.py.
-    build: ./idp-shim
-    depends_on:
-      keycloak:
-        condition: service_healthy
-    environment:
-      SHIM_ISSUER: http://idp-shim:9000
-      TRINO_CLIENT_ID: ${TRINO_CLIENT_ID}
-      # The engine-proof secret (distinct from the Keycloak client secret users log in with).
-      TRINO_CLIENT_SECRET: ${SHIM_ENGINE_SECRET}
-      SERVICE_PRINCIPAL: trino_svc
-      AUDIENCE: ${POLARIS_CLIENT_ID}
-      KC_BASE: http://keycloak:8080
-      KC_REALM: ${KC_REALM}
-      # Realm-scoped service account (view-users only) for group lookup — NOT master admin.
-      SHIM_KC_CLIENT_ID: idp-shim
-      SHIM_KC_SECRET: ${SHIM_KC_SECRET}
-    volumes:
-      # Persist the signing key so a shim restart doesn't rotate it (which would invalidate
-      # every token Trino holds + Polaris's cached JWKS, breaking the table plane).
-      - shim_key:/keys
-    ports:
-      - "19090:9000"
 
   broker:
     # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
@@ -175,7 +145,7 @@ services:
     environment:
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
-      OPA_URL: http://opa:8181/v1/data/lakehouse/blob/allow
+      OPA_URL: http://opa:8181/v1/data/lakehouse/blob/vend
       RGW_ENDPOINT: http://ceph:8080
       BLOB_ROLE_ARN: ${BLOB_ROLE_ARN}
       BUCKET: ${S3_BUCKET}
@@ -244,7 +214,7 @@ services:
         condition: service_completed_successfully
       opa:
         condition: service_started
-      idp-shim:
+      keycloak:
         condition: service_healthy
     environment:
       # --- persistence ---
@@ -263,11 +233,12 @@ services:
       #     comes from the token's principal_name claim; roles from principal_roles. ---
       polaris.authentication.type: mixed
       quarkus.oidc.tenant-enabled: "true"
-      # OIDC issuer = the idp-shim (NOT Keycloak directly): Polaris validates the
-      # real per-user tokens the shim mints for Trino-relayed requests.
-      quarkus.oidc.auth-server-url: http://idp-shim:9000
+      # OIDC issuer = Keycloak. Trino forwards each user's own Keycloak token as the bearer
+      # (the `token` extra credential), so Polaris validates the person's token itself.
+      quarkus.oidc.auth-server-url: http://keycloak:8080/realms/${KC_REALM}
       quarkus.oidc.discovery-enabled: "true"
       quarkus.oidc.client-id: ${POLARIS_CLIENT_ID}
+      quarkus.oidc.token.audience: ${POLARIS_CLIENT_ID}
       quarkus.oidc.roles.role-claim-path: principal_roles
       # No id-claim-path: external principals are federated by NAME only (the default
       # mapper returns an empty principal-id when id-claim-path is unset). Setting it to
@@ -275,7 +246,7 @@ services:
       polaris.oidc.principal-mapper.name-claim-path: principal_name
       polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
       polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
-      # --- authz: delegated to OPA (deny-by-default policy, served by governance) ---
+      # --- authz: delegated to OPA (deny-by-default policy; grants fetched from governance) ---
       polaris.authorization.type: opa
       polaris.authorization.opa.policy-uri: http://opa:8181/v1/data/polaris/authz
       polaris.authorization.opa.auth.type: none
@@ -315,20 +286,50 @@ services:
     volumes:
       - ./polaris/bootstrap.sh:/polaris/bootstrap.sh:ro
 
+  gate:
+    # Proxy in front of Polaris for Trino: lets a person who may view a table but not read
+    # it load the table without a credential, so DESCRIBE works. See gate/app.py.
+    build: ./gate
+    depends_on:
+      polaris:
+        condition: service_healthy
+
   trino:
     image: ${TRINO_IMAGE}
+    # Trino's clients send an access token only over TLS, so the container makes a
+    # self-signed dev keystore (SAN localhost, trino) at each start, replacing the previous
+    # one (a restart keeps /tmp), then runs the image's own command. Clients in the
+    # container verify against the same file.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        rm -f /tmp/trino-tls.p12 &&
+        keytool -genkeypair -keystore /tmp/trino-tls.p12 -storetype PKCS12
+        -storepass "$$TRINO_TLS_PASSWORD" -alias trino -keyalg RSA -keysize 2048
+        -validity 3650 -dname CN=trino -ext SAN=dns:localhost,dns:trino &&
+        exec /usr/lib/trino/bin/launcher run --etc-dir /etc/trino
     depends_on:
       polaris-setup:
         condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      gate:
+        condition: service_healthy
     environment:
-      # Engine-proof secret for the idp-shim; referenced by iceberg.properties as ${ENV:...}.
-      SHIM_ENGINE_SECRET: ${SHIM_ENGINE_SECRET}
+      # Referenced by config.properties and iceberg.properties as ${ENV:...}.
+      KC_REALM: ${KC_REALM}
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID}
+      TRINO_CLIENT_ID: ${TRINO_CLIENT_ID}
+      TRINO_CLIENT_SECRET: ${TRINO_CLIENT_SECRET}
+      TRINO_INTERNAL_SECRET: ${TRINO_INTERNAL_SECRET}
+      TRINO_TLS_PASSWORD: ${TRINO_TLS_PASSWORD}
     volumes:
       - ./trino/etc/config.properties:/etc/trino/config.properties:ro
       - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
       - ./seed:/seed:ro
     ports:
       - "8083:8080"
+      - "18443:8443"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/info"]
       interval: 10s
@@ -338,4 +339,3 @@ services:
 
 volumes:
   postgres_data:
-  shim_key:

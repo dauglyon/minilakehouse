@@ -1,19 +1,21 @@
 """
 broker — the blob vending broker (Flow C: blob datasets). The true end-to-end plane.
 
-A client presents its OWN Keycloak token and names a dataset. Unlike the idp-shim (which
-trusts the engine's *assertion* of a user), the broker has the user's real token, so it
+A client presents its OWN Keycloak token and names a dataset. The broker
 **cryptographically verifies it** (signature against Keycloak's JWKS, issuer, expiry) —
 no engine in the byte path, safe even against a compromised engine.
 
 Flow:
   1. verify the user's token            -> subject + groups
-  2. derive prefix from the dataset id  (datasets/<id>/ — a pure derivation, NOT OPA)
-  3. ask OPA the predicate "may S read dataset X?"  -> yes/no   (OPA never enumerates)
-  4. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to the
-     dataset's prefix (the role permits datasets/*; the session policy narrows; the
-     client cannot widen it) -> per-dataset temp credentials
-  5. return the scoped credentials; the client reads those objects directly from RGW.
+  2. ask OPA's `vend` rule about the dataset id -> {allow, prefix}; OPA fetches the
+     dataset's grants and registered prefix from governance
+  3. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to that
+     prefix (the role permits datasets/*; the session policy narrows; the client cannot
+     widen it) -> per-dataset temp credentials
+  4. return the scoped credentials; the client reads those objects directly from RGW.
+
+OPA denies an unknown dataset exactly as a denied one, so the broker reveals nothing about
+which datasets exist.
 """
 import json
 import os
@@ -35,7 +37,7 @@ BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
 TTL = int(os.environ.get("CRED_TTL_SECONDS", "900"))
-# A dataset id is a tenant-qualified name (e.g. projx/public); the prefix is derived from it.
+# A dataset id is a tenant-qualified name (e.g. projx/public).
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 
 _jwks = jwt.PyJWKClient(KEYCLOAK_JWKS)
@@ -78,12 +80,13 @@ def authed_user():
         return None, None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_allows(subject, groups, dataset):
+def opa_vend(subject, groups, dataset):
+    """OPA's {allow, prefix} for this subject reading this dataset."""
     r = _http.post(OPA_URL, json={"input": {
-        "subject": subject, "groups": groups, "action": "read", "dataset": dataset,
+        "subject": subject, "groups": groups, "dataset": dataset,
     }}, timeout=5)
     r.raise_for_status()
-    return r.json().get("result") is True
+    return r.json().get("result") or {"allow": False}
 
 
 def session_policy(prefix):
@@ -110,15 +113,17 @@ def vend():
     dataset = (request.get_json(silent=True) or {}).get("dataset")
     if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
         return jsonify({"error": "invalid dataset id"}), 400
-    prefix = f"datasets/{dataset}/"
-    # the prefix becomes an STS ARN below; refuse if the derivation isn't confined
+    decision = opa_vend(subject, groups, dataset)
+    if decision.get("allow") is not True:
+        app.logger.info("DENY subject=%s groups=%s dataset=%s", subject, groups, dataset)
+        return jsonify({"error": "forbidden"}), 403
+
+    # Governance confined the prefix at registration; it becomes an STS ARN below, so
+    # re-check rather than trust it.
+    prefix = decision.get("prefix", "")
     if not (prefix.startswith("datasets/") and prefix.endswith("/") and ".." not in prefix):
         app.logger.error("refusing unconfined prefix for %s: %r", dataset, prefix)
         return jsonify({"error": "internal error"}), 500
-
-    if not opa_allows(subject, groups, dataset):
-        app.logger.info("DENY subject=%s groups=%s dataset=%s", subject, groups, dataset)
-        return jsonify({"error": "forbidden"}), 403
 
     cr = _sts.assume_role(
         # STS caps the session-name length; truncate so a long username can't fail AssumeRole.
