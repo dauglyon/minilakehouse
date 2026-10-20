@@ -25,11 +25,12 @@ The browser leg is bound so knowing the (disclosed) auth id is not enough to com
 for someone else: the callback must echo an HttpOnly nonce cookie set at initiate, the code is
 bound by PKCE (a verifier the browser never sees), the session is yielded only by the separate
 poll token, and initiate and callback are each single-use (a replay is refused). Pending logins
-expire (LOGIN_TTL); at the cap (MAX_PENDING) a new challenge sheds any login not past the IdP
-(not in 'exchanging'), else returns 503, so an unauthenticated flood evicts its own entries
-rather than wedge the cap or exhaust memory. The login maps are guarded by a lock. Not done: a
-per-source rate limit on challenges (the production control against a flood evicting a real
-login mid-type), and a browser confirmation page naming the client.
+expire (LOGIN_TTL). Challenges are rate-limited per client address (RATE_MAX/RATE_WINDOW), which
+lets cap eviction stay fail-safe: at the cap (MAX_PENDING) a new challenge sheds only a login no
+browser has started (pending, no nonce), never one in the browser, mid-exchange, or ready, and
+returns 503 if none are free. The login maps are guarded by a lock. Not done: a browser
+confirmation page naming the client, and a shared/persistent session store (sessions are
+in-memory, so a restart logs everyone out).
 
 Toward Trino (plain JWT, unchanged): every forwarded request carries the person's current
 access token, refreshed from the stored refresh token when it is within REFRESH_SKEW of
@@ -97,6 +98,13 @@ _lock = threading.Lock()
 # A challenge is unauthenticated, so bound how many pending logins can pile up, and drop stale.
 LOGIN_TTL = 300
 MAX_PENDING = 1000
+# Rate-limit challenges per client address. This is what lets eviction stay fail-safe (it only
+# ever drops un-started logins), since it caps how fast any one source can create entries at
+# all — without it, protecting in-progress logins lets a flood wedge the cap, and not
+# protecting them lets a flood evict a real login mid-type.
+RATE_MAX = 20
+RATE_WINDOW = 60
+_ip_hits = {}  # client address -> [recent challenge timestamps] (guarded by _lock)
 # session id -> {"subject", "access", "refresh", "access_exp"} after login.
 _sessions = {}
 
@@ -151,6 +159,21 @@ def _purge_logins():  # call under _lock
         _drop_login(auth_id)
 
 
+def _rate_ok(addr):  # call under _lock
+    """True if `addr` is under its challenge rate, recording this one. Empty buckets are
+    dropped as they age out, so the map doesn't grow with one-off addresses."""
+    cutoff = time.time() - RATE_WINDOW
+    for a in [a for a, ts in _ip_hits.items() if not ts or ts[-1] < cutoff]:
+        del _ip_hits[a]
+    hits = [t for t in _ip_hits.get(addr, []) if t >= cutoff]
+    if len(hits) >= RATE_MAX:
+        _ip_hits[addr] = hits
+        return False
+    hits.append(time.time())
+    _ip_hits[addr] = hits
+    return True
+
+
 def challenge(refresh_only_sid=None):
     """Trino's 401 bearer challenge. With a session whose refresh failed, offer only the token
     server (the client re-polls); otherwise the full redirect-and-token challenge, or 503 when
@@ -160,14 +183,16 @@ def challenge(refresh_only_sid=None):
         return Response('{"error":"authentication required"}', status=401,
                         headers={"WWW-Authenticate": hdr}, content_type="application/json")
     with _lock:
+        if not _rate_ok(request.remote_addr):
+            return Response('{"error":"too many login attempts; retry shortly"}', status=429,
+                            content_type="application/json")
         _purge_logins()
-        # A challenge and initiate both need no credential, so neither "pending" nor having a
-        # nonce proves a real login — only "exchanging" is reached (a valid IdP code with the
-        # matching nonce cookie). At the cap, shed anything not exchanging, oldest first; 503
-        # only if every slot is mid-exchange. So a challenge+initiate flood evicts its own
-        # entries instead of wedging the cap, and can't grow memory past it.
+        # Eviction stays fail-safe: only a login no browser has started (pending, no nonce) is
+        # dropped, oldest first, so a login in the browser, mid-exchange, or ready to collect is
+        # never evicted. The per-source rate limit above is what keeps that safe — it bounds how
+        # fast any source fills slots, so the cap can't be wedged with started logins.
         while len(_logins) >= MAX_PENDING:
-            spare = [a for a, l in _logins.items() if l["status"] != "exchanging"]
+            spare = [a for a, l in _logins.items() if l["status"] == "pending" and not l["nonce"]]
             if not spare:
                 return Response('{"error":"login capacity reached; retry shortly"}', status=503,
                                 content_type="application/json")

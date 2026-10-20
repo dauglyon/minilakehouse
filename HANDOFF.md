@@ -183,6 +183,10 @@ a `delete` grant for drops; the login proxy (`login-proxy/`). Open:
 3. Long queries: Trino's refresh works only while the user's Keycloak login session is
    active (idle 30 min by default; exchanges don't renew it), measured (`WHITEPAPER.md` §6).
 4. No API to change group membership or grants; both change only in governance's database.
+5. Login-proxy production hardening, parked (prototype is otherwise complete): a shared/
+   persistent session store (sessions are in-memory, a restart logs everyone out), a browser
+   confirmation page naming the requesting client, and global/distributed flood controls
+   beyond the per-source challenge rate limit already in place.
 
 To check:
 
