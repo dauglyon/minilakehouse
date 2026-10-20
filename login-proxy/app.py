@@ -25,9 +25,11 @@ The browser leg is bound so knowing the (disclosed) auth id is not enough to com
 for someone else: the callback must echo an HttpOnly nonce cookie set at initiate, the code is
 bound by PKCE (a verifier the browser never sees), the session is yielded only by the separate
 poll token, and initiate and callback are each single-use (a replay is refused). Pending logins
-expire (LOGIN_TTL); at the cap (MAX_PENDING) a new challenge sheds only logins no browser has
-started, else returns 503, so a flood can't evict a login in progress or exhaust memory. The
-login maps are guarded by a lock. Not done: a browser confirmation page naming the client.
+expire (LOGIN_TTL); at the cap (MAX_PENDING) a new challenge sheds any login not past the IdP
+(not in 'exchanging'), else returns 503, so an unauthenticated flood evicts its own entries
+rather than wedge the cap or exhaust memory. The login maps are guarded by a lock. Not done: a
+per-source rate limit on challenges (the production control against a flood evicting a real
+login mid-type), and a browser confirmation page naming the client.
 
 Toward Trino (plain JWT, unchanged): every forwarded request carries the person's current
 access token, refreshed from the stored refresh token when it is within REFRESH_SKEW of
@@ -159,11 +161,13 @@ def challenge(refresh_only_sid=None):
                         headers={"WWW-Authenticate": hdr}, content_type="application/json")
     with _lock:
         _purge_logins()
-        # A challenge needs no credential. At the cap, shed only logins no browser has started
-        # (no nonce yet), oldest first; never one mid-login. If even those don't free room, all
-        # pending logins are in flight, so refuse the new one rather than evict a real one.
+        # A challenge and initiate both need no credential, so neither "pending" nor having a
+        # nonce proves a real login — only "exchanging" is reached (a valid IdP code with the
+        # matching nonce cookie). At the cap, shed anything not exchanging, oldest first; 503
+        # only if every slot is mid-exchange. So a challenge+initiate flood evicts its own
+        # entries instead of wedging the cap, and can't grow memory past it.
         while len(_logins) >= MAX_PENDING:
-            spare = [a for a, l in _logins.items() if l["nonce"] is None]
+            spare = [a for a, l in _logins.items() if l["status"] != "exchanging"]
             if not spare:
                 return Response('{"error":"login capacity reached; retry shortly"}', status=503,
                                 content_type="application/json")
