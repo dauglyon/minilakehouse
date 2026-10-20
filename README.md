@@ -64,6 +64,7 @@ byte path.
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
+| **loginproxy** | Sits in front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client, holds the person's refresh token, and puts a fresh token on every forwarded request as the bearer and the `token` extra credential. |
 | **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
 | **postgres** | Polaris metastore **and** the durable `governance` registry database. |
@@ -93,7 +94,22 @@ q() {
 q alice -f /seed/seed-table.sql
 ```
 
-Keycloak access tokens last 5 minutes; `q` fetches a fresh one per command.
+Keycloak access tokens last 5 minutes; `q` fetches a fresh one per command. A real client
+instead logs in once through the **loginproxy**, which refreshes on its behalf:
+
+```bash
+# Log in once (browserless helper, standing in for the CLI's browser handshake) and reuse the
+# session token across commands; the proxy swaps in a fresh Keycloak token on every request,
+# so the session lasts as long as the person's Keycloak login, not 5 minutes.
+SID=$(docker compose exec -T governance python /seed/proxy_login.py alice)
+pq() { docker compose exec -T trino trino --server https://loginproxy:9200 --insecure \
+         --user alice --access-token "$SID" "$@"; }
+pq --execute "SELECT * FROM iceberg.db.t1"      # -> 1
+# A real CLI user runs instead:  trino --server https://<proxy> --external-authentication
+```
+
+`--insecure` skips verifying the proxy's self-signed dev cert (dev only); the proxy verifies
+Trino's cert, pinned at startup.
 
 **About the demos below:** the discovery/blob demos present a user's *own* Keycloak token to
 governance/the broker, which validate the token's issuer. Run them **in-network** (service
@@ -268,10 +284,10 @@ tenants, and neither can see the other's.
 
 ## Limitations
 
-- Trino refreshes each query's token by Keycloak token exchange while the user's Keycloak
-  login session is active (it idles out after 30 minutes by default; Trino's exchanges don't
-  count as activity). A query that needs Polaris after that fails. Each refresh logs four
-  retry warnings before it succeeds. A query without `--extra-credential token=...` fails.
+- A client that logs in through the **loginproxy** stays connected as long as the person's
+  Keycloak login lasts (the proxy refreshes for it). A client pointed straight at Trino with
+  one token (the `q` helper) is cut off after 5 minutes. The proxy holds sessions in memory,
+  so restarting it logs everyone out.
 - With `see` only, DESCRIBE works through Trino (via the `gate`) and SELECT fails; an INSERT
   fails with "Failed to initialize the vended credentials" rather than access denied.
 - A refused create's first line is Trino's own ("Failed to create transaction"); the gate's

@@ -489,7 +489,9 @@ listings (every upstream page, one filter, its own page tokens), answering not-f
 refused name the person may not view, and repeating a refused credentialed load without the
 credential request, deciding table and namespace creation, and reporting table creates and
 drops; tables registered as entries with `see`, `read`, `write` and `delete` by group; group
-membership in governance; each person's Polaris principal created on first use; OPA reachable only by its callers; storage events plus a periodic
+membership in governance; each person's Polaris principal created on first use; a login
+proxy that keeps a client session past the token's 5-minute life by holding the refresh token
+and forwarding a fresh token to Trino; OPA reachable only by its callers; storage events plus a periodic
 listing.
 
 Differs from this document: tables are entries in their own registry, not in the catalog

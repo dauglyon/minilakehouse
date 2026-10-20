@@ -90,6 +90,7 @@ files/blobs over S3) under the *same* governance model as tables.
 |-----------|------|
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
+| **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
 | **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, accepts governed ingest and table registration, records the table lifecycle the gate reports, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
 | **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance create a person's Polaris principal before their first request. Holds no permissions; Polaris and OPA decide everything it forwards. |
@@ -323,13 +324,16 @@ reference (the sections above are current-state).
 
 ## 11. Limitations & deferred work
 
-- Trino keeps a user's token alive by token exchange (standard exchange, enabled for the
-  `trino` client in the realm file) while the user's Keycloak login session is active: an
-  exchange does not count as activity, so refresh stops once that session idles out (30
-  minutes by default), and a query fails at its next Polaris call after that. Each refresh
-  first fails six times (Iceberg authenticates its first attempt with the user's bearer,
-  which Keycloak rejects) and then succeeds with the engine's client credential, logging four
-  retry warnings.
+- A client that logs in through the **login-proxy** keeps its session as long as the person's
+  Keycloak login lasts: the proxy holds the refresh token and swaps a fresh access token onto
+  every request. A client that instead points straight at Trino with a single token (the `q`
+  helper, or `--access-token`) is cut off when that token expires after 5 minutes; Trino's own
+  Iceberg-client token exchange only extends the engine's catalog session, not the client's
+  connection. The proxy keeps its sessions in memory, so a proxy restart logs everyone out.
+- The proxy's browser login was exercised through the protocol (challenge, redirect, callback,
+  poll) with a scripted Keycloak login (`seed/proxy_login.py`), not a real browser-driven CLI
+  run; the token refresh was shown by forcing a refresh per request, not by waiting out a
+  5-minute token.
 - A person with `see` and no `read` who tries to write a table gets Trino's "Failed to
   initialize the vended credentials" rather than access denied: the gate's retry returns the
   table without a credential and Trino stops there. A refused create's first line is Trino's

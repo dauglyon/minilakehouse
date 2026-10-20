@@ -373,6 +373,32 @@ services:
       retries: 20
       start_period: 20s
 
+  loginproxy:
+    # Keeps a person's Trino session alive past their 5-minute Keycloak token: speaks Trino's
+    # external-authentication protocol to the client, holds the refresh token, and forwards a
+    # fresh token to Trino as the bearer and the `token` extra credential. See login-proxy/app.py.
+    build: ./login-proxy
+    depends_on:
+      trino:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      TRINO_URL: https://trino:8443
+      # The proxy pins Trino's self-signed cert from this host at startup, then verifies every
+      # forwarded request against it.
+      TRINO_PIN_HOST: trino:8443
+      TRINO_CA: /tmp/trino.crt
+      KC_AUTH: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/auth
+      KC_TOKEN: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/token
+      TRINO_CLIENT_ID: ${TRINO_CLIENT_ID}
+      TRINO_CLIENT_SECRET: ${TRINO_CLIENT_SECRET}
+      # How the client and the browser reach this proxy. In-network here; a deployment uses a
+      # published URL. Keycloak must allow it as a redirect URI (realm file, trino client).
+      PUBLIC_URL: https://loginproxy:9200
+    ports:
+      - "19200:9200"
+
 networks:
   default:
   # OPA and its callers only; internal, so nothing on it reaches outside the host.
