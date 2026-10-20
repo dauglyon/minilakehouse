@@ -58,7 +58,10 @@ PAYLOAD=$(cat <<JSON
   "catalog": {
     "name": "${CATALOG_NAME}",
     "type": "INTERNAL",
-    "properties": { "default-base-location": "s3://${S3_BUCKET}/warehouse/" },
+    "properties": {
+      "default-base-location": "s3://${S3_BUCKET}/warehouse/",
+      "polaris.config.drop-with-purge.enabled": "true"
+    },
     "storageConfigInfo": {
       "storageType": "S3",
       "allowedLocations": ["s3://${S3_BUCKET}/warehouse/"],
@@ -87,20 +90,22 @@ case "${HTTP}" in
   *)       echo "ERROR: catalog create returned ${HTTP}" >&2; cat /tmp/cat-resp.json >&2; exit 1 ;;
 esac
 
-# Register the bare external principals (names only — no roles, no grants). Polaris
-# requires every external identity to exist as a managed principal; OPA holds all the
-# rules, so these are pure identity records. service-account-trino is the Keycloak service
-# account Trino uses for its own catalog calls (granted nothing in OPA); alice/bob are the
-# end users.
-for p in service-account-trino alice bob; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${MGMT}/principals" \
-    -H "${AUTH}" -H "Content-Type: application/json" -H "${RH}" \
-    -d "{\"principal\":{\"name\":\"${p}\",\"type\":\"USER\"}}")
-  case "${code}" in
-    200|201) echo "  principal ${p} created" ;;
-    409)     echo "  principal ${p} exists (OK)" ;;
-    *)       echo "  WARN: principal ${p} create returned ${code}" ;;
-  esac
-done
+# Polaris 1.5 refuses a token whose name has no stored principal, so governance creates one,
+# name only, the first time each person reaches the gate. It does so as `provisioner`, which
+# OPA allows to create principals and nothing else (opa/policy.rego). Its credentials are set
+# to the .env values, so governance can log in without this script handing it a secret.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${MGMT}/principals" \
+  -H "${AUTH}" -H "Content-Type: application/json" -H "${RH}" \
+  -d '{"principal":{"name":"provisioner","type":"SERVICE"}}')
+case "${code}" in
+  200|201) echo "  principal provisioner created" ;;
+  409)     echo "  principal provisioner exists (OK)" ;;
+  *)       echo "ERROR: principal provisioner create returned ${code}" >&2; exit 1 ;;
+esac
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${MGMT}/principals/provisioner/reset" \
+  -H "${AUTH}" -H "Content-Type: application/json" -H "${RH}" \
+  -d "{\"clientId\":\"${PROVISIONER_CLIENT_ID}\",\"clientSecret\":\"${PROVISIONER_CLIENT_SECRET}\"}")
+[ "${code}" = "200" ] || { echo "ERROR: provisioner credential reset returned ${code}" >&2; exit 1; }
+echo "  provisioner credentials set"
 
 echo "Polaris catalog + principal setup complete."

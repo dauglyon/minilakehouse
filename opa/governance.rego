@@ -1,8 +1,9 @@
 package lakehouse.governance
 
-# The one way any rule gets grants. OPA holds none; every rule that needs a grant fetches it
-# from governance's /internal lookups here, at decision time, so a grant change applies at
-# the next decision. Callers send only who is asking and what they name.
+# The one way any rule gets grants or group membership. OPA holds neither; every rule that
+# needs one fetches it from governance's /internal lookups here, at decision time, so a grant
+# or membership change applies at the next decision. Callers send only who is asking and what
+# they name.
 #
 # The result is the response body, or undefined on any failure (raise_error=false turns a
 # transport error into a status code), so a rule that depends on it denies.
@@ -10,6 +11,9 @@ package lakehouse.governance
 import future.keywords.if
 
 get(path) := _send({"method": "GET", "url": _url(path), "headers": _auth})
+
+# The groups a person (subject or Polaris principal name) belongs to.
+groups(subject) := get(concat("/", ["/internal/groups", urlquery.encode(subject)])).groups
 
 # http.send serializes `body` as JSON but sets no Content-Type; governance needs it to parse.
 post(path, body) := _send({

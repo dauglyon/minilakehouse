@@ -1,8 +1,22 @@
 {
-  "table_grants": {
-    "grants": { "alice": { "read": ["db.t1"] } },
-    "writers": ["alice"]
+  "groups": {
+    "jgi-writers": ["alice"],
+    "stewards": ["alice", "carol"],
+    "projw-team": ["carol"],
+    "no-access": ["bob"]
   },
+  "namespace_owners": { "jgi-writers": ["lakehouse.db"] },
+  "tables": [
+    {
+      "id": "lakehouse.db.t1",
+      "description": "demo table",
+      "steward": "alice",
+      "see": [],
+      "read": ["jgi-writers"],
+      "write": ["jgi-writers"],
+      "delete": ["jgi-writers"]
+    }
+  ],
   "register_grants": {
     "jgi-writers": ["datasets/projx/", "datasets/projz/"],
     "projw-team": ["datasets/projw/"]

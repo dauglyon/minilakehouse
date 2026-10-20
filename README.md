@@ -58,11 +58,11 @@ byte path.
 
 | Service | Role |
 |---|---|
-| **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, groups, the `trino` login client and its service account). |
-| **governance** | The PAP + dataset registry (single source of truth), Postgres-backed. Serves grants to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), and accepts governed ingest (`POST /datasets`). |
-| **opa** | The PDP. Rules only (`opa/policy.rego` = tables, `opa/blob.rego` = blobs). Every caller sends only who is asking and the ids it names; each rule fetches the grants it needs from governance (`opa/governance.rego`). |
+| **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`) and table registration (`POST /tables`), and creates each person's Polaris account on first use. |
+| **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
-| **gate** | Proxy between Trino and Polaris: if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides nothing itself. |
+| **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
 | **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
@@ -140,13 +140,26 @@ files directly from RGW. OPA is consulted at the vend — never on the byte path
 q alice --execute "SELECT * FROM iceberg.db.t1"
 #  -> "1"
 
-# DENY — bob authenticates fine but has no grant; denied at the credential vend
+# DENY — bob authenticates fine but has no grant, so for him the table and its schema do not
+# exist: the same answer as for a name nobody created
 q bob --execute "SELECT * FROM iceberg.db.t1"
-#  -> Query ... failed: Failed to load table 't1'
+#  -> Query ... failed: line 1:15: Schema 'db' does not exist
 
-# See OPA decide, on the real per-user identity:
-docker compose logs opa | grep LOAD_TABLE_WITH
-#  -> alice ... "allow":true   |   bob ... "allow":false
+# A new table is registered first, by a steward whose group owns the schema, with its grants;
+# then someone in its `write` grant creates it. An unregistered table is refused.
+docker compose exec -T governance python -c "
+import subprocess, requests
+t = subprocess.run(['python', '/seed/user_token.py', 'alice'], capture_output=True, text=True).stdout.strip()
+print(requests.post('http://localhost:8000/tables', headers={'Authorization': 'Bearer ' + t},
+      json={'id': 'lakehouse.db.t2', 'read': ['jgi-writers'], 'write': ['jgi-writers']}).json())"
+#  -> {'id': 'lakehouse.db.t2', 'ok': True, 'status': 'pending'}
+q alice --execute "CREATE TABLE iceberg.db.t2 AS SELECT 2 AS y"
+#  -> CREATE TABLE: 1 row      (governance now lists lakehouse.db.t2 as live)
+
+# See what OPA was asked, on the real per-user identity (bob is refused at the schema check,
+# which the gate answers as not-found):
+docker compose logs opa | grep -E 'LOAD_TABLE_WITH|NAMESPACE_EXISTS'
+#  -> alice ... LOAD_TABLE_WITH_WRITE_DELEGATION   |   bob ... NAMESPACE_EXISTS
 ```
 
 ## Flow C — blob datasets
@@ -225,17 +238,22 @@ tenants, and neither can see the other's.
 ## Security model
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across both
-  planes. Tables (`opa/policy.rego`): `root` / read credential (`read`) / viewing a table's
-  columns and location (`see` or `read`) / listings (anyone) / writes, DDL and read-write
-  credentials (`writers`). Blobs (`opa/blob.rego`): `allow` (read) / `visible` (see) / `allow_register`
-  (ingest), all group-based. Every grant comes from governance at decision time.
+  planes, all by group. Tables (`opa/policy.rego`): `root` / read credential (`read` or
+  `write`) / viewing a table's columns and location (`see`, `read` or `write`) / viewing a
+  schema (its owners, or any grant on a table in it) / listings (anyone; the gate trims them
+  to what may be viewed) / creating (a registered table with the person in its `write`, or a
+  schema under one their group owns) / writes and read-write credentials (`write`) /
+  dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `allow`
+  (read) / `visible` (see) / `allow_register` (ingest). Group membership and every grant
+  come from governance at decision time; tokens carry no groups.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Tables: Trino and Polaris both validate it (issuer, expiry, audience `polaris`); Trino's
   username is the token's `principal_name` and impersonation is refused; the engine's own
   service account is granted nothing. Blobs: the broker verifies the user's **own** token (no
   engine in the byte path).
 - **Entry lookups are closed.** Governance's `/internal/*` returns grants for datasets a user
-  can't see, so it requires a bearer held only by OPA.
+  can't see, so it requires a bearer held only by OPA. OPA answers any query, including one
+  that reads that bearer, so only Polaris, the broker and governance can reach it.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`), prefix-
   scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further per
   request to one dataset prefix. The long-lived governance service holds only a **read-only RGW
@@ -254,17 +272,19 @@ tenants, and neither can see the other's.
   login session is active (it idles out after 30 minutes by default; Trino's exchanges don't
   count as activity). A query that needs Polaris after that fails. Each refresh logs four
   retry warnings before it succeeds. A query without `--extra-credential token=...` fails.
-- Table listings aren't trimmed: everyone sees every table's name. Viewing a table's columns
-  needs `see` or `read`; with `see` only, DESCRIBE works through Trino (via the `gate`) and
-  SELECT fails.
+- With `see` only, DESCRIBE works through Trino (via the `gate`) and SELECT fails; an INSERT
+  fails with "Failed to initialize the vended credentials" rather than access denied.
+- A refused create's first line is Trino's own ("Failed to create transaction"); the gate's
+  reason is the error's cause, which the CLI prints with `--debug`.
+- Group membership and grants change only in governance's database.
+- Polaris 1.5 needs an account for every person; the gate has governance create it the first
+  time each person shows up. When a Polaris release has the `external` credential mode, that
+  step goes away.
 - Every decision reads governance: if governance is down, every read is denied.
-- Table-plane `writers` is a coarse global list (a writer may write any namespace); a real model
-  would scope it per-namespace.
 - No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
   its bytes vanished). Discovery is blob-only; table discovery is via the catalog's own listing.
 - Plaintext/no-TLS everywhere except Trino's token port, which uses a self-signed keystore
-  generated at container start; dev credentials in `.env`; the OPA debug API exposed — all
-  dev-only.
+  generated at container start; dev credentials in `.env` — all dev-only.
 - RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the
   `projx` demo blobs are re-seeded automatically, but re-seed the table (the command above)
   and re-run the ingest demo for `projz`. (Re-running the `polaris-setup` one-shot likewise

@@ -162,15 +162,22 @@ and `spark_connect_proxy`, either of which may decide access itself.
 
 ## Next steps
 
-Done: every design and code step listed here before. Open:
+Done: every design and code step listed here before; the gate (listings, not-found,
+isolation, creation checks, create/drop reports); group membership moved from Keycloak to
+governance, with tables registered as entries granted `see`/`read`/`write`/`delete` by group;
+a `delete` grant for drops. Open:
 
-1. `WHITEPAPER.md` §12.4: how table rules learn groups, since Polaris's OPA input has none.
-2. Long queries: Trino's refresh works only while the user's Keycloak login session is
+1. Polaris accounts: built, created on first use (governance `POST /principals/me`, as the
+   create-only `provisioner`; the gate calls it before a person's first request). Planned:
+   when a Polaris release includes the `external` credential mode (PR #5119, merged on main
+   2026-09-24, not in 1.8.0), set `polaris.authentication.credential-mode=external`, pin that
+   release, and remove the provisioner, the endpoint and the gate's call.
+2. Client sessions past the 5-minute token: a login proxy in front of Trino that speaks
+   Trino's external-authentication protocol and keeps each person's refresh token. Chosen,
+   unbuilt.
+3. Long queries: Trino's refresh works only while the user's Keycloak login session is
    active (idle 30 min by default; exchanges don't renew it), measured (`WHITEPAPER.md` §6).
-3. Table listings are untrimmed. Viewing a table now needs `see` or `read`; the gate
-   (`gate/app.py`, only this so far) repeats a refused credentialed load without the
-   credential request, so `see`-only DESCRIBE works through Trino.
-4. Commit the working tree.
+4. No API to change group membership or grants; both change only in governance's database.
 
 To check:
 

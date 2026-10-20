@@ -3,12 +3,6 @@
   "enabled": true,
   "sslRequired": "none",
   "registrationAllowed": false,
-  "groups": [
-    { "name": "jgi-writers", "path": "/jgi-writers" },
-    { "name": "projw-team", "path": "/projw-team" },
-    { "name": "no-access", "path": "/no-access" },
-    { "name": "stewards", "path": "/stewards" }
-  ],
   "users": [
     {
       "username": "alice",
@@ -19,8 +13,7 @@
       "email": "alice@example.org",
       "credentials": [
         { "type": "password", "value": "alice", "temporary": false }
-      ],
-      "groups": ["/jgi-writers", "/stewards"]
+      ]
     },
     {
       "username": "bob",
@@ -31,8 +24,7 @@
       "email": "bob@example.org",
       "credentials": [
         { "type": "password", "value": "bob", "temporary": false }
-      ],
-      "groups": ["/no-access"]
+      ]
     },
     {
       "username": "carol",
@@ -43,8 +35,7 @@
       "email": "carol@example.org",
       "credentials": [
         { "type": "password", "value": "carol", "temporary": false }
-      ],
-      "groups": ["/projw-team", "/stewards"]
+      ]
     }
   ],
   "clients": [
@@ -71,20 +62,6 @@
             "user.attribute": "username",
             "claim.name": "principal_name",
             "jsonType.label": "String",
-            "access.token.claim": "true",
-            "id.token.claim": "true",
-            "introspection.token.claim": "true"
-          }
-        },
-        {
-          "name": "principal_roles",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-group-membership-mapper",
-          "consentRequired": false,
-          "config": {
-            "claim.name": "principal_roles",
-            "full.path": "false",
-            "multivalued": "true",
             "access.token.claim": "true",
             "id.token.claim": "true",
             "introspection.token.claim": "true"

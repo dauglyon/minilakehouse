@@ -10,6 +10,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    networks: [default, catalog]
     ports:
       - "15432:5432"
     volumes:
@@ -31,6 +32,7 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
     volumes:
       - ./keycloak/realm-lakehouse.json:/opt/keycloak/data/import/realm-lakehouse.json:ro
+    networks: [default, catalog]
     ports:
       - "18080:8080"
     healthcheck:
@@ -96,6 +98,12 @@ services:
       OPA_BASE: http://opa:8181
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
       ENTRY_TOKEN: ${ENTRY_TOKEN}   # bearer OPA must present to /internal/*
+      LIFECYCLE_TOKEN: ${LIFECYCLE_TOKEN}   # bearer the gate presents to report table creates/drops
+      # Creating each person's Polaris principal on first use (POST /principals/me).
+      POLARIS_URL: http://polaris:8181
+      POLARIS_REALM: ${POLARIS_REALM}
+      PROVISIONER_CLIENT_ID: ${PROVISIONER_CLIENT_ID}
+      PROVISIONER_CLIENT_SECRET: ${PROVISIONER_CLIENT_SECRET}
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       # Least-privilege reader (ListBucket on datasets/* only) — NOT the RGW admin key.
@@ -105,6 +113,7 @@ services:
       S3_BUCKET: ${S3_BUCKET}
     volumes:
       - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)
+    networks: [default, policy, catalog]
     ports:
       - "19092:8000"
 
@@ -119,8 +128,10 @@ services:
       ENTRY_TOKEN: ${ENTRY_TOKEN}
     volumes:
       - ./opa:/policies:ro
-    ports:
-      - "18181:8181"
+    # OPA's API answers anyone who reaches it: any query, including ENTRY_TOKEN from its
+    # environment and every grant through governance. So it sits only on `policy`, with
+    # its callers (polaris, broker, governance, gate), and publishes no host port.
+    networks: [policy]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:8181/health"]
       interval: 5s
@@ -151,6 +162,7 @@ services:
       BUCKET: ${S3_BUCKET}
       BLOB_BROKER_KEY: ${BLOB_BROKER_KEY}
       BLOB_BROKER_SECRET: ${BLOB_BROKER_SECRET}
+    networks: [default, policy]
     ports:
       - "19091:9100"
 
@@ -165,6 +177,7 @@ services:
     volumes:
       - ./ceph/rgw-entrypoint.sh:/rgw-entrypoint.sh:ro
       - ./ceph/sts-bootstrap.sh:/sts-bootstrap.sh:ro
+    networks: [default, catalog]
     ports:
       - "19000:8080"
     healthcheck:
@@ -206,6 +219,7 @@ services:
         rc=$$?
         if [ $$rc -eq 3 ]; then echo "Already bootstrapped — skipping (OK)"; exit 0; fi
         exit $$rc
+    networks: [catalog]
 
   polaris:
     image: ${POLARIS_IMAGE}
@@ -230,7 +244,7 @@ services:
       AWS_SECRET_ACCESS_KEY: ${RGW_SECRET_KEY}
       # --- authn: MIXED — internal root (admin/bootstrap/catalog) + external Keycloak
       #     tokens (user-facing catalog ops). The external identity's principal name
-      #     comes from the token's principal_name claim; roles from principal_roles. ---
+      #     comes from the token's principal_name claim. ---
       polaris.authentication.type: mixed
       quarkus.oidc.tenant-enabled: "true"
       # OIDC issuer = Keycloak. Trino forwards each user's own Keycloak token as the bearer
@@ -239,13 +253,16 @@ services:
       quarkus.oidc.discovery-enabled: "true"
       quarkus.oidc.client-id: ${POLARIS_CLIENT_ID}
       quarkus.oidc.token.audience: ${POLARIS_CLIENT_ID}
-      quarkus.oidc.roles.role-claim-path: principal_roles
+      # Polaris 1.5 logs the whole credential, token included, at WARN whenever a token
+      # carries a role that isn't a Polaris role the principal holds, and principals hold
+      # none. So no role claim is mapped, and the filter drops every role Quarkus finds
+      # anyway (Keycloak's realm roles, e.g. on the engine's service-account token), since
+      # Keycloak issues none named PRINCIPAL_ROLE:. OPA receives roles: [] either way.
       # No id-claim-path: external principals are federated by NAME only (the default
       # mapper returns an empty principal-id when id-claim-path is unset). Setting it to
       # a non-numeric claim like `sub` makes Polaris try to parse the UUID as a long.
       polaris.oidc.principal-mapper.name-claim-path: principal_name
-      polaris.oidc.principal-roles-mapper.mappings[0].regex: (.+)
-      polaris.oidc.principal-roles-mapper.mappings[0].replacement: PRINCIPAL_ROLE:$$1
+      polaris.oidc.principal-roles-mapper.filter: "PRINCIPAL_ROLE:.+"
       # --- authz: delegated to OPA (deny-by-default policy; grants fetched from governance) ---
       polaris.authorization.type: opa
       polaris.authorization.opa.policy-uri: http://opa:8181/v1/data/polaris/authz
@@ -254,11 +271,14 @@ services:
       polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": "[\"S3\"]"
       # RGW speaks http (no TLS) in this dev image, so allow the "insecure" S3 FileIO.
       polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      # Mint each table credential under the person's name (STS session polaris-<principal>),
+      # so storage can attribute reads; credentials are then cached per person, not shared.
+      polaris.features."INCLUDE_PRINCIPAL_NAME_IN_SUBSCOPED_CREDENTIAL": "true"
       polaris.readiness.ignore-severe-issues: "true"
       quarkus.otel.sdk.disabled: "true"
-    ports:
-      - "8181:8181"
-      - "18185:8182"
+    # Reachable only through the gate (and by polaris-setup, as root): Trino and every other
+    # client are on `default`, which Polaris is not on, and no host port is published.
+    networks: [catalog, policy]
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
       interval: 5s
@@ -277,6 +297,8 @@ services:
       POLARIS_REALM: ${POLARIS_REALM}
       POLARIS_ROOT_CLIENT_ID: ${POLARIS_ROOT_CLIENT_ID}
       POLARIS_ROOT_CLIENT_SECRET: ${POLARIS_ROOT_CLIENT_SECRET}
+      PROVISIONER_CLIENT_ID: ${PROVISIONER_CLIENT_ID}
+      PROVISIONER_CLIENT_SECRET: ${PROVISIONER_CLIENT_SECRET}
       CATALOG_NAME: ${CATALOG_NAME}
       S3_BUCKET: ${S3_BUCKET}
       S3_ENDPOINT: http://ceph:8080
@@ -285,14 +307,28 @@ services:
     entrypoint: ["/bin/sh", "/polaris/bootstrap.sh"]
     volumes:
       - ./polaris/bootstrap.sh:/polaris/bootstrap.sh:ro
+    # default too: the script installs jq from the internet, and `catalog` has no way out.
+    networks: [default, catalog]
 
   gate:
-    # Proxy in front of Polaris for Trino: lets a person who may view a table but not read
-    # it load the table without a credential, so DESCRIBE works. See gate/app.py.
+    # The only way to Polaris. Verifies the caller's token, trims listings to what the caller
+    # may view, turns refusals for names they may not view into not-found, loads a table
+    # without a credential for a person who may view but not read it, decides which tables
+    # and namespaces may be created, and reports creates and drops. See gate/app.py.
     build: ./gate
     depends_on:
       polaris:
         condition: service_healthy
+      opa:
+        condition: service_healthy
+    environment:
+      OPA_URL: http://opa:8181/v1/data/lakehouse/tables
+      GOVERNANCE_URL: http://governance:8000
+      LIFECYCLE_TOKEN: ${LIFECYCLE_TOKEN}
+      KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
+      KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
+      POLARIS_AUDIENCE: ${POLARIS_CLIENT_ID}
+    networks: [default, catalog, policy]
 
   trino:
     image: ${TRINO_IMAGE}
@@ -336,6 +372,16 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+
+networks:
+  default:
+  # OPA and its callers only; internal, so nothing on it reaches outside the host.
+  policy:
+    internal: true
+  # Polaris, its backends, the gate, Polaris's setup jobs, and governance (which creates
+  # each person's Polaris principal).
+  catalog:
+    internal: true
 
 volumes:
   postgres_data:

@@ -6,9 +6,9 @@ A client presents its OWN Keycloak token and names a dataset. The broker
 no engine in the byte path, safe even against a compromised engine.
 
 Flow:
-  1. verify the user's token            -> subject + groups
+  1. verify the user's token            -> subject
   2. ask OPA's `vend` rule about the dataset id -> {allow, prefix}; OPA fetches the
-     dataset's grants and registered prefix from governance
+     person's groups and the dataset's grants and registered prefix from governance
   3. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to that
      prefix (the role permits datasets/*; the session policy narrows; the client cannot
      widen it) -> per-dataset temp credentials
@@ -54,37 +54,34 @@ app = Flask(__name__)
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
 # separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token):
-    """Cryptographically verify the caller's own Keycloak token -> (subject, groups). PyJWT
-    enforces signature + exp; we add issuer and azp (the token must have been issued through
-    our login client, not some other realm client)."""
+    """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
+    signature + exp; we add issuer and azp (the token must have been issued through our login
+    client, not some other realm client). Groups are not read from the token: OPA gets them
+    from governance."""
     key = _jwks.get_signing_key_from_jwt(token).key
     claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
                         options={"verify_aud": False})
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
-    subject = claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
-    groups = claims.get("principal_roles") or claims.get("groups") or []
-    return subject, groups
+    return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
 
 
 def authed_user():
-    """Verify the request's bearer token. Returns (subject, groups, None) on success, or
-    (None, None, error_response) for the caller to return as-is."""
+    """Verify the request's bearer token. Returns (subject, None) on success, or
+    (None, error_response) for the caller to return as-is."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
-        return None, None, (jsonify({"error": "missing bearer token"}), 401)
+        return None, (jsonify({"error": "missing bearer token"}), 401)
     try:
-        return (*verify_user(auth[7:]), None)
+        return verify_user(auth[7:]), None
     except Exception as e:  # noqa: BLE001
         app.logger.warning("token verification failed: %s", e)
-        return None, None, (jsonify({"error": "invalid token"}), 401)
+        return None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_vend(subject, groups, dataset):
+def opa_vend(subject, dataset):
     """OPA's {allow, prefix} for this subject reading this dataset."""
-    r = _http.post(OPA_URL, json={"input": {
-        "subject": subject, "groups": groups, "dataset": dataset,
-    }}, timeout=5)
+    r = _http.post(OPA_URL, json={"input": {"subject": subject, "dataset": dataset}}, timeout=5)
     r.raise_for_status()
     return r.json().get("result") or {"allow": False}
 
@@ -106,16 +103,16 @@ def health():
 
 @app.post("/vend")
 def vend():
-    subject, groups, err = authed_user()
+    subject, err = authed_user()
     if err:
         return err
 
     dataset = (request.get_json(silent=True) or {}).get("dataset")
     if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
         return jsonify({"error": "invalid dataset id"}), 400
-    decision = opa_vend(subject, groups, dataset)
+    decision = opa_vend(subject, dataset)
     if decision.get("allow") is not True:
-        app.logger.info("DENY subject=%s groups=%s dataset=%s", subject, groups, dataset)
+        app.logger.info("DENY subject=%s dataset=%s", subject, dataset)
         return jsonify({"error": "forbidden"}), 403
 
     # Governance confined the prefix at registration; it becomes an STS ARN below, so

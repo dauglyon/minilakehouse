@@ -1,7 +1,8 @@
 """
 governance — the PAP + dataset registry, and the single source of truth (Postgres-backed).
 
-It owns the dataset registry + all grants; OPA holds none. Every caller, governance included,
+It owns group membership, the dataset and table registries, and all grants; OPA holds none,
+and Keycloak only proves who a person is. Every caller, governance included,
 sends OPA only who is asking and what they name; OPA's rules fetch the grants they need from
 the /internal/* lookups here, at decision time. Durable state lives in a dedicated
 `governance` Postgres DB.
@@ -42,6 +43,18 @@ KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 # Bearer OPA presents to /internal/*. Those return any entry's grants, including datasets the
 # person can't see, so they are closed to everyone else.
 ENTRY_TOKEN = os.environ["ENTRY_TOKEN"]
+# Bearer the gate presents when it reports a table created or dropped through Polaris.
+LIFECYCLE_TOKEN = os.environ["LIFECYCLE_TOKEN"]
+# Polaris refuses a token whose name has no stored principal (released Polaris has no other
+# mode), so governance creates each person's, name only, the first time the gate sees them.
+# It logs in as `provisioner`, which OPA allows to create principals and nothing else.
+POLARIS_URL = os.environ["POLARIS_URL"]
+POLARIS_REALM = os.environ["POLARIS_REALM"]
+PROVISIONER = (os.environ["PROVISIONER_CLIENT_ID"], os.environ["PROVISIONER_CLIENT_SECRET"])
+# Polaris's own principals; a person with one of these names would act as it.
+RESERVED_PRINCIPALS = {"root", "provisioner"}
+# A table id: catalog, namespace levels and name joined by "." (opa/tables.rego).
+TABLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$")
 # Only tokens issued THROUGH our login client are accepted (azp), so a token minted for some
 # other realm client can't be replayed here as a user credential.
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
@@ -92,11 +105,26 @@ CREATE TABLE IF NOT EXISTS datasets (
     last_modified   TIMESTAMPTZ,
     last_reconciled TIMESTAMPTZ
 );
-CREATE TABLE IF NOT EXISTS table_grants (
-    id      INTEGER PRIMARY KEY DEFAULT 1,
-    grants  JSONB  NOT NULL DEFAULT '{}'::jsonb,
-    writers TEXT[] NOT NULL DEFAULT '{}',
-    CONSTRAINT table_grants_singleton CHECK (id = 1)
+CREATE TABLE IF NOT EXISTS group_members (
+    grp    TEXT NOT NULL,
+    member TEXT NOT NULL,                    -- a person's subject (the token's principal_name)
+    PRIMARY KEY (grp, member)
+);
+CREATE TABLE IF NOT EXISTS table_entries (
+    id          TEXT PRIMARY KEY,            -- <catalog>.<namespace...>.<table>
+    description TEXT,
+    steward     TEXT,
+    see         TEXT[] NOT NULL DEFAULT '{}',
+    read        TEXT[] NOT NULL DEFAULT '{}',
+    write       TEXT[] NOT NULL DEFAULT '{}',
+    "delete"    TEXT[] NOT NULL DEFAULT '{}',
+    status      TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
+    location    TEXT                         -- learned from Polaris when the table is created
+);
+CREATE TABLE IF NOT EXISTS namespace_owners (
+    grp       TEXT NOT NULL,
+    namespace TEXT NOT NULL,                 -- <catalog>.<namespace...>; covers every namespace under it
+    PRIMARY KEY (grp, namespace)
 );
 CREATE TABLE IF NOT EXISTS register_grants (
     grp      TEXT PRIMARY KEY,
@@ -170,12 +198,23 @@ def init_db():
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
                  d.get("visibility", []), d.get("access", [])),
             )
-        tg = reg.get("table_grants", {})
-        cur.execute(
-            "INSERT INTO table_grants (id, grants, writers) VALUES (1, %s, %s) "
-            "ON CONFLICT (id) DO NOTHING",
-            (json.dumps(tg.get("grants", {})), tg.get("writers", [])),
-        )
+        for grp, members in reg.get("groups", {}).items():
+            for m in members:
+                cur.execute("INSERT INTO group_members (grp, member) VALUES (%s, %s) "
+                            "ON CONFLICT DO NOTHING", (grp, m))
+        for t in reg.get("tables", []):
+            if not TABLE_ID_RE.match(t["id"]):
+                raise ValueError(f"registry.json: bad table id {t['id']!r}")
+            cur.execute(
+                'INSERT INTO table_entries (id, description, steward, see, read, write, "delete") '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                (t["id"], t.get("description"), t.get("steward"), t.get("see", []),
+                 t.get("read", []), t.get("write", []), t.get("delete", [])),
+            )
+        for grp, namespaces in reg.get("namespace_owners", {}).items():
+            for ns in namespaces:
+                cur.execute("INSERT INTO namespace_owners (grp, namespace) VALUES (%s, %s) "
+                            "ON CONFLICT DO NOTHING", (grp, ns))
         for grp, prefixes in reg.get("register_grants", {}).items():
             # Roots MUST end in / — the ownership boundary is startswith(prefix, root), so a
             # missing slash would let `datasets/projx` own `datasets/projxEVIL/`.
@@ -194,35 +233,35 @@ def _entry(row):
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
 # separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token):
-    """Cryptographically verify the caller's own Keycloak token -> (subject, groups). PyJWT
-    enforces signature + exp; we add issuer and azp (the token must have been issued through
-    our login client, not some other realm client)."""
+    """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
+    signature + exp; we add issuer and azp (the token must have been issued through our login
+    client, not some other realm client). Groups are not read from the token: OPA gets them
+    from governance."""
     key = _jwks.get_signing_key_from_jwt(token).key
     claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
                         options={"verify_aud": False})
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
-    subject = claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
-    groups = claims.get("principal_roles") or claims.get("groups") or []
-    return subject, groups
+    return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
 
 
 def authed_user():
-    """Verify the request's bearer token. Returns (subject, groups, None) on success, or
-    (None, None, error_response) for the caller to return as-is."""
+    """Verify the request's bearer token. Returns (subject, None) on success, or
+    (None, error_response) for the caller to return as-is."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
-        return None, None, (jsonify({"error": "missing bearer token"}), 401)
+        return None, (jsonify({"error": "missing bearer token"}), 401)
     try:
-        return (*verify_user(auth[7:]), None)
+        return verify_user(auth[7:]), None
     except Exception as e:  # noqa: BLE001
         app.logger.warning("token verification failed: %s", e)
-        return None, None, (jsonify({"error": "invalid token"}), 401)
+        return None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa(rule, inp):
-    """Evaluate one lakehouse.blob rule; returns its result."""
-    r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/blob/{rule}", json={"input": inp}, timeout=5)
+def opa(rule, inp, package="blob"):
+    """Evaluate one lakehouse.<package> rule; returns its result."""
+    r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/{package}/{rule}", json={"input": inp},
+                   timeout=5)
     r.raise_for_status()
     return r.json().get("result")
 
@@ -306,9 +345,8 @@ def reconcile_loop():
 @app.get("/health")
 def health():
     with db() as cur:
-        cur.execute("SELECT id FROM datasets ORDER BY id")
-        ids = [r["id"] for r in cur.fetchall()]
-    return jsonify({"ok": True, "datasets": ids})
+        cur.execute("SELECT 1")
+    return jsonify({"ok": True})
 
 
 # Grant lookups for OPA's rules (opa/governance.rego), behind ENTRY_TOKEN.
@@ -339,31 +377,90 @@ def internal_register_grants():
     return jsonify({r["grp"]: r["prefixes"] for r in rows})
 
 
-@app.get("/internal/tables/<fqn>")
-def internal_table(fqn):
-    # Principals holding see and read on the table (table grants are per principal: Polaris's
-    # OPA input names the principal but carries no groups). Unknown table = nobody.
-    if err := internal_caller():
-        return err
-    entry = {"id": fqn, "see": [], "read": []}
-    with db() as cur:
-        cur.execute("SELECT p.key AS principal, p.value AS g FROM table_grants, "
-                    "jsonb_each(grants) AS p WHERE id = 1", ())
-        for r in cur.fetchall():
-            for grant in ("see", "read"):
-                if fqn in r["g"].get(grant, []):
-                    entry[grant].append(r["principal"])
-    return jsonify(entry)
-
-
-@app.get("/internal/table-writers")
-def internal_table_writers():
+@app.get("/internal/groups/<subject>")
+def internal_groups(subject):
     if err := internal_caller():
         return err
     with db() as cur:
-        cur.execute("SELECT writers FROM table_grants WHERE id = 1")
+        cur.execute("SELECT grp FROM group_members WHERE member = %s ORDER BY grp", (subject,))
+        return jsonify({"groups": [r["grp"] for r in cur.fetchall()]})
+
+
+_TABLE_COLS = 'id, see, read, write, "delete", status'
+
+
+def _ids_from_body():
+    ids = (request.get_json(silent=True) or {}).get("ids")
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+        return None
+    return ids
+
+
+@app.get("/internal/tables/<table_id>")
+def internal_table(table_id):
+    # A table's grants, as sets of groups; an unregistered table is 404, so its rules deny.
+    if err := internal_caller():
+        return err
+    with db() as cur:
+        cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = %s", (table_id,))
         row = cur.fetchone()
-    return jsonify({"writers": row["writers"] if row else []})
+    return (jsonify(row), 200) if row else (jsonify({"error": "not found"}), 404)
+
+
+@app.post("/internal/tables")
+def internal_tables():
+    if err := internal_caller():
+        return err
+    if (ids := _ids_from_body()) is None:
+        return jsonify({"error": "ids must be a list of strings"}), 400
+    with db() as cur:
+        cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = ANY(%s)", (ids,))
+        return jsonify({"entries": {r["id"]: r for r in cur.fetchall()}})
+
+
+@app.post("/internal/namespaces")
+def internal_namespaces():
+    # {id: {id, owners: [group], viewers: [group]}}. Owners own the namespace or one above it;
+    # viewers hold see, read or write on some table at any depth under it (`lakehouse.db`
+    # covers `lakehouse.db.t1` and `lakehouse.db.x.t2`). Ids are compared with starts_with,
+    # not LIKE, so "_" and "%" in a name are plain characters.
+    if err := internal_caller():
+        return err
+    if (ids := _ids_from_body()) is None:
+        return jsonify({"error": "ids must be a list of strings"}), 400
+    entries = {}
+    with db() as cur:
+        for i in ids:
+            cur.execute("SELECT DISTINCT grp FROM namespace_owners "
+                        "WHERE namespace = %s OR starts_with(%s, namespace || '.')", (i, i))
+            owners = sorted(r["grp"] for r in cur.fetchall())
+            cur.execute("SELECT DISTINCT unnest(see || read || write) AS grp FROM table_entries "
+                        "WHERE starts_with(id, %s || '.')", (i,))
+            viewers = sorted(r["grp"] for r in cur.fetchall())
+            entries[i] = {"id": i, "owners": owners, "viewers": viewers}
+    return jsonify({"entries": entries})
+
+
+@app.post("/internal/table-events")
+def table_events():
+    # The gate's report that Polaris created or dropped a table: created sets a pending entry
+    # live and records its location, dropped sets a live entry gone. Any other transition is
+    # logged and ignored.
+    if not hmac.compare_digest(request.headers.get("Authorization", ""),
+                               f"Bearer {LIFECYCLE_TOKEN}"):
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    table_id, event = body.get("id"), body.get("event")
+    old, new = {"created": ("pending", "live"), "dropped": ("live", "gone")}.get(event, (None, None))
+    if not isinstance(table_id, str) or old is None:
+        return jsonify({"error": "id and event (created|dropped) required"}), 400
+    with db(commit=True) as cur:
+        cur.execute("UPDATE table_entries SET status = %s, location = COALESCE(%s, location) "
+                    "WHERE id = %s AND status = %s RETURNING id",
+                    (new, body.get("location"), table_id, old))
+        changed = cur.fetchone() is not None
+    app.logger.info("TABLE %s %s%s", event, table_id, "" if changed else " (no matching entry; ignored)")
+    return jsonify({"ok": True, "changed": changed})
 
 
 @app.post("/events")
@@ -398,7 +495,7 @@ def events():
 def register_dataset():
     # Register a new dataset. The steward supplies the PREFIX (which they own); the id is
     # derived from it. authN = the caller's token; authZ = OPA's allow_register.
-    subject, groups, err = authed_user()
+    subject, err = authed_user()
     if err:
         return err
 
@@ -408,8 +505,8 @@ def register_dataset():
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
 
-    if opa("allow_register", {"subject": subject, "groups": groups, "prefix": prefix}) is not True:
-        app.logger.info("DENY register subject=%s groups=%s prefix=%s", subject, groups, prefix)
+    if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
+        app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
         return jsonify({"error": "forbidden"}), 403
 
     try:
@@ -441,9 +538,66 @@ def register_dataset():
     return jsonify({"ok": True, "id": ds_id, "registered_by": subject}), 201
 
 
+@app.post("/principals/me")
+def provision_principal():
+    # Create the caller's Polaris principal if it doesn't exist. Authenticated by the person's
+    # own token, so it creates only that person's; the gate calls it before a person's first
+    # request reaches Polaris, which would otherwise refuse it (and log the token).
+    subject, err = authed_user()
+    if err:
+        return err
+    if subject in RESERVED_PRINCIPALS:
+        return jsonify({"error": "reserved name"}), 403
+    headers = {"Polaris-Realm": POLARIS_REALM}
+    tok = _http.post(f"{POLARIS_URL}/api/catalog/v1/oauth/tokens", auth=PROVISIONER, headers=headers,
+                     data={"grant_type": "client_credentials", "scope": "PRINCIPAL_ROLE:ALL"},
+                     timeout=5)
+    tok.raise_for_status()
+    headers["Authorization"] = f"Bearer {tok.json()['access_token']}"
+    r = _http.post(f"{POLARIS_URL}/api/management/v1/principals", headers=headers, timeout=5,
+                   json={"principal": {"name": subject, "type": "USER"}})
+    if r.status_code not in (201, 409):
+        app.logger.warning("provision %s: Polaris returned %s %s", subject, r.status_code, r.text[:200])
+        return jsonify({"error": "could not create principal"}), 502
+    if r.status_code == 201:
+        app.logger.info("PROVISION principal=%s", subject)
+    return jsonify({"ok": True, "principal": subject, "created": r.status_code == 201})
+
+
+@app.post("/tables")
+def register_table():
+    # Register a table before it is created: Polaris (through the gate) creates only a
+    # registered, pending table, for someone in its write grant. authZ = OPA's
+    # lakehouse.tables.allow_register (a steward whose group owns the namespace).
+    subject, err = authed_user()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    table_id = body.get("id")
+    grants = {g: body.get(g, []) for g in ("see", "read", "write", "delete")}
+    if not isinstance(table_id, str) or not TABLE_ID_RE.match(table_id):
+        return jsonify({"error": "id must be <catalog>.<namespace...>.<table>"}), 400
+    if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
+        return jsonify({"error": "see, read, write and delete must be lists of groups"}), 400
+    if opa("allow_register", {"subject": subject, "id": table_id}, package="tables") is not True:
+        app.logger.info("DENY register-table subject=%s id=%s", subject, table_id)
+        return jsonify({"error": "forbidden"}), 403
+    try:
+        with db(commit=True) as cur:
+            cur.execute(
+                'INSERT INTO table_entries (id, description, steward, see, read, write, "delete") '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (table_id, body.get("description"), subject, grants["see"], grants["read"],
+                 grants["write"], grants["delete"]))
+    except psycopg2.errors.UniqueViolation:
+        return jsonify({"error": "table unavailable"}), 409
+    app.logger.info("REGISTER-TABLE subject=%s id=%s", subject, table_id)
+    return jsonify({"ok": True, "id": table_id, "status": "pending"}), 201
+
+
 @app.get("/discover")
 def discover():
-    subject, groups, err = authed_user()
+    subject, err = authed_user()
     if err:
         return err
 
@@ -455,8 +609,7 @@ def discover():
         rows = cur.fetchall()
 
     # One decision over every candidate id; OPA returns which pass, governance builds the list.
-    res = opa("discover", {"subject": subject, "groups": groups,
-                           "datasets": [r["id"] for r in rows]})
+    res = opa("discover", {"subject": subject, "datasets": [r["id"] for r in rows]})
     seen, reads = set(res["visible"]), set(res["readable"])
     visible = [{"id": r["id"], "description": r["description"], "steward": r["steward"],
                 "can_read": r["id"] in reads} for r in rows if r["id"] in seen]

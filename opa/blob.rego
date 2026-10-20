@@ -1,12 +1,12 @@
 package lakehouse.blob
 
 # Blob-plane rules (Flows A and C, and registration). Callers send the person's subject and
-# groups and the dataset ids or prefix they name; the rules fetch entries and ownership from
-# governance (lakehouse.governance), once per decision.
+# the dataset ids or prefix they name; the rules fetch the person's groups, the entries and
+# ownership from governance (lakehouse.governance).
 #
-#   vend            input {subject, groups, dataset: id}       broker: {allow, prefix} for one dataset
-#   discover        input {subject, groups, datasets: [id]}    governance: {visible: [id], readable: [id]}
-#   allow_register  input {subject, groups, prefix}            governance: may register at prefix
+#   vend            input {subject, dataset: id}       broker: {allow, prefix} for one dataset
+#   discover        input {subject, datasets: [id]}    governance: {visible: [id], readable: [id]}
+#   allow_register  input {subject, prefix}            governance: may register at prefix
 #
 # An entry is {id, prefix, visibility: [group], access: [group]}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
@@ -30,7 +30,7 @@ discover := {"visible": visible, "readable": readable}
 
 visible contains id if {
 	some id, e in _entries
-	some g in input.groups
+	some g in _groups
 	g in e.visibility
 }
 
@@ -45,9 +45,9 @@ readable contains id if {
 default allow_register := false
 
 allow_register if {
-	"stewards" in input.groups
+	"stewards" in _groups
 	owned := governance.get("/internal/register-grants")
-	some g in input.groups
+	some g in _groups
 	some root in object.get(owned, g, [])
 	startswith(input.prefix, root)
 }
@@ -58,7 +58,9 @@ else := [input.dataset]
 # {id: entry} for the ids named in the input that exist.
 _entries := governance.post("/internal/datasets", {"ids": _ids}).entries
 
+_groups := governance.groups(input.subject)
+
 _reads(e) if {
-	some g in input.groups
+	some g in _groups
 	g in e.access
 }
