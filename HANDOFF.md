@@ -184,9 +184,15 @@ a `delete` grant for drops; the login proxy (`login-proxy/`). Open:
    active (idle 30 min by default; exchanges don't renew it), measured (`WHITEPAPER.md` §6).
 4. No API to change group membership or grants; both change only in governance's database.
 5. Login-proxy production hardening, parked (prototype is otherwise complete): a shared/
-   persistent session store (sessions are in-memory, a restart logs everyone out), a browser
-   confirmation page naming the requesting client, and global/distributed flood controls
-   beyond the per-source challenge rate limit already in place.
+   persistent session store (sessions are in-memory, a restart logs everyone out); a browser
+   confirmation page naming the requesting client; and flood controls that need deployment
+   topology — the per-source challenge rate limit keys on `request.remote_addr`, which is the
+   real peer only on a direct connection (host-published :19200 passes through Docker's
+   userland proxy and shares one address, so it is best-effort there); behind a trusted LB,
+   key it on a validated `X-Forwarded-For` (e.g. werkzeug `ProxyFix` with a fixed hop count),
+   never an unvalidated one, and bucket IPv6 by /64. A single in-memory instance has an
+   irreducible cap-vs-eviction tradeoff under a distributed flood; distributed rate limiting is
+   the real control.
 
 To check:
 
