@@ -24,8 +24,10 @@ Toward the client (Trino's protocol):
 The browser leg is bound so knowing the (disclosed) auth id is not enough to complete a login
 for someone else: the callback must echo an HttpOnly nonce cookie set at initiate, the code is
 bound by PKCE (a verifier the browser never sees), the session is yielded only by the separate
-poll token, and pending logins expire (LOGIN_TTL) and are capped (MAX_PENDING). Not done: a
-browser confirmation page naming the requesting client.
+poll token, and initiate and callback are each single-use (a replay is refused). Pending logins
+expire (LOGIN_TTL); at the cap (MAX_PENDING) a new challenge sheds only logins no browser has
+started, else returns 503, so a flood can't evict a login in progress or exhaust memory. The
+login maps are guarded by a lock. Not done: a browser confirmation page naming the client.
 
 Toward Trino (plain JWT, unchanged): every forwarded request carries the person's current
 access token, refreshed from the stored refresh token when it is within REFRESH_SKEW of
@@ -44,6 +46,7 @@ import logging
 import os
 import secrets
 import ssl
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -86,6 +89,9 @@ _verify = TRINO_CA or True
 # auth_id -> {poll_token, status, created, nonce, verifier, session?, error?}.
 _logins = {}
 _by_poll = {}  # poll_token -> auth_id
+# The dev server serves requests on threads; guard the login maps (not the per-request session
+# refresh, which does network I/O and must not serialize behind one lock).
+_lock = threading.Lock()
 # A challenge is unauthenticated, so bound how many pending logins can pile up, and drop stale.
 LOGIN_TTL = 300
 MAX_PENDING = 1000
@@ -131,13 +137,13 @@ def _fresh_token(sid):
     return s["access"]
 
 
-def _drop_login(auth_id):
+def _drop_login(auth_id):  # call under _lock
     login = _logins.pop(auth_id, None)
     if login:
         _by_poll.pop(login["poll_token"], None)
 
 
-def _purge_logins():
+def _purge_logins():  # call under _lock
     cutoff = time.time() - LOGIN_TTL
     for auth_id in [a for a, l in _logins.items() if l["created"] < cutoff]:
         _drop_login(auth_id)
@@ -145,23 +151,31 @@ def _purge_logins():
 
 def challenge(refresh_only_sid=None):
     """Trino's 401 bearer challenge. With a session whose refresh failed, offer only the token
-    server (the client re-polls); otherwise the full redirect-and-token challenge."""
+    server (the client re-polls); otherwise the full redirect-and-token challenge, or 503 when
+    too many logins are already in flight."""
     if refresh_only_sid:
         hdr = f'Bearer x_token_server="{PUBLIC_URL}/auth/token/{refresh_only_sid}"'
-    else:
+        return Response('{"error":"authentication required"}', status=401,
+                        headers={"WWW-Authenticate": hdr}, content_type="application/json")
+    with _lock:
         _purge_logins()
-        # Bound memory: a challenge needs no credential, so an unauthenticated flood can't grow
-        # _logins without limit — evict the oldest pending login once at the cap.
+        # A challenge needs no credential. At the cap, shed only logins no browser has started
+        # (no nonce yet), oldest first; never one mid-login. If even those don't free room, all
+        # pending logins are in flight, so refuse the new one rather than evict a real one.
         while len(_logins) >= MAX_PENDING:
-            _drop_login(min(_logins, key=lambda a: _logins[a]["created"]))
+            spare = [a for a, l in _logins.items() if l["nonce"] is None]
+            if not spare:
+                return Response('{"error":"login capacity reached; retry shortly"}', status=503,
+                                content_type="application/json")
+            _drop_login(min(spare, key=lambda a: _logins[a]["created"]))
         auth_id = secrets.token_urlsafe(24)       # reaches the browser/IdP; locates the record
         poll_token = secrets.token_urlsafe(32)    # secret the client keeps; yields the session
         _logins[auth_id] = {"poll_token": poll_token, "status": "pending",
                             "created": time.time(), "nonce": None, "verifier": None}
         _by_poll[poll_token] = auth_id
-        hdr = (f'Bearer x_redirect_server="{PUBLIC_URL}/auth/initiate/{auth_id}", '
-               f'x_token_server="{PUBLIC_URL}/auth/token/{poll_token}", '
-               f'x_token_endpoint="{KC_TOKEN}", scope="{SCOPE}"')
+    hdr = (f'Bearer x_redirect_server="{PUBLIC_URL}/auth/initiate/{auth_id}", '
+           f'x_token_server="{PUBLIC_URL}/auth/token/{poll_token}", '
+           f'x_token_endpoint="{KC_TOKEN}", scope="{SCOPE}"')
     return Response('{"error":"authentication required"}', status=401,
                     headers={"WWW-Authenticate": hdr}, content_type="application/json")
 
@@ -170,48 +184,61 @@ def challenge(refresh_only_sid=None):
 def initiate(auth_id):
     # The browser landed here from x_redirect_server; send it to Keycloak. Bind this leg to this
     # browser: a nonce in an HttpOnly cookie the callback must echo, and a PKCE verifier the
-    # browser never sees. `state` is the auth_id, which no longer yields the session.
-    _purge_logins()
-    login = _logins.get(auth_id)
-    if login is None:
-        return "unknown or expired login", 404
-    login["nonce"] = secrets.token_urlsafe(16)
-    login["verifier"] = secrets.token_urlsafe(48)
-    chal = base64.urlsafe_b64encode(
-        hashlib.sha256(login["verifier"].encode()).digest()).decode().rstrip("=")
+    # browser never sees. Allowed once: a second initiate (nonce already set, or past pending)
+    # is refused, so a login can't be restarted onto another browser.
+    with _lock:
+        _purge_logins()
+        login = _logins.get(auth_id)
+        if login is None:
+            return "unknown or expired login", 404
+        if login["status"] != "pending" or login["nonce"] is not None:
+            return "login already started", 409
+        nonce = login["nonce"] = secrets.token_urlsafe(16)
+        verifier = login["verifier"] = secrets.token_urlsafe(48)
+    chal = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     resp = app.make_response(redirect(f"{KC_AUTH}?" + urlencode({
         "response_type": "code", "client_id": CLIENT_ID, "scope": SCOPE,
         "redirect_uri": f"{PUBLIC_URL}/auth/callback", "state": auth_id,
         "code_challenge": chal, "code_challenge_method": "S256"})))
-    resp.set_cookie("login_nonce", login["nonce"], max_age=LOGIN_TTL, httponly=True,
+    resp.set_cookie("login_nonce", nonce, max_age=LOGIN_TTL, httponly=True,
                     secure=True, samesite="Lax", path="/auth/callback")
     return resp
 
 
 @app.get("/auth/callback")
 def callback():
-    _purge_logins()
-    login = _logins.get(request.args.get("state", ""))
-    if login is None:
-        return "unknown or expired login", 404
-    # Only the browser that started this login holds the nonce cookie; a forged or cross-client
-    # callback fails here and leaves the login pending for the real browser.
-    if not login["nonce"] or not hmac.compare_digest(
-            request.cookies.get("login_nonce", ""), login["nonce"]):
-        return "login not recognised for this browser", 400
-    if "error" in request.args or "code" not in request.args:
-        login.update(status="error", error=request.args.get("error", "no code"))
-        return "login failed; return to your client", 400
+    state = request.args.get("state", "")
+    # Validate and consume the login atomically, so a replayed or forged callback can't reuse
+    # the nonce or code; the Keycloak exchange then runs outside the lock.
+    with _lock:
+        _purge_logins()
+        login = _logins.get(state)
+        if login is None:
+            return "unknown or expired login", 404
+        if login["status"] != "pending":
+            return "login already completed", 400
+        if not login["nonce"] or not hmac.compare_digest(
+                request.cookies.get("login_nonce", ""), login["nonce"]):
+            return "login not recognised for this browser", 400
+        if "error" in request.args or "code" not in request.args:
+            login.update(status="error", error=request.args.get("error", "no code"))
+            return "login failed; return to your client", 400
+        login["status"] = "exchanging"
+        verifier, login["nonce"], login["verifier"] = login["verifier"], None, None
+        code = request.args["code"]
     r = _http.post(KC_TOKEN, timeout=10, data={
-        "grant_type": "authorization_code", "code": request.args["code"],
-        "redirect_uri": f"{PUBLIC_URL}/auth/callback", "code_verifier": login["verifier"],
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": f"{PUBLIC_URL}/auth/callback", "code_verifier": verifier,
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET})
-    if r.status_code != 200:
-        login.update(status="error", error="token exchange failed")
-        return "login failed; return to your client", 400
-    tokens = r.json()
-    subject = _claims(tokens["access_token"]).get("principal_name", "?")
-    login.update(status="ready", session=_store(subject, tokens))
+    with _lock:
+        login = _logins.get(state)
+        if login is None:
+            return "login expired", 400
+        if r.status_code != 200:
+            login.update(status="error", error="token exchange failed")
+            return "login failed; return to your client", 400
+        subject = _claims(r.json()["access_token"]).get("principal_name", "?")
+        login.update(status="ready", session=_store(subject, r.json()))
     app.logger.info("LOGIN subject=%s", subject)
     return "login complete; return to your client", 200
 
@@ -219,23 +246,24 @@ def callback():
 @app.get("/auth/token/<key>")
 def token_poll(key):
     # Two callers hit this. A session id (refresh): refresh and hand the same id back, or
-    # 401-challenge if the refresh token lapsed. A pending login's poll_token: nextUri until the
+    # 401-challenge if the refresh token lapsed. A pending login's poll_token: nextUri while the
     # browser finishes, then the session id. An auth_id is not accepted here — only poll_token.
-    _purge_logins()
     if key in _sessions:
         return (jsonify({"token": key}) if _fresh_token(key) else challenge())
-    auth_id = _by_poll.get(key)
-    login = _logins.get(auth_id) if auth_id else None
-    if login is None:
-        return jsonify({"error": "unknown or expired login"}), 404
-    if login["status"] == "pending":
-        return jsonify({"nextUri": f"{PUBLIC_URL}/auth/token/{key}"})
-    if login["status"] == "error":
-        err = login.get("error", "login failed")
+    with _lock:
+        _purge_logins()
+        auth_id = _by_poll.get(key)
+        login = _logins.get(auth_id) if auth_id else None
+        if login is None:
+            return jsonify({"error": "unknown or expired login"}), 404
+        if login["status"] in ("pending", "exchanging"):
+            return jsonify({"nextUri": f"{PUBLIC_URL}/auth/token/{key}"})
+        if login["status"] == "error":
+            err = login.get("error", "login failed")
+            _drop_login(auth_id)
+            return jsonify({"error": err})
+        session = login["session"]
         _drop_login(auth_id)
-        return jsonify({"error": err})
-    session = login["session"]
-    _drop_login(auth_id)
     return jsonify({"token": session})
 
 
