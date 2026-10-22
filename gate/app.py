@@ -23,10 +23,10 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    read-only tables: `datasets` (the dataset index), `sessions` and `accessed`. A load of one
    returns governance's per-person table (governance/index_table.py), whose files governance
    serves. Polaris holds neither.
-7. The access log (PROVENANCE.md 4.1). Before it passes on a response that hands out a table's
-   storage credential, a load or a credential refresh, the gate has governance log the read;
-   before it forwards a table create or commit, the write. When the log refuses or is
-   unreachable, the gate refuses the request.
+7. The access log (PROVENANCE.md 4.1). Before it passes on any response that hands out a
+   storage credential, the gate has governance log it: a read of the table the path names, or
+   on a create a write of the new table; before it forwards a table create or commit, the
+   write. When the log refuses or is unreachable, the gate refuses the request.
 8. Accounts. Polaris 1.5 refuses a token whose name has no stored principal, and logs the
    token when it does. Before a person's first request reaches Polaris, the gate has
    governance create their principal (governance verifies the person's own token). A token
@@ -208,7 +208,7 @@ def writes(segments, body):
 def vended(r):
     """(whether this catalog response hands out a storage credential, its expiry in epoch ms or
     None)."""
-    if r.status_code != 200:
+    if not 200 <= r.status_code < 300:
         return False, None
     try:
         body = r.json()
@@ -386,7 +386,8 @@ def proxy(_):
                     return not_found("namespace", named[2], None)
                 return forbidden(f"{t} is not registered for creation, or you are not in its write grant")
 
-        if request.method == "POST" and (written := writes(segments, body)):
+        written = writes(segments, body) if request.method == "POST" else []
+        if written:
             log_access(claims, [{"dataset": t, "kind": "table", "mode": "write", "expires": None}
                                 for t in written])
         delegated = any(k.lower() == DELEGATION for k in headers)
@@ -409,13 +410,22 @@ def proxy(_):
             app.logger.info("credential refused for %s; loading without one", raw)
             delegated = False
             r = forward(raw, {k: v for k, v in headers.items() if k.lower() != DELEGATION})
-        if request.method == "GET" and named and named[0] == "table":
-            # A 304 to a credentialed load means the engine reuses the credential it was given
-            # with this table earlier, possibly in another session.
-            issued, expires = vended(r)
-            if issued or (r.status_code == 304 and delegated):
-                log_access(claims, [{"dataset": ident([named[1], *named[2], named[3]]),
-                                     "kind": "table", "mode": "read", "expires": expires}])
+        # No storage credential leaves the gate unlogged, whatever the path: one on a create
+        # (staged or not) is a write of the new table, any other a read of the table the path
+        # names, and one on a path naming no table is refused, having nothing to be logged as.
+        # A 304 to a credentialed load means the engine reuses the credential it was given with
+        # this table earlier, possibly in another session.
+        issued, expires = vended(r)
+        if issued or (request.method == "GET" and r.status_code == 304 and delegated):
+            if named and named[0] == "table":
+                held, mode = ident([named[1], *named[2], named[3]]), "read"
+            elif named and named[0] == "tables" and request.method == "POST":
+                held, mode = (new_tables or [None])[0], "write"
+            else:
+                held, mode = None, "read"
+            if not (mode == "write" and held in written):
+                log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
+                                     "expires": expires}])
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.

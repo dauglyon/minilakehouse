@@ -316,11 +316,13 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   `accesses` table holds one row per credential handed out and per table write: person,
   Keycloak subject, login (`sid`), session, dataset, `files` or `table`, `read` or `write`,
   time, credential expiry. The broker logs each credential after `AssumeRole` and before
-  returning it. The gate logs a read for any table response that carries a storage
-  credential (a load or a refresh from Polaris's credentials endpoint) and for a 304 to a
-  credentialed load, where the engine reuses a credential it already holds; it logs a write
-  before forwarding a create that is not staged, a commit, or a multi-table commit, so a
-  failed log stops the write before Polaris sees it. Each row is stamped with the session the
+  returning it. The gate checks every response it forwards for a storage credential and
+  logs one wherever it appears: on a create, staged or not, as a write of the new table;
+  anywhere else (a load, a refresh from Polaris's credentials endpoint) as a read of the
+  table the path names; on a path naming no table it refuses the request. It also logs a 304
+  to a credentialed load as a read, since the engine then reuses a credential it already
+  holds, and a write before forwarding a create that is not staged, a commit, or a
+  multi-table commit, so a failed log stops the write before Polaris sees it. Each row is stamped with the session the
   login points at when it is written (`logins`); a login's first row points it at the
   person's most recently used session, or at a new `default` one. A token with no `sid`, which
   is every service-account token, is one login per account. `governance.sessions` and

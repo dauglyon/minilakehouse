@@ -72,10 +72,12 @@ Governance holds one row per credential issued and per table write (`accesses` i
 client certificate:
 
 - The broker, for every file vend (`broker/app.py`, `vend`).
-- The gate (`gate/app.py`, `proxy`), for every response that hands out a table's storage
-  credential: a load, a refresh from the credentials endpoint Polaris advertises as
-  `client.refresh-credentials-endpoint`, and a 304 to a credentialed load, where the engine
-  reuses a credential it already holds. And for every table create and commit it forwards.
+- The gate (`gate/app.py`, `proxy`), for every response that hands out a storage credential,
+  whatever its path: a load or a refresh from the credentials endpoint Polaris advertises as
+  `client.refresh-credentials-endpoint` is a read, a create (staged or not) a write of the
+  new table, and a credential on a path that names no table is refused. A 304 to a
+  credentialed load is a read too, since the engine reuses a credential it already holds.
+  And for every table create and commit it forwards.
 
 Both record before they return the credential, and the gate records a write before it
 forwards the create or commit, so a failed record stops the write before the catalog sees
@@ -394,8 +396,8 @@ container, all artefacts removed afterwards:
 7. Build step 1, run on the stack. As alice: a Trino read of `db.t1` and a broker read
    credential for `projx/public` appear in `governance.accessed`, both in session `default`,
    and `governance.sessions` shows `default` as current, though each command used a new
-   login. A CTAS into a registered pending table logged one write: Trino's staged create logs
-   nothing, its completing commit logs the write. bob's refused read logged nothing. With the
+   login. A CTAS into a registered pending table logged two writes: Polaris hands out a
+   credential on Trino's staged create, and the completing commit is the second. bob's refused read logged nothing. With the
    log's address made unreachable, a gate given a credentialed load answered 503, a gate
    given a commit answered 503 and Polaris logged no request for the table, a load without a
    credential still answered 200, and the broker answered 503. On the internal listener, the
