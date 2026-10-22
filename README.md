@@ -166,9 +166,10 @@ q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
 #  -> "0"
 ```
 
-pyiceberg reads the files from the endpoint the catalog sends with the table. Trino reads
-every file from its own configured endpoint, so its catalog has one mapping rule that sends
-`s3://governance-index/` to governance (`trino/etc/s3-security-mapping.json`).
+Engines reach storage at one address, `storage:8080`, with the bucket in the host name, as
+AWS S3 routes buckets: Docker DNS sends `lakehouse.storage` to Ceph and
+`governance-index.storage` to governance, so no engine needs a setting that names the index.
+Ceph accepts that addressing because `rgw_dns_name` lists `storage` (`ceph/rgw-entrypoint.sh`).
 
 ## Flow B — Iceberg tables
 
@@ -423,7 +424,7 @@ PY
 - Every decision reads governance: if governance is down, every read is denied.
 - `/discover` lists file datasets only; the `governance.datasets` table lists both kinds.
 - The dataset index's files are held in governance's memory: a restart drops them and the next
-  load rebuilds them. Trino needs the mapping rule above to read them.
+  load rebuilds them.
 - Plaintext/no-TLS everywhere except Trino's token port, which uses a self-signed keystore
   generated at container start; dev credentials in `.env` — all dev-only.
 - RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the

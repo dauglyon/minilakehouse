@@ -36,6 +36,7 @@ from botocore.config import Config
 from flask import Flask, Response, jsonify, request
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
+from werkzeug.serving import make_server
 
 REGISTRY_PATH = os.environ.get("REGISTRY", "/app/registry.json")
 OPA_BASE = os.environ.get("OPA_BASE", "http://opa:8181")
@@ -78,8 +79,11 @@ def derive_id(prefix):
 # Least-privilege reader creds (ListBucket on datasets/* via a bucket policy set by the
 # rgw-setup one-shot). Governance does NOT hold the RGW admin key; reconcile only lists.
 RGW_ENDPOINT = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
-# Where engines fetch the dataset index's files (index_table.py): this service.
-INDEX_ENDPOINT = os.environ.get("INDEX_ENDPOINT", "http://governance:8000")
+# Where engines fetch the dataset index's files (index_table.py): the storage address every
+# engine already uses, by bucket-in-hostname addressing. Docker DNS points
+# governance-index.storage at this service's INDEX_PORT and <bucket>.storage at Ceph.
+INDEX_ENDPOINT = os.environ.get("INDEX_ENDPOINT", "http://storage:8080")
+INDEX_PORT = int(os.environ.get("INDEX_PORT", "8080"))
 RGW_KEY = os.environ.get("RGW_ACCESS_KEY", "")
 RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
@@ -860,7 +864,8 @@ def index_load():
         return err
     table = index_table.build(subject, _index_rows(subject))
     config = {**index_table.mint(subject), "s3.endpoint": INDEX_ENDPOINT,
-              "s3.path-style-access": "true", "s3.region": "us-east-1", "client.region": "us-east-1"}
+              "s3.force-virtual-addressing": "true", "s3.region": "us-east-1",
+              "client.region": "us-east-1"}
     return jsonify({**table, "config": config})
 
 
@@ -869,10 +874,13 @@ def _s3_error(status, code):
                     status=status, content_type="application/xml")
 
 
-@app.route(f"/{index_table.BUCKET}/<path:key>", methods=["GET", "HEAD"])
+# S3 GetObject/HeadObject for the index's files, served on INDEX_PORT to requests addressed to
+# governance-index.storage. The signature names the person; they may read only their own prefix.
+index_app = Flask("index")
+
+
+@index_app.route("/<path:key>", methods=["GET", "HEAD"])
 def index_object(key):
-    # S3 GetObject/HeadObject for the index's files. The signature names the person; they may
-    # read only their own prefix.
     raw_path, _, raw_query = (request.environ.get("RAW_URI") or request.path).partition("?")
     subject = index_table.verify(request.method, raw_path, raw_query, request.headers)
     if subject is None or not key.startswith(subject + "/"):
@@ -931,6 +939,8 @@ if __name__ == "__main__":
     except Exception as e:    # noqa: BLE001 — RGW trouble must not abort boot; the timer retries
         app.logger.warning("startup reconcile failed: %s", e)
     threading.Thread(target=reconcile_loop, daemon=True).start()
+    threading.Thread(target=make_server("0.0.0.0", INDEX_PORT, index_app, threaded=True).serve_forever,
+                     daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
     # owns a connection pool and a single reconcile timer thread.
     app.run(host="0.0.0.0", port=8000, use_reloader=False)

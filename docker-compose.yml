@@ -113,7 +113,13 @@ services:
       S3_BUCKET: ${S3_BUCKET}
     volumes:
       - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)
-    networks: [default, policy, catalog]
+    networks:
+      # Serves the dataset index's files on port 8080 by bucket-in-hostname addressing
+      # (governance/index_table.py).
+      default:
+        aliases: [governance-index.storage]
+      policy: {}
+      catalog: {}
     ports:
       - "19092:8000"
 
@@ -177,7 +183,12 @@ services:
     volumes:
       - ./ceph/rgw-entrypoint.sh:/rgw-entrypoint.sh:ro
       - ./ceph/sts-bootstrap.sh:/sts-bootstrap.sh:ro
-    networks: [default, catalog]
+    networks:
+      # Engines read storage at one address with the bucket in the host name: <bucket>.storage
+      # resolves here, governance-index.storage to governance (ceph/rgw-entrypoint.sh).
+      default:
+        aliases: [storage, "${S3_BUCKET}.storage"]
+      catalog: {}
     ports:
       - "19000:8080"
     healthcheck:
@@ -364,7 +375,6 @@ services:
     volumes:
       - ./trino/etc/config.properties:/etc/trino/config.properties:ro
       - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
-      - ./trino/etc/s3-security-mapping.json:/etc/trino/s3-security-mapping.json:ro
       - ./seed:/seed:ro
     ports:
       - "8083:8080"

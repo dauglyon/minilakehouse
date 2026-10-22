@@ -17,6 +17,15 @@ if ! grep -q 'rgw_sts_key' /etc/ceph/ceph.conf; then
   sed -i "s|\[client.rgw.test\]|[client.rgw.test]\n    rgw_sts_key = ${RGW_STS_KEY}\n    rgw_s3_auth_use_sts = true|" /etc/ceph/ceph.conf
 fi
 
+# Bucket-in-hostname (virtual-host) addressing: with rgw_dns_name set, a request to
+# <bucket>.storage names its bucket in the host, as AWS S3 routes buckets. Docker DNS points
+# lakehouse.storage at this container and governance-index.storage at governance, so an engine
+# with one storage address reads the dataset index from governance and everything else from
+# here. With rgw_dns_name set, RGW reads an unlisted host as a bucket name (ceph:8080 becomes
+# bucket "ceph"), so every host clients reach RGW by for path-style requests is listed too.
+sed -i '/rgw_dns_name/d' /etc/ceph/ceph.conf
+sed -i "s|\[client.rgw.test\]|[client.rgw.test]\n    rgw_dns_name = ${RGW_DNS_NAMES:-storage, ceph, localhost, 127.0.0.1}|" /etc/ceph/ceph.conf
+
 # Bucket notifications (registry freshness): this image's ceph.conf explicitly narrows the enabled APIs to
 # `rgw enable apis = s3, admin, iam, sts` — which DROPS `notifications` (present in the
 # compiled default). Bucket notifications + the SNS topic API need it, so append it.

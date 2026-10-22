@@ -251,6 +251,13 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   request's SigV4 signature against that credential and serves only the person's own prefix.
   Nothing is written to storage, and the row hash in every path means a cache keyed by path
   never returns stale rows or another person's. Every dataset's actual data stays in Ceph.
+  Engines find the files at the one storage address they already use: with the bucket in the
+  host name, Docker DNS sends `governance-index.storage` to governance's port 8080 and
+  `lakehouse.storage` to Ceph. Trino takes only the credential from the catalog, never a
+  storage address (`S3VendedCredentials.java` in Trino 484), so this is how its reads of the
+  index reach governance with no setting that names the index. Ceph accepts bucket-in-host
+  addressing because `rgw_dns_name` lists `storage`; it lists `ceph`, `localhost` and
+  `127.0.0.1` too, because RGW reads an unlisted host name as a bucket name.
 - **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
   a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
   changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`):
@@ -397,9 +404,7 @@ reference (the sections above are current-state).
 - Every decision reads governance: a governance outage denies every read, and table checks
   are uncached.
 - `/discover` lists file datasets only; the `governance.datasets` table lists both kinds. Its
-  files live in governance's memory (a restart drops them; the next load rebuilds them), and
-  Trino reads them only through the mapping rule in `trino/etc/s3-security-mapping.json`,
-  because Trino takes no storage endpoint from the catalog.
+  files live in governance's memory (a restart drops them; the next load rebuilds them).
 - Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
   token only over TLS; the container generates a self-signed keystore at each start), dev
   credentials in `.env`, the OPA debug image, and unauthenticated `/events`
