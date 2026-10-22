@@ -350,7 +350,7 @@ denies every read.
 7. **Publish a derived dataset.** As 6, plus `inputs` and any widenings. Governance
    additionally checks the person may read every input and holds `share` on every input they
    widen past. Build the output with any tool, as themselves.
-8. **Retire.** Delete the objects or drop the table. The delete events, or the gate's drop
+8. **Delete.** Delete the objects or drop the table. The delete events, or the gate's drop
    report, set `gone`.
 9. **Change grants.** Log in. Call governance naming the dataset and the change. Governance
    applies 4.4 and recomputes.
@@ -478,17 +478,15 @@ grants, over the entry governance holds at the time of the decision.
 
 **Declared and trusted.** The `inputs` list of a derived dataset. The content of any dataset.
 
-## 12. Open decisions
+## 12. Decisions
 
-Decided so far: governance holds the only copy of every grant and of group membership,
+Decided: governance holds the only copy of every grant and of group membership,
 callers send OPA only who is asking and the ids they name, and every rule fetches the groups
 and entries it needs with `http.send`; table names are
 confidential, so `see` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
 set-location are root-only; `group-admins` assign top-level folder roots and namespaces, and
 their owners delegate below them; `read` implies `see`.
-
-1. Explicit retirement distinct from the folder emptying or the table being dropped.
 
 ## 13. Status against the repository
 

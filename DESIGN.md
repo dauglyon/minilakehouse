@@ -387,8 +387,7 @@ reference (the sections above are current-state).
   gate refuses tokens naming Polaris's own principals (`root`, `provisioner`).
 - Every decision reads governance: a governance outage denies every read, and table checks
   are uncached.
-- No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
-  its bytes vanished). Discovery is blob-only; table discovery rides Polaris's own listing.
+- Discovery is blob-only; table discovery rides Polaris's own listing.
 - Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
   token only over TLS; the container generates a self-signed keystore at each start), dev
   credentials in `.env`, the OPA debug image, and unauthenticated `/events`

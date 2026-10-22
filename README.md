@@ -397,8 +397,7 @@ PY
   time each person shows up. When a Polaris release has the `external` credential mode, that
   step goes away.
 - Every decision reads governance: if governance is down, every read is denied.
-- No de-registration yet (a steward explicitly retiring a dataset, vs. it going `gone` because
-  its bytes vanished). Discovery is blob-only; table discovery is via the catalog's own listing.
+- Discovery is blob-only; table discovery is via the catalog's own listing.
 - Plaintext/no-TLS everywhere except Trino's token port, which uses a self-signed keystore
   generated at container start; dev credentials in `.env` — all dev-only.
 - RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the
