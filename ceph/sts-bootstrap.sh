@@ -100,6 +100,19 @@ JSON
 echo ">>> ensuring role ${BLOB_ROLE}"
 ensure_role "$BLOB_ROLE" "$BLOB_TRUST" blobread "$BLOB_PERM"
 
+# The role the broker assumes for a dataset's `write` grant: put and delete under datasets/,
+# never get or list (WHITEPAPER 4.2), narrowed per request to one dataset's folder.
+BLOB_WRITE_ROLE="${BLOB_WRITE_ROLE:-blob-writer}"
+BLOB_WRITE_PERM=$(cat <<JSON
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow",
+   "Action":["s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],
+   "Resource":["arn:aws:s3:::${BUCKET}/${BLOB_PREFIX}/*"]}]}
+JSON
+)
+echo ">>> ensuring role ${BLOB_WRITE_ROLE}"
+ensure_role "$BLOB_WRITE_ROLE" "$BLOB_TRUST" blobwrite "$BLOB_WRITE_PERM"
+
 # --- Governance reader: a least-privilege S3 user the governance service uses to LIST
 # dataset prefixes (reconcile). It holds no rights of its own; the rgw-setup one-shot grants
 # it ListBucket on datasets/* via a bucket policy. So governance never holds the admin key. ---

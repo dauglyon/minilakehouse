@@ -214,7 +214,7 @@ row takes its lock, so the entry OPA reads is the one the write replaces.
 | Component | Role | Trusted for |
 |---|---|---|
 | Keycloak | Identity provider. Issues every token the system accepts, one audience per service. | Who the person is. |
-| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets, as a call and as a per-person table whose files it builds and serves, accepts registration, grant changes and group changes, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
+| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets as a per-person table whose files it builds and serves, accepts registration, grant changes and group changes, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
 | OPA | Holds policy and no grants. Each rule fetches the entries it needs from governance at decision time. Returns a decision document. Reachable only by its callers: its API evaluates any query it is sent, including one that reads its own credentials. | Every access decision. |
 | gate | A proxy in front of Polaris. Verifies the token, checks table creation against the catalog through OPA, trims list responses to what the person may see, maps denied named operations to not-found, and reports table create and drop to governance. Answers for the dataset index table itself. | The same custody of every current user's Polaris token that Trino has; the table lifecycle (section 9); correctness of list trimming. Polaris must be reachable only through it. |
 | Polaris | Iceberg REST catalog. Delegates every operation's decision to OPA. Vends a per-table credential on allow. Holds a long-lived storage credential able to assume the vending role. | Relaying the decision into a credential; custody of that storage credential. |
@@ -327,8 +327,7 @@ account, which holds no grants.
 1. **Find tables in SQL.** Any SQL tool lists namespaces and tables through the gate and sees
    only what its person may see.
 2. **Find datasets.** Query the table `governance.datasets` from any engine connected to the
-   catalog, or call the catalog's listing with the token. Either returns every dataset, table
-   or file, whose effective `see` includes one of the person's groups, with name and
+   catalog. It returns every dataset, table or file, whose effective `see` includes one of the person's groups, with name and
    description and whether the person may read it. The table's files are built by governance
    for the person reading them and served by governance; no copy of the list is stored.
 3. **Read a table in Trino.** Log in. Connect to Trino with the token, attach it as the
@@ -504,18 +503,17 @@ listings (every upstream page, one filter, its own page tokens), answering not-f
 refused name the person may not view, and repeating a refused credentialed load without the
 credential request, deciding table and namespace creation, and reporting table creates and
 drops; tables registered as entries with `see`, `read`, `share`, `write` and `delete` by
-group; grant changes through governance, decided by OPA under the entry's row lock as in 4.4;
+group; `write` for file datasets, a broker credential that puts and deletes in the folder; grant changes through governance, decided by OPA under the entry's row lock as in 4.4;
 group membership and owners, and root ownership, in governance, changed through it as in 4.4; each person's Polaris principal created on first use; a login
 proxy that keeps a client session past the token's 5-minute life by holding the refresh token
 and forwarding a fresh token to Trino; OPA reachable only by its callers; storage events plus a periodic
 listing.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files, so the catalog's listing call shows files only; `share` is only the right to change
-grants, since there are no derived datasets to widen; no `write` for files, no derived
-datasets, no widenings; one token audience serves every service, and only Trino and Polaris
+with files; `share` is only the right to change
+grants, since there are no derived datasets to widen; no derived datasets, no widenings; one token audience serves every service, and only Trino and Polaris
 check it; the entry lookup is closed by a shared bearer token rather than by caller
-identity; the registering upload uses the storage admin key; the periodic listing is
+identity; the periodic listing is
 authoritative and notifications are not persistent; the events endpoint is unauthenticated.
 
 ## 14. Questions for the reviewer

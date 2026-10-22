@@ -162,9 +162,10 @@ services:
     environment:
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
-      OPA_URL: http://opa:8181/v1/data/lakehouse/blob/vend
+      OPA_BLOB_URL: http://opa:8181/v1/data/lakehouse/blob
       RGW_ENDPOINT: http://ceph:8080
       BLOB_ROLE_ARN: ${BLOB_ROLE_ARN}
+      BLOB_WRITE_ROLE_ARN: ${BLOB_WRITE_ROLE_ARN}
       BUCKET: ${S3_BUCKET}
       BLOB_BROKER_KEY: ${BLOB_BROKER_KEY}
       BLOB_BROKER_SECRET: ${BLOB_BROKER_SECRET}

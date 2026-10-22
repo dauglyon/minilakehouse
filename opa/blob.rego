@@ -4,14 +4,15 @@ package lakehouse.blob
 # the dataset ids or prefix they name; the rules fetch the person's groups, the entries and
 # ownership from governance (lakehouse.governance).
 #
-#   vend            input {subject, dataset: id}       broker: {allow, prefix} for one dataset
+#   vend            input {subject, dataset: id}       broker: {allow, prefix} to read one dataset
+#   vend_write      input {subject, dataset: id}       broker: {allow, prefix} to write one dataset
 #   discover        input {subject, datasets: [id]}    governance: {visible: [id], readable: [id]}
 #   allow_register  input {subject, prefix}            governance: may register at prefix
 #   allow_change    input {subject, dataset: id, grants: [grant]}
 #                                                      governance: may change these grants
 #   allow_change_root  input {subject, prefix}         governance: may change who owns this root
 #
-# An entry is {id, prefix, visibility: [group], access: [group], share: [group]}. A dataset can be
+# An entry is {id, prefix, visibility: [group], access: [group], share: [group], write: [group]}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
 # so it is denied exactly as a dataset the caller has no grant on.
 
@@ -29,6 +30,16 @@ default vend := {"allow": false}
 vend := {"allow": true, "prefix": e.prefix} if {
 	e := _entries[input.dataset]
 	_reads(e)
+}
+
+# Writing (WHITEPAPER 4.2): put and delete in the dataset's folder, granted by `write` alone; it
+# implies neither `see` nor `read`.
+default vend_write := {"allow": false}
+
+vend_write := {"allow": true, "prefix": e.prefix} if {
+	e := _entries[input.dataset]
+	some g in _groups
+	g in e.write
 }
 
 discover := {"visible": visible, "readable": readable}
@@ -56,7 +67,8 @@ allow_register if {
 }
 
 # Changing grants (WHITEPAPER 4.4): `see` and `read` by a group holding `share` on the dataset;
-# `share` by a group owning a root above its prefix, the ownership registration checks.
+# `share` and `write` by a group owning a root above its prefix, the ownership registration
+# checks.
 default allow_change := false
 
 allow_change if {
@@ -73,7 +85,10 @@ _may_change(e, g) if {
 	x in e.share
 }
 
-_may_change(e, "share") if _owns_root(e.prefix)
+_may_change(e, g) if {
+	g in {"share", "write"}
+	_owns_root(e.prefix)
+}
 
 # Changing who owns a prefix root: `group-admins` for a top-level root (datasets/<name>/), and
 # anyone whose group owns that root or one above it. Owning a root owns everything under it,

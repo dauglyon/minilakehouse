@@ -7,12 +7,14 @@ no engine in the byte path, safe even against a compromised engine.
 
 Flow:
   1. verify the user's token            -> subject
-  2. ask OPA's `vend` rule about the dataset id -> {allow, prefix}; OPA fetches the
-     person's groups and the dataset's grants and registered prefix from governance
-  3. on allow: AssumeRole on `blob-vendor` with an inline session policy scoped to that
-     prefix (the role permits datasets/*; the session policy narrows; the client cannot
-     widen it) -> per-dataset temp credentials
-  4. return the scoped credentials; the client reads those objects directly from RGW.
+  2. ask OPA about the dataset id -> {allow, prefix}: `vend` to read (the dataset's `read`
+     grant), `vend_write` to write (its `write` grant). OPA fetches the person's groups and
+     the dataset's grants and registered prefix from governance
+  3. on allow: AssumeRole on `blob-vendor` (read: get and list) or `blob-writer` (write: put
+     and delete, no get, WHITEPAPER 4.2) with an inline session policy scoped to that prefix
+     (the role permits datasets/*; the session policy narrows; the client cannot widen it)
+     -> per-dataset temp credentials
+  4. return the scoped credentials; the client reads or writes those objects directly in RGW.
 
 OPA denies an unknown dataset exactly as a denied one, so the broker reveals nothing about
 which datasets exist.
@@ -30,9 +32,10 @@ from flask import Flask, jsonify, request
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
-OPA_URL = os.environ["OPA_URL"]
+OPA_BLOB = os.environ["OPA_BLOB_URL"]  # .../v1/data/lakehouse/blob
 RGW_ENDPOINT = os.environ["RGW_ENDPOINT"]
 BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
+BLOB_WRITE_ROLE_ARN = os.environ["BLOB_WRITE_ROLE_ARN"]
 BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
@@ -79,14 +82,22 @@ def authed_user():
         return None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_vend(subject, dataset):
-    """OPA's {allow, prefix} for this subject reading this dataset."""
-    r = _http.post(OPA_URL, json={"input": {"subject": subject, "dataset": dataset}}, timeout=5)
+def opa_vend(subject, dataset, mode):
+    """OPA's {allow, prefix} for this subject reading or writing this dataset."""
+    rule = "vend_write" if mode == "write" else "vend"
+    r = _http.post(f"{OPA_BLOB}/{rule}", json={"input": {"subject": subject, "dataset": dataset}},
+                   timeout=5)
     r.raise_for_status()
     return r.json().get("result") or {"allow": False}
 
 
-def session_policy(prefix):
+def session_policy(prefix, mode):
+    if mode == "write":
+        return json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*"],
+             "Action": ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+                        "s3:ListMultipartUploadParts"]},
+        ]})
     return json.dumps({"Version": "2012-10-17", "Statement": [
         {"Effect": "Allow", "Action": ["s3:GetObject"],
          "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*"]},
@@ -107,12 +118,15 @@ def vend():
     if err:
         return err
 
-    dataset = (request.get_json(silent=True) or {}).get("dataset")
+    body = request.get_json(silent=True) or {}
+    dataset, mode = body.get("dataset"), body.get("mode", "read")
     if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
         return jsonify({"error": "invalid dataset id"}), 400
-    decision = opa_vend(subject, dataset)
+    if mode not in ("read", "write"):
+        return jsonify({"error": "mode must be read or write"}), 400
+    decision = opa_vend(subject, dataset, mode)
     if decision.get("allow") is not True:
-        app.logger.info("DENY subject=%s dataset=%s", subject, dataset)
+        app.logger.info("DENY %s subject=%s dataset=%s", mode, subject, dataset)
         return jsonify({"error": "forbidden"}), 403
 
     # Governance confined the prefix at registration; it becomes an STS ARN below, so
@@ -124,10 +138,11 @@ def vend():
 
     cr = _sts.assume_role(
         # STS caps the session-name length; truncate so a long username can't fail AssumeRole.
-        RoleArn=BLOB_ROLE_ARN, RoleSessionName=f"blob-{subject}"[:32],
-        Policy=session_policy(prefix), DurationSeconds=TTL,
+        RoleArn=BLOB_WRITE_ROLE_ARN if mode == "write" else BLOB_ROLE_ARN,
+        RoleSessionName=f"blob-{subject}"[:32],
+        Policy=session_policy(prefix, mode), DurationSeconds=TTL,
     )["Credentials"]
-    app.logger.info("VEND subject=%s dataset=%s prefix=%s", subject, dataset, prefix)
+    app.logger.info("VEND %s subject=%s dataset=%s prefix=%s", mode, subject, dataset, prefix)
     return jsonify({
         "access_key_id": cr["AccessKeyId"],
         "secret_access_key": cr["SecretAccessKey"],
@@ -136,6 +151,7 @@ def vend():
         "endpoint": RGW_ENDPOINT,
         "bucket": BUCKET,
         "prefix": prefix,
+        "mode": mode,
     })
 
 

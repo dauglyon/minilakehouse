@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     visibility      TEXT[] NOT NULL DEFAULT '{}',
     access          TEXT[] NOT NULL DEFAULT '{}',
     share           TEXT[] NOT NULL DEFAULT '{}',
+    write           TEXT[] NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
     object_count    BIGINT NOT NULL DEFAULT 0,
     total_bytes     BIGINT NOT NULL DEFAULT 0,
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS register_grants (
     prefixes TEXT[] NOT NULL DEFAULT '{}'   -- prefix roots this group may register under
 );
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS write TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
 """
 
@@ -216,10 +218,10 @@ def init_db():
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
                 raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share, write) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
-                 d.get("visibility", []), d.get("access", []), d.get("share", [])),
+                 d.get("visibility", []), d.get("access", []), d.get("share", []), d.get("write", [])),
             )
         for grp, members in reg.get("groups", {}).items():
             for m in members:
@@ -254,7 +256,8 @@ def init_db():
 def _entry(row):
     """The meaning/grants half of a datasets row — what OPA decides over."""
     return {"id": row["id"], "prefix": row["prefix"],
-            "visibility": row["visibility"], "access": row["access"], "share": row["share"]}
+            "visibility": row["visibility"], "access": row["access"], "share": row["share"],
+            "write": row["write"]}
 
 
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
@@ -388,7 +391,7 @@ def internal_datasets():
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
-        cur.execute("SELECT id, prefix, visibility, access, share FROM datasets WHERE id = ANY(%s)",
+        cur.execute("SELECT id, prefix, visibility, access, share, write FROM datasets WHERE id = ANY(%s)",
                     (ids,))
         rows = cur.fetchall()
     return jsonify({"entries": {r["id"]: _entry(r) for r in rows}})
@@ -540,9 +543,9 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
-    grants = {g: body.get(g, []) for g in ("visibility", "access", "share")}
+    grants = {g: body.get(g, []) for g in ("visibility", "access", "share", "write")}
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "visibility, access and share must be lists of groups"}), 400
+        return jsonify({"error": "visibility, access, share and write must be lists of groups"}), 400
 
     if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
@@ -558,10 +561,10 @@ def register_dataset():
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
                 return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')",
+                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share, write, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
                 (ds_id, prefix, body.get("description"), subject,
-                 grants["visibility"], grants["access"], grants["share"]),
+                 grants["visibility"], grants["access"], grants["share"], grants["write"]),
             )
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset unavailable"}), 409
@@ -635,8 +638,8 @@ def register_table():
 
 
 # The grants a change may name, per kind, and the column each is stored in. A file dataset has
-# no write yet and no delete (its write credential would delete objects), WHITEPAPER 4.2.
-_GRANT_COLS = {"dataset": {"see": "visibility", "read": "access", "share": "share"},
+# no delete: its write credential deletes objects (WHITEPAPER 4.2).
+_GRANT_COLS = {"dataset": {"see": "visibility", "read": "access", "share": "share", "write": "write"},
                "table": {g: g for g in ("see", "read", "share", "write", "delete")}}
 
 
@@ -837,7 +840,9 @@ def change_root_owners(kind, root_id):
 
 
 def _index_rows(subject):
-    """Every live dataset and table the subject may see, with whether they may read it."""
+    """Every live dataset and table the subject may see, with whether they may read it. Only
+    live entries: existence is storage's truth (reconcile, the gate's reports), visibility
+    OPA's; governance builds the list, OPA says which candidates pass."""
     with db() as cur:
         cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live'")
         files = cur.fetchall()
@@ -909,27 +914,6 @@ def index_object(key):
     # Flask from replacing Content-Length with the empty body's 0.
     return Response([] if request.method == "HEAD" else [body], status=status, headers=headers,
                     content_type="application/octet-stream")
-
-
-@app.get("/discover")
-def discover():
-    subject, err = authed_user()
-    if err:
-        return err
-
-    # Only LIVE datasets are advertised — discovery never shows a dead (gone) or not-yet-
-    # populated (pending) dataset. Existence is storage truth (reconcile); visibility is
-    # the OPA predicate below. Discovery = OPA-visible ∩ live.
-    with db() as cur:
-        cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' ORDER BY id")
-        rows = cur.fetchall()
-
-    # One decision over every candidate id; OPA returns which pass, governance builds the list.
-    res = opa("discover", {"subject": subject, "datasets": [r["id"] for r in rows]})
-    seen, reads = set(res["visible"]), set(res["readable"])
-    visible = [{"id": r["id"], "description": r["description"], "steward": r["steward"],
-                "can_read": r["id"] in reads} for r in rows if r["id"] in seen]
-    return jsonify({"subject": subject, "visible": visible})
 
 
 if __name__ == "__main__":
