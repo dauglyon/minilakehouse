@@ -67,11 +67,13 @@ files/blobs over S3) under the *same* governance model as tables.
  POLICY (control plane — decides, never touches bytes)
    governance (PAP)                          OPA (PDP)
    • Postgres-backed dataset and       ◄──   • rules only, no grants: vend / discover /
-     table registries, group membership        allow_register (blobs), table lanes
-     and grants (the only copy)                (view/read/write/delete/create)
-   • serves them to OPA (/internal/*)        • every rule fetches the groups and grants
-   • serves discovery (Flow A)                 it needs from governance, per decision
-   • keeps the registry fresh vs storage
+     table registries, group membership        allow_register / allow_change (blobs),
+     and grants (the only copy)                table lanes (view/read/write/delete/
+   • serves them to OPA (/internal/*)          create/change), group and root changes
+   • serves discovery (Flow A)               • every rule fetches the groups and grants
+   • keeps the registry fresh vs storage       it needs from governance, per decision
+   • accepts grant, group and root
+     ownership changes (asks OPA)
 
  ENFORCEMENT (PEPs — ask POLICY, then act)
    TABLES                                    BLOBS / FILES
@@ -91,8 +93,8 @@ files/blobs over S3) under the *same* governance model as tables.
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
-| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, accepts governed ingest and table registration, records the table lifecycle the gate reports, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
-| **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
+| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
+| **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
 | **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance create a person's Polaris principal before their first request. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
 | **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision. No engine in the byte path. |
@@ -140,6 +142,8 @@ rule            caller      input                              fetches          
 vend            broker      {subject, dataset: id}             POST /internal/datasets      {allow, prefix}
 discover        governance  {subject, datasets: [id]}          POST /internal/datasets      {visible: [id], readable: [id]}
 allow_register  governance  {subject, prefix}                  GET /internal/register-grants  true | false
+allow_change    governance  {subject, dataset: id,             POST /internal/datasets,     true | false
+                             grants: [grant]}                    GET /internal/register-grants
 table lanes     Polaris     {actor, action, resource}          GET /internal/tables/<id>,   true | false
                                                                  POST /internal/namespaces
 tables.decide   gate        {subject, tables: [id],            POST /internal/tables,       {tables: [id], namespaces: [id]}
@@ -147,6 +151,12 @@ tables.decide   gate        {subject, tables: [id],            POST /internal/ta
 tables.allow_create     gate        {subject, id}              GET /internal/tables/<id>    true | false
 tables.allow_namespace  gate        {subject, id}              POST /internal/namespaces    true | false
 tables.allow_register   governance  {subject, id}              POST /internal/namespaces    true | false
+tables.allow_change     governance  {subject, id,              GET /internal/tables/<id>,   true | false
+                                     grants: [grant]}            POST /internal/namespaces
+groups.allow_create     governance  {subject}                  —                            true | false
+groups.allow_change     governance  {subject, group}           GET /internal/group-owners/<group>  true | false
+allow_change_root       governance  {subject, prefix}          GET /internal/register-grants  true | false
+tables.allow_change_root  governance  {subject, id}            POST /internal/namespaces    true | false
 ```
 
 Every rule also fetches `GET /internal/groups/<subject>`.
@@ -220,6 +230,26 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   network only the gate and its setup jobs share, so every client call passes the gate. Blobs (`blob.rego`): `allow` (read) / `visible`
   (see) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
   carry no groups.
+- **Grant changes are decided like access.** `PATCH /permissions/<dataset|table>/<id>` adds
+  or removes groups from an entry's grants. OPA's `allow_change` decides it while
+  governance holds the entry's row lock, so the entry OPA fetches is the one the write
+  replaces: `see` and `read` change only for a group holding the entry's `share`; `share`,
+  and a table's `write` and `delete`, only for a group owning the root (the prefix root or
+  namespace registration checks). An unknown id is refused exactly as a denied change.
+- **Groups are administered by their owners.** A group's owners are groups (`group_owners`);
+  anyone in one of them may change its members and owners (`PATCH /groups/<name>`), decided
+  by `groups.allow_change` under a per-group advisory lock. Only `group-admins` may create a
+  group (`POST /groups`). Governance refuses a change that leaves a group without an owner,
+  and refuses to create a group under a name any grant or ownership already uses: a dangling
+  grant to that name would otherwise pass to whoever joined the new group.
+- **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
+  a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
+  changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`):
+  `group-admins` for a top-level root (`datasets/<name>/`, `<catalog>.<namespace>`), and
+  anyone in a group owning that root or one above it. Changes take one advisory lock, so the
+  ownership OPA reads is the ownership the write replaces. Because an owner of a root owns
+  every root below it, a delegated subtree can always be taken back from above, and nothing
+  tracks who delegated what.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Tables: Trino authenticates the token and relays it to Polaris unchanged; Trino's username
   is the token's `principal_name`, and Trino's default access control refuses impersonation,
@@ -236,9 +266,10 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   no host port.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`),
   prefix-scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further
-  per request. The long-lived governance service holds only a read-only RGW reader
-  (`ListBucket` on `datasets/*`, via a bucket policy) — never an admin key. Admin-only RGW
-  setup runs in the `rgw-setup` one-shot.
+  per request. No long-lived service holds an admin key: Polaris authenticates as
+  `polaris-catalog` and the broker as `blob-broker`, each able only to assume its vending
+  role, and governance holds a read-only RGW reader (`ListBucket` on `datasets/*`, via a
+  bucket policy). Admin-only RGW setup runs in the `rgw-setup` one-shot.
 - **Governed ingest is scoped.** A steward must be in the `stewards` group *and* the prefix
   must sit under a root one of their groups owns (per-group ownership in OPA). Prefixes are confined
   to `datasets/<...>/` with no traversal, and the overlap-check + insert are serialized (an
@@ -280,6 +311,13 @@ reference (the sections above are current-state).
   cached JWKS — silently breaking the table plane until both refreshed. The key now loads from
   a persistent volume (stable `kid`). (Idle token *expiry* is a non-issue: the shim correctly
   rejects an expired engine token and Trino re-authenticates; only key *rotation* was the bug.)
+- **Polaris is off the RGW admin key.** Polaris authenticates as `polaris-catalog`, an RGW
+  user with no S3 rights that the `polaris-vendor` role's trust policy names. Polaris builds
+  its own file access for a table from a credential scoped to that table's locations
+  (`IcebergCatalog.loadFileIOForTableLike` in 1.5.0), so table create, commit and purge work
+  with the role alone. RGW needs no capability on the assuming user for `AssumeRole`; the
+  trust policy decides. `ceph/sts-bootstrap.sh` sets each role's trust on every run with
+  `radosgw-admin role-trust-policy modify` (`role update` changes only the session duration).
 - **Governance is off the RGW admin key.** Wiring notifications and setting the reader's bucket
   policy need bucket-owner rights, so that runs once in the `rgw-setup` one-shot; the
   long-lived governance service authenticates as a read-only `governance-reader` (ListBucket on
@@ -330,17 +368,13 @@ reference (the sections above are current-state).
   helper, or `--access-token`) is cut off when that token expires after 5 minutes; Trino's own
   Iceberg-client token exchange only extends the engine's catalog session, not the client's
   connection. The proxy keeps its sessions in memory, so a proxy restart logs everyone out.
-- The proxy's browser login was exercised through the protocol (challenge, redirect, callback,
-  poll) with a scripted Keycloak login (`seed/proxy_login.py`), not a real browser-driven CLI
-  run; the token refresh was shown by forcing a refresh per request, not by waiting out a
-  5-minute token.
 - A person with `see` and no `read` who tries to write a table gets Trino's "Failed to
   initialize the vended credentials" rather than access denied: the gate's retry returns the
   table without a credential and Trino stops there. A refused create's first line is Trino's
   own ("Failed to create transaction", "Failed to create namespace"); the gate's reason is
   the error's cause, which the CLI prints with `--debug`.
-- Group membership and grants change only in governance's database: there is no API for
-  either.
+- `share` carries only its change right, since derived datasets (its widening right) are
+  not built.
 - Polaris 1.5 refuses a token whose name has no stored principal, so the gate has governance
   create each person's on first use (`POST /principals/me`, as the `provisioner` principal,
   which OPA confines to creating principals). When a Polaris release includes the `external`

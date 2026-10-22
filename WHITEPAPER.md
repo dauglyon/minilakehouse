@@ -114,7 +114,8 @@ service.
 ### 4.2 Five grants
 
 Each grant is a set of groups. Governance holds the groups and who belongs to each, beside the
-grants; Keycloak only proves who a person is. A membership change applies at the person's next
+grants; Keycloak only proves who a person is. Each group has owners, which are groups, and
+section 4.4 says who changes membership. A membership change applies at the person's next
 request, since every rule looks the person's groups up at decision time.
 
 - **see**: the dataset appears in listings for this group. For a table, in Polaris's listing
@@ -196,13 +197,22 @@ row takes its lock, so the entry OPA reads is the one the write replaces.
 - Adding a widening to d for grant g and group x: callers holding effective `share` on every
   input of d whose effective g lacks x. Removing one: callers holding effective `share` on d.
 - `inputs`: never.
+- A group's members and owners: callers in one of the group's owners, decided under a lock
+  on that group. A change leaving a group without an owner is refused.
+- Creating a group: callers in `group-admins`, who name its first owners. A name any grant or
+  ownership already uses is refused, since whoever joined the new group would hold those
+  grants.
+- Owners of a folder root or namespace: callers in `group-admins` for a top-level one, and
+  callers in a group owning it or one above it. A group owning a root owns everything under
+  it, so an owner can hand part of its tree to another group and can always take it back;
+  nothing records who delegated what.
 
 ## 5. Components and trust
 
 | Component | Role | Trusted for |
 |---|---|---|
 | Keycloak | Identity provider. Issues every token the system accepts, one audience per service. | Who the person is. |
-| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets, accepts registration and grant changes, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
+| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets, accepts registration, grant changes and group changes, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
 | OPA | Holds policy and no grants. Each rule fetches the entries it needs from governance at decision time. Returns a decision document. Reachable only by its callers: its API evaluates any query it is sent, including one that reads its own credentials. | Every access decision. |
 | gate | A proxy in front of Polaris. Verifies the token, checks table creation against the catalog through OPA, trims list responses to what the person may see, maps denied named operations to not-found, and reports table create and drop to governance. | The same custody of every current user's Polaris token that Trino has; the table lifecycle (section 9); correctness of list trimming. Polaris must be reachable only through it. |
 | Polaris | Iceberg REST catalog. Delegates every operation's decision to OPA. Vends a per-table credential on allow. Holds a long-lived storage credential able to assume the vending role. | Relaying the decision into a credential; custody of that storage credential. |
@@ -224,10 +234,10 @@ no entry and is denied exactly as a dataset the person has no grant on. A datase
 fixed at registration, as a table's is (set-location is root-only, section 8), so the folder
 in OPA's decision is the folder the grants were written for.
 
-Governance holds no storage admin key. A one-shot setup step configures bucket policy and
-notifications with admin rights and exits. Polaris today holds the admin key; reducing it to a
-user that can only assume the vending role is a hardening item, and until it is done the
-summary's claim that nothing on the byte path re-decides has Polaris as the exception.
+No long-lived service holds a storage admin key. A one-shot setup step configures bucket
+policy and notifications with admin rights and exits. Polaris authenticates to storage as a
+user whose only right is assuming the vending role, and its own reads and writes of a table's
+metadata use a credential from that role scoped to the table's locations, as a vended one is.
 
 Polaris through 1.8 refuses a token whose name has no stored principal, and writes the
 token to its log when it does. So before a person's first request reaches Polaris, the gate
@@ -345,10 +355,11 @@ denies every read.
 
 ### Operator
 
-10. **People and groups.** People in Keycloak; who belongs to which group in governance.
-    Each person's Polaris principal is created on first use (section 5).
-11. **Which groups may register under which folder roots.** Seeded at first boot. No runtime
-    path yet.
+10. **People and groups.** People in Keycloak; groups in governance, created by
+    `group-admins` and changed by each group's owners (4.4). Each person's Polaris principal
+    is created on first use (section 5).
+11. **Which groups own which folder roots and namespaces.** `group-admins` assign top-level
+    ones; their owners delegate below them (4.4).
 
 ## 8. What OPA decides
 
@@ -366,6 +377,9 @@ everyone but root.
 | `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
 | `allow_register` | governance | requested folder | the caller is a steward and a caller group owns a root above the folder |
 | `allow_change` | governance | dataset id and the requested change | the rules of 4.4 |
+| `groups.allow_create` | governance | | the caller is in `group-admins` |
+| `groups.allow_change` | governance | group name | a caller group is among the group's owners |
+| `allow_change_root` | governance | folder root or namespace | the caller is in `group-admins` and it is top-level, or a caller group owns it or one above it |
 | Polaris: list namespaces, list tables, list views | Polaris | namespace | allowed for any authenticated person; the gate trims the response by `visible` |
 | Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group owns the namespace or one above it, or any table in it is visible to the caller |
 | Polaris: create table, create view, commit a staged create | Polaris | namespace | the caller may view the namespace; the gate has already decided per table with `allow_create`, since Polaris names only the namespace |
@@ -445,7 +459,6 @@ Grants are independent of status. Listings show `live` entries only.
   trusting the engine, which this design does not.
 - **Registration reveals names within a tenant.** Registering an id that exists fails, so
   co-owners of a root can learn each other's names. Accepted: they share a root.
-- **Polaris holds a broad storage credential** until the hardening in section 5 is done.
 - **The gate is a component you run** in front of a catalog you do not control. A Polaris
   release that changes list response shapes requires a gate change.
 
@@ -470,15 +483,15 @@ callers send OPA only who is asking and the ids they name, and every rule fetche
 and entries it needs with `http.send`; table names are
 confidential, so `see` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
-set-location are root-only.
+set-location are root-only; `group-admins` assign top-level folder roots and namespaces, and
+their owners delegate below them.
 
 1. Whether `read` should imply `see`. The model says no. Every comparator says yes.
 2. Explicit retirement distinct from the folder emptying or the table being dropped.
-3. A runtime path for root ownership.
 
 ## 13. Status against the repository
 
-Implemented today: the catalog with `see` and `read` for file datasets; the file listing;
+Implemented today: the catalog with `see`, `read` and `share` for file datasets; the file listing;
 the broker, scoping credentials to the folder in OPA's decision; Polaris delegating to OPA
 with per-table credentials, viewing a table gated on `see` or `read` and read-write
 credentials on `write`, drops on `delete`; registration gated by `stewards` and root ownership; OPA holding
@@ -488,15 +501,17 @@ authenticating people by their Keycloak token over HTTPS and forwarding it to Po
 listings (every upstream page, one filter, its own page tokens), answering not-found for a
 refused name the person may not view, and repeating a refused credentialed load without the
 credential request, deciding table and namespace creation, and reporting table creates and
-drops; tables registered as entries with `see`, `read`, `write` and `delete` by group; group
-membership in governance; each person's Polaris principal created on first use; a login
+drops; tables registered as entries with `see`, `read`, `share`, `write` and `delete` by
+group; grant changes through governance, decided by OPA under the entry's row lock as in 4.4;
+group membership and owners, and root ownership, in governance, changed through it as in 4.4; each person's Polaris principal created on first use; a login
 proxy that keeps a client session past the token's 5-minute life by holding the refresh token
 and forwarding a fresh token to Trino; OPA reachable only by its callers; storage events plus a periodic
 listing.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files, so the catalog's listing shows files only; no `share`, no `write` for files, no
-derived datasets, no grant or membership changes except in the database, no widenings;
+with files, so the catalog's listing shows files only; `share` is only the right to change
+grants, since there are no derived datasets to widen; no `write` for files, no derived
+datasets, no widenings;
 namespace ownership is recorded by namespace, not derived from folder roots; one token
 audience serves every service, and only Trino and Polaris
 check it; the entry lookup is closed by a shared bearer token rather than by caller

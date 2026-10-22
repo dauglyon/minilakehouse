@@ -23,6 +23,9 @@ vending broker) — with a real **metadata-visibility plane** (see-but-not-read)
 - [Flow B — Iceberg tables](#flow-b--iceberg-tables)
 - [Flow C — blob datasets](#flow-c--blob-datasets)
 - [Registry freshness & governed ingest](#registry-freshness--governed-ingest)
+- [Changing grants](#changing-grants)
+- [Changing groups](#changing-groups)
+- [Assigning roots](#assigning-roots)
 - [Security model](#security-model)
 - [Limitations](#limitations)
 
@@ -59,8 +62,8 @@ byte path.
 | Service | Role |
 |---|---|
 | **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. |
-| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`) and table registration (`POST /tables`), and creates each person's Polaris account on first use. |
-| **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), and creates each person's Polaris account on first use. |
+| **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
@@ -251,6 +254,99 @@ Because an id is the prefix's tenant slice, two stewards in different groups can
 a dataset called `results` (`projx/results` and `projw/results`) — names never collide across
 tenants, and neither can see the other's.
 
+## Changing grants
+
+`PATCH /permissions/<dataset|table>/<id>` adds and removes groups from an entry's grants, in
+the shape of Unity Catalog's permissions API. OPA decides each change (`allow_change`):
+`see` and `read` change only for someone in a group holding the entry's `share`; `share`, and
+a table's `write` and `delete`, only for someone whose group owns the root the entry sits
+under (the prefix root or namespace that registration checks). A change applies at the next
+decision.
+
+```bash
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+t = requests.post(KC, data=dict(grant_type="password", client_id="trino",
+    client_secret="trino-secret", username="alice", password="alice")).json()["access_token"]
+h = {"Authorization": f"Bearer {t}"}
+def change(op):
+    return requests.patch("http://governance:8000/permissions/dataset/projx/private", headers=h,
+        json={"changes": [{"group": "jgi-writers", op: ["read"]}]}).json()["grants"]["read"]
+vend = lambda: requests.post("http://broker:9100/vend", headers=h,
+                             json={"dataset": "projx/private"}).status_code
+print("grant read :", change("add"), vend())
+print("revoke read:", change("remove"), vend())
+PY
+#  -> grant read : ['jgi-writers'] 200
+#     revoke read: [] 403
+```
+
+alice may change `read` on `projx/private` because `jgi-writers` holds its `share`; bob gets
+403 for any change, the same answer as for an id that does not exist.
+
+## Changing groups
+
+Each group has owners, which are themselves groups. Anyone in one of a group's owners may add
+and remove its members and owners (`PATCH /groups/<name>`); only `group-admins` may create a
+group (`POST /groups`), naming its first owners. OPA decides both (`opa/groups.rego`). A change
+that would leave a group without an owner is refused, and so is creating a group under a name
+some grant or ownership already uses, since whoever joined it would hold those grants. The
+seed has `jgi-writers` and `projw-team` own themselves, and `group-admins` (carol) own
+`stewards`, `no-access` and itself.
+
+```bash
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+def h(u): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
+    client_id="trino", client_secret="trino-secret", username=u, password=u)).json()["access_token"]}
+def members(op):  # alice is in jgi-writers, which owns itself
+    return requests.patch("http://governance:8000/groups/jgi-writers", headers=h("alice"),
+        json={"members": {op: ["bob"]}}).json()["members"]
+vend = lambda: requests.post("http://broker:9100/vend", headers=h("bob"),
+                             json={"dataset": "projx/public"}).status_code
+print("add bob   :", members("add"), vend())
+print("remove bob:", members("remove"), vend())
+PY
+#  -> add bob   : ['alice', 'bob'] 200
+#     remove bob: ['alice'] 403
+```
+
+## Assigning roots
+
+A group owning a prefix root (`datasets/projx/`) or a namespace (`lakehouse.db`) owns
+everything under it: its members may change `share`, `write` and `delete` on what is
+registered there, and those who are also in `stewards` may register there.
+`PATCH /roots/<dataset|namespace>/<id>` adds and removes a root's owners (a dataset root is
+named like a dataset id: `projx/sub` is `datasets/projx/sub/`). OPA decides
+(`allow_change_root`): `group-admins` assign top-level roots (`datasets/<name>/`,
+`<catalog>.<namespace>`), and anyone in a group owning a root or one above it may change its
+owners. So an owner can hand part of its tree to another group, and can always take it back.
+
+```bash
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+def h(u): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
+    client_id="trino", client_secret="trino-secret", username=u, password=u)).json()["access_token"]}
+def owners(u, root, op, group):
+    r = requests.patch(f"http://governance:8000/roots/dataset/{root}", headers=h(u),
+                       json={"owners": {op: [group]}})
+    return r.status_code, r.json().get("owners")
+# alice's jgi-writers owns datasets/projx/; carol is in projw-team
+print("alice gives projx/sub to projw-team    :", owners("alice", "projx/sub", "add", "projw-team"))
+print("carol passes projx/sub/t2 to no-access :", owners("carol", "projx/sub/t2", "add", "no-access"))
+print("bob tries to take projx/sub            :", owners("bob", "projx/sub", "add", "no-access"))
+print("alice takes both back                  :", owners("alice", "projx/sub/t2", "remove", "no-access"),
+      owners("alice", "projx/sub", "remove", "projw-team"))
+PY
+#  -> alice gives projx/sub to projw-team    : (200, ['projw-team'])
+#     carol passes projx/sub/t2 to no-access : (200, ['no-access'])
+#     bob tries to take projx/sub            : (403, None)
+#     alice takes both back                  : (200, []) (200, [])
+```
+
 ## Security model
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across both
@@ -260,7 +356,11 @@ tenants, and neither can see the other's.
   to what may be viewed) / creating (a registered table with the person in its `write`, or a
   schema under one their group owns) / writes and read-write credentials (`write`) /
   dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `allow`
-  (read) / `visible` (see) / `allow_register` (ingest). Group membership and every grant
+  (read) / `visible` (see) / `allow_register` (ingest). Grant changes (`allow_change` in
+  both): `see` and `read` by `share` holders; `share`, `write` and `delete` by root owners.
+  Group changes (`opa/groups.rego`): a group's owners change its members and owners;
+  `group-admins` create groups. Root ownership (`allow_change_root` in `blob.rego` and
+  `tables.rego`): `group-admins` for top-level roots, owners of a root or one above it below. Group membership and every grant
   come from governance at decision time; tokens carry no groups.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Tables: Trino and Polaris both validate it (issuer, expiry, audience `polaris`); Trino's
@@ -272,9 +372,10 @@ tenants, and neither can see the other's.
   that reads that bearer, so only Polaris, the broker and governance can reach it.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`), prefix-
   scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further per
-  request to one dataset prefix. The long-lived governance service holds only a **read-only RGW
-  reader** (ListBucket on `datasets/*`, via a bucket policy) — never an admin key. Admin-only
-  RGW setup runs in a one-shot.
+  request to one dataset prefix. No long-lived service holds an admin key: Polaris and the
+  broker each authenticate as an RGW user that can only assume its vending role, and
+  governance holds a **read-only RGW reader** (ListBucket on `datasets/*`, via a bucket
+  policy). Admin-only RGW setup runs in a one-shot.
 - **Governed ingest is scoped.** A steward may register only under a prefix one of their groups
   owns (per-group ownership in OPA), prefixes are confined to `datasets/<...>/` (no traversal), and
   the overlap check + insert are serialized so two registrations can't claim overlapping
@@ -292,7 +393,6 @@ tenants, and neither can see the other's.
   fails with "Failed to initialize the vended credentials" rather than access denied.
 - A refused create's first line is Trino's own ("Failed to create transaction"); the gate's
   reason is the error's cause, which the CLI prints with `--debug`.
-- Group membership and grants change only in governance's database.
 - Polaris 1.5 needs an account for every person; the gate has governance create it the first
   time each person shows up. When a Polaris release has the `external` credential mode, that
   step goes away.

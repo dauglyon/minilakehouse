@@ -13,9 +13,14 @@ package lakehouse.tables
 #   allow_create     input {subject, id}   gate: may create this table or view now
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
+#   allow_change     input {subject, id, grants: [grant]}
+#                                          governance: may change these grants on this table
+#   allow_change_root  input {subject, id}  governance: may change who owns this namespace
 
 import data.lakehouse.governance
+import data.lakehouse.groups
 import future.keywords.contains
+import future.keywords.every
 import future.keywords.if
 import future.keywords.in
 
@@ -54,9 +59,49 @@ default allow_register := false
 allow_register if {
 	gs := governance.groups(input.subject)
 	"stewards" in gs
-	parts := split(input.id, ".")
+	namespace_owned(gs, namespace(_parent(input.id)))
+}
+
+# Changing grants (WHITEPAPER 4.4): `see` and `read` by a group holding `share` on the table;
+# `share`, `write` and `delete` by a group owning its namespace, the ownership registration
+# checks.
+default allow_change := false
+
+allow_change if {
+	e := table(input.id)
+	gs := governance.groups(input.subject)
+	count(input.grants) > 0
+	every g in input.grants {
+		_may_change(gs, e, g)
+	}
+}
+
+_may_change(gs, e, g) if {
+	g in {"see", "read"}
+	some x in gs
+	x in e.share
+}
+
+_may_change(gs, _, g) if {
+	g in {"share", "write", "delete"}
+	namespace_owned(gs, namespace(_parent(input.id)))
+}
+
+# Changing who owns a namespace: `group-admins` for a top-level one (<catalog>.<namespace>),
+# and anyone whose group owns that namespace or one above it, as for prefix roots (blob.rego).
+default allow_change_root := false
+
+allow_change_root if {
+	groups.admin(input.subject)
+	count(split(input.id, ".")) == 2
+}
+
+allow_change_root if namespace_owned(governance.groups(input.subject), namespace(input.id))
+
+# The namespace holding a table: its id without the last name.
+_parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
+	parts := split(id, ".")
 	count(parts) >= 3
-	namespace_owned(gs, namespace(concat(".", array.slice(parts, 0, count(parts) - 1))))
 }
 
 # A table's grants. For tables, write implies read: writing an Iceberg table reads its

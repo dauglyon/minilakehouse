@@ -7,13 +7,18 @@ package lakehouse.blob
 #   vend            input {subject, dataset: id}       broker: {allow, prefix} for one dataset
 #   discover        input {subject, datasets: [id]}    governance: {visible: [id], readable: [id]}
 #   allow_register  input {subject, prefix}            governance: may register at prefix
+#   allow_change    input {subject, dataset: id, grants: [grant]}
+#                                                      governance: may change these grants
+#   allow_change_root  input {subject, prefix}         governance: may change who owns this root
 #
-# An entry is {id, prefix, visibility: [group], access: [group]}. A dataset can be
+# An entry is {id, prefix, visibility: [group], access: [group], share: [group]}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
 # so it is denied exactly as a dataset the caller has no grant on.
 
 import data.lakehouse.governance
+import data.lakehouse.groups
 import future.keywords.contains
+import future.keywords.every
 import future.keywords.if
 import future.keywords.in
 
@@ -46,10 +51,46 @@ default allow_register := false
 
 allow_register if {
 	"stewards" in _groups
+	_owns_root(input.prefix)
+}
+
+# Changing grants (WHITEPAPER 4.4): `see` and `read` by a group holding `share` on the dataset;
+# `share` by a group owning a root above its prefix, the ownership registration checks.
+default allow_change := false
+
+allow_change if {
+	e := _entries[input.dataset]
+	count(input.grants) > 0
+	every g in input.grants {
+		_may_change(e, g)
+	}
+}
+
+_may_change(e, g) if {
+	g in {"see", "read"}
+	some x in _groups
+	x in e.share
+}
+
+_may_change(e, "share") if _owns_root(e.prefix)
+
+# Changing who owns a prefix root: `group-admins` for a top-level root (datasets/<name>/), and
+# anyone whose group owns that root or one above it. Owning a root owns everything under it,
+# so an owner can delegate part of its tree and can't be shut out of it.
+default allow_change_root := false
+
+allow_change_root if {
+	groups.admin(input.subject)
+	count(split(trim_suffix(input.prefix, "/"), "/")) == 2
+}
+
+allow_change_root if _owns_root(input.prefix)
+
+_owns_root(prefix) if {
 	owned := governance.get("/internal/register-grants")
 	some g in _groups
 	some root in object.get(owned, g, [])
-	startswith(input.prefix, root)
+	startswith(prefix, root)
 }
 
 _ids := input.datasets if input.datasets

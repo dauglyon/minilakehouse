@@ -3,7 +3,15 @@
     "jgi-writers": ["alice"],
     "stewards": ["alice", "carol"],
     "projw-team": ["carol"],
-    "no-access": ["bob"]
+    "no-access": ["bob"],
+    "group-admins": ["carol"]
+  },
+  "group_owners": {
+    "jgi-writers": ["jgi-writers"],
+    "stewards": ["group-admins"],
+    "projw-team": ["projw-team"],
+    "no-access": ["group-admins"],
+    "group-admins": ["group-admins"]
   },
   "namespace_owners": { "jgi-writers": ["lakehouse.db"] },
   "tables": [
@@ -13,6 +21,7 @@
       "steward": "alice",
       "see": [],
       "read": ["jgi-writers"],
+      "share": ["jgi-writers"],
       "write": ["jgi-writers"],
       "delete": ["jgi-writers"]
     }
@@ -27,14 +36,16 @@
       "description": "projx public data",
       "steward": "alice",
       "visibility": ["jgi-writers"],
-      "access": ["jgi-writers"]
+      "access": ["jgi-writers"],
+      "share": ["jgi-writers"]
     },
     {
       "prefix": "datasets/projx/private/",
       "description": "projx private data",
       "steward": "alice",
       "visibility": ["jgi-writers"],
-      "access": []
+      "access": [],
+      "share": ["jgi-writers"]
     },
     {
       "prefix": "datasets/projy/secret/",
