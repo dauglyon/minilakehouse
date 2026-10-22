@@ -173,6 +173,8 @@ services:
     build: ./governance
     entrypoint: ["python", "/app/pki.py"]
     network_mode: none
+    environment:
+      OPA_UID: "1000"   # the user the OPA image runs as; its client key is readable only by it
     volumes:
       - pki_ca:/pki/ca
       - pki_governance:/pki/governance

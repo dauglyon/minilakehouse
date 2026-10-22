@@ -19,16 +19,26 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 CA_DIR, GOV_DIR, OPA_DIR = "/pki/ca", "/pki/governance", "/pki/opa"
 DAYS = 3650
+# Each private key is readable only by the user its container runs as: governance runs as root,
+# the OPA image as OPA_UID.
+OPA_UID = int(os.environ.get("OPA_UID", "1000"))
+KEY_OWNERS = {f"{CA_DIR}/ca.key": 0, f"{GOV_DIR}/server.key": 0, f"{OPA_DIR}/client.key": OPA_UID}
 
 
 def _key():
     return ec.generate_private_key(ec.SECP256R1())
 
 
-def _write(path, data, mode=0o644):
-    with open(path, "wb") as f:
-        f.write(data)
-    os.chmod(path, mode)
+def _write(path, data, mode=0o644, owner=None):
+    # Created with its final mode, so a key is never briefly readable by others.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, data)
+        os.fchmod(fd, mode)
+        if owner is not None:
+            os.fchown(fd, owner, owner)
+    finally:
+        os.close(fd)
 
 
 def _pem_key(key):
@@ -56,12 +66,15 @@ def main():
     for d in (CA_DIR, GOV_DIR, OPA_DIR):
         os.makedirs(d, exist_ok=True)
     if all(os.path.exists(p) for p in (f"{CA_DIR}/ca.key", f"{GOV_DIR}/server.crt", f"{OPA_DIR}/client.crt")):
+        for path, owner in KEY_OWNERS.items():  # keys written by an earlier version were 0644
+            os.chmod(path, 0o600)
+            os.chown(path, owner, owner)
         print("pki: certificates exist")
         return
     ca_key = _key()
     ca = _cert("minilakehouse internal CA", ca_key, None, ca_key, ca=True)
     ca_pem = ca.public_bytes(serialization.Encoding.PEM)
-    _write(f"{CA_DIR}/ca.key", _pem_key(ca_key), 0o600)
+    _write(f"{CA_DIR}/ca.key", _pem_key(ca_key), 0o600, KEY_OWNERS[f"{CA_DIR}/ca.key"])
     server_key, client_key = _key(), _key()
     server = _cert("governance", server_key, ca.subject, ca_key,
                    eku=ExtendedKeyUsageOID.SERVER_AUTH, dns=["governance"])
@@ -70,8 +83,7 @@ def main():
                                (OPA_DIR, "client", client, client_key)):
         _write(f"{d}/ca.crt", ca_pem)
         _write(f"{d}/{name}.crt", cert.public_bytes(serialization.Encoding.PEM))
-        # World-readable inside its own volume: the container mounting it may run as another user.
-        _write(f"{d}/{name}.key", _pem_key(key), 0o644)
+        _write(f"{d}/{name}.key", _pem_key(key), 0o600, KEY_OWNERS[f"{d}/{name}.key"])
     print("pki: created CA, governance server certificate, opa client certificate")
 
 
