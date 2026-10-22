@@ -44,7 +44,9 @@ vend_write := {"allow": true, "prefix": e.prefix} if {
 
 discover := {"visible": visible, "readable": readable}
 
-# `read` implies `see`: a dataset a group may read is listed for it.
+# `read` implies `see`: a dataset a group may read is listed for it. Governance's dataset index
+# offers OPA only entries whose visibility or access names one of the person's groups
+# (governance/app.py _index_rows); a change to what makes a dataset visible changes that too.
 visible contains id if {
 	some id, e in _entries
 	some g in _groups

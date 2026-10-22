@@ -140,12 +140,15 @@ q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
 #  -> "0"     bob is in no group with a grant, so he sees nothing
 ```
 
-The gate answers for this table itself. Governance builds its files for the person loading it
-(one database query, then one OPA decision per kind: governance builds the candidate list and
-OPA says which candidates pass), keeps them in memory, and serves them from an S3-style
-endpoint that accepts only the short-lived credential issued with that load, signed per
-request. Every dataset's actual data stays in Ceph. The file paths carry a hash of the rows, so
-a grant change appears at the next query and no cache can serve one person's rows to another.
+The gate answers for this table itself. Governance builds its files for the person loading
+it (one database query, then one OPA decision per kind: governance builds the candidate list
+and OPA says which candidates pass; the candidates are only entries whose viewing grants
+name one of the person's groups, so the work follows what the person may see, not the
+catalog's size, and `seed/check-index-narrowing.py` checks that this drops nothing OPA would
+show), keeps them in memory, and serves them from an S3-style endpoint that accepts only the
+short-lived credential issued with that load, signed per request. Every dataset's actual
+data stays in Ceph. The file paths carry a hash of the rows, so a grant change appears at
+the next query and no cache can serve one person's rows to another.
 
 Engines reach storage at one address, `storage.internal:8080`, with the bucket in the host
 name, as AWS S3 routes buckets: Docker DNS sends `lakehouse.storage.internal` to Ceph and

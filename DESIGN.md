@@ -262,6 +262,16 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   bucket-in-host addressing because `rgw_dns_name` lists `storage.internal`; it lists
   `ceph`, `localhost` and `127.0.0.1` too, because RGW reads an unlisted host name as a
   bucket name.
+- **The index's work follows what a person may see.** Governance offers OPA only the live
+  entries whose viewing grants name one of the person's groups (GIN indexes on
+  `visibility || access` and `see || read || write`), which are exactly the grants OPA's
+  visibility rules test, so the narrowing drops only entries OPA would refuse and OPA still
+  decides each candidate. Measured at 50,000 live datasets with 5,003 visible to alice: a load
+  took 2.39 s offering OPA every entry and 0.25 s narrowed. `seed/check-index-narrowing.py`
+  compares the narrowed rows with OPA's decision over every entry for every person in a group;
+  a rule that makes an entry visible by anything other than those grants must change the
+  narrowing query too. The gate's table listings and the periodic re-listing of every dataset
+  folder still grow with the whole catalog.
 - **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
   a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
   changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`):

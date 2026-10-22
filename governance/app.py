@@ -162,6 +162,10 @@ CREATE TABLE IF NOT EXISTS register_grants (
 );
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS write TEXT[] NOT NULL DEFAULT '{}';
+-- The dataset index narrows its candidates to entries whose viewing grants name one of the
+-- person's groups (_index_rows); these keep that query proportional to the matches.
+CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((visibility || access));
+CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((see || read || write));
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
 """
 
@@ -850,15 +854,26 @@ def change_root_owners(kind, root_id):
 def _index_rows(subject):
     """Every live dataset and table the subject may see, with whether they may read it. Only
     live entries: existence is storage's truth (reconcile, the gate's reports), visibility
-    OPA's; governance builds the list, OPA says which candidates pass."""
+    OPA's; governance builds the list, OPA says which candidates pass.
+
+    The candidates are only entries whose viewing grants name one of the subject's groups:
+    see or read for a file dataset, see, read or write for a table. Those are exactly the
+    grants OPA's visibility rules test (blob.rego `visible`, tables.rego `viewable`), so the
+    narrowing drops only entries OPA would refuse, and OPA's cost follows what the person may
+    see rather than the catalog's size. seed/check-index-narrowing.py checks the two agree."""
     with db() as cur:
-        cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live'")
+        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
+        groups = [r["grp"] for r in cur.fetchall()]
+        cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' "
+                    "AND (visibility || access) && %s::text[]", (groups,))
         files = cur.fetchall()
-        cur.execute("SELECT id, description, steward FROM table_entries WHERE status = 'live'")
+        cur.execute("SELECT id, description, steward FROM table_entries WHERE status = 'live' "
+                    "AND (see || read || write) && %s::text[]", (groups,))
         tables = cur.fetchall()
-    f = opa("discover", {"subject": subject, "datasets": [r["id"] for r in files]})
-    t = opa("decide", {"subject": subject, "tables": [r["id"] for r in tables], "namespaces": []},
-            package="tables")
+    f = (opa("discover", {"subject": subject, "datasets": [r["id"] for r in files]})
+         if files else {"visible": [], "readable": []})
+    t = (opa("decide", {"subject": subject, "tables": [r["id"] for r in tables], "namespaces": []},
+             package="tables") if tables else {"tables": [], "readable": []})
     rows = [{"id": r["id"], "kind": "files", "description": r["description"],
              "steward": r["steward"], "can_read": r["id"] in f["readable"]}
             for r in files if r["id"] in f["visible"]]

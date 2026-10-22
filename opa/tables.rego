@@ -118,6 +118,9 @@ readable(groups, e) if {
 	g in array.concat(e.read, e.write)
 }
 
+# Governance's dataset index offers OPA only tables whose see, read or write names one of the
+# person's groups (governance/app.py _index_rows); a change to what makes a table viewable
+# changes that too.
 viewable(groups, e) if {
 	some g in groups
 	g in array.concat(e.see, array.concat(e.read, e.write))
