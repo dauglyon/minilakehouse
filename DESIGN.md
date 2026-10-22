@@ -351,9 +351,11 @@ reference (the sections above are current-state).
   the timer, events, and register); the seed and register paths use advisory locks.
 - **RGW notifications on this image.** Ceph 20.2.1 supports them, but the image's `ceph.conf`
   narrows the enabled APIs and drops `notifications`; the entrypoint re-adds it. Topics are
-  created via the SNS/S3 API (boto3) — `radosgw-admin` has no `topic create`. RGW data here is
-  ephemeral (no volume), so it re-bootstraps on container *recreate* — the table re-seed and
-  blob re-seed are expected post-`up` steps.
+  created via the SNS/S3 API (boto3) — `radosgw-admin` has no `topic create`.
+- **Ceph keeps its data.** The image's own startup runs the OSD on memstore (RAM) and deletes
+  the cluster at every start. `ceph/start.sh` replaces it: the cluster lives on the `ceph_data`
+  volume with a BlueStore OSD on a sparse 20 GB file, created at the first start and reused at
+  every later one, so restarts and container recreation keep buckets, tables and roles.
 - **The engine relays the user's token instead of naming the user.** Trino copies a query's
   extra credentials into its per-user Iceberg catalog session, and the Iceberg REST client
   sends a credential named `token` as the bearer before attempting any exchange (read in the

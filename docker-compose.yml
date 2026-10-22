@@ -182,7 +182,10 @@ services:
     entrypoint: ["/bin/sh", "/rgw-entrypoint.sh"]
     volumes:
       - ./ceph/rgw-entrypoint.sh:/rgw-entrypoint.sh:ro
+      - ./ceph/start.sh:/ceph-start.sh:ro
       - ./ceph/sts-bootstrap.sh:/sts-bootstrap.sh:ro
+      # The cluster (MON store, BlueStore OSD file), so data survives restarts and recreation.
+      - ceph_data:/var/lib/ceph
     networks:
       # Engines read storage at one address with the bucket in the host name:
       # <bucket>.storage.internal resolves here, governance-index.storage.internal to
@@ -425,3 +428,4 @@ networks:
 
 volumes:
   postgres_data:
+  ceph_data:

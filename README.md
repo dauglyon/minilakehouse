@@ -429,7 +429,7 @@ PY
   load rebuilds them.
 - Plaintext/no-TLS everywhere except Trino's token port, which uses a self-signed keystore
   generated at container start; dev credentials in `.env` — all dev-only.
-- RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the
-  `projx` demo blobs are re-seeded automatically, but re-seed the table (the command above)
-  and re-run the ingest demo for `projz`. (Re-running the `polaris-setup` one-shot likewise
-  drops & recreates the catalog — re-seed the table after.)
+- Ceph keeps its data on the `ceph_data` volume across restarts and recreation;
+  `docker compose down -v` clears it, after which re-seed the table (the command above) and
+  re-run the ingest demo for `projz`. Re-running the `polaris-setup` one-shot drops and
+  recreates the catalog, so re-seed the table after that too.

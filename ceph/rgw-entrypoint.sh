@@ -7,8 +7,8 @@
 #
 #  2. Once the cluster + admin user are up, create the `polaris-vendor` STS role that
 #     Polaris assumes to vend per-table credentials. Done in the background so we can
-#     hand the foreground to the image's own entrypoint (which must stay PID 1 for
-#     signal handling and `wait`). radosgw-admin creates the role with an empty-account
+#     hand the foreground to ceph/start.sh (which must stay PID 1 for signal handling
+#     and `wait`). radosgw-admin creates the role with an empty-account
 #     ARN (arn:aws:iam:::role/polaris-vendor) — stable, unlike the IAM API which mints a
 #     per-instance account id.
 set -e
@@ -45,4 +45,5 @@ fi
   sh /sts-bootstrap.sh || echo "WARN: STS role bootstrap failed (see logs)"
 ) &
 
-exec /entrypoint.sh
+# ceph/start.sh, not the image's /entrypoint.sh: it keeps the cluster on the ceph_data volume.
+exec /bin/bash /ceph-start.sh
