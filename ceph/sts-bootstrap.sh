@@ -12,24 +12,35 @@ BUCKET="${BUCKET:-lakehouse}"
 WHPREFIX="${WAREHOUSE_PREFIX:-warehouse}"
 BLOB_PREFIX="${BLOB_PREFIX:-datasets}"
 
-# Create a role only if absent, then (always, idempotently) attach its policy. A genuine
-# create failure is NOT swallowed — it aborts via `set -e` and surfaces in the logs, rather
-# than masquerading as "already exists".
+# Create a role only if absent, then (always, idempotently) set its trust and attach its
+# policy, so a rerun moves an existing role to the current trust. A genuine create failure is
+# NOT swallowed — it aborts via `set -e` and surfaces in the logs, rather than masquerading as
+# "already exists".
 ensure_role() {  # name  trust_doc  policy_name  policy_doc
   radosgw-admin role get --role-name="$1" >/dev/null 2>&1 \
     || radosgw-admin role create --role-name="$1" --assume-role-policy-doc="$2"
+  radosgw-admin role-trust-policy modify --role-name="$1" --assume-role-policy-doc="$2"
   radosgw-admin role-policy put --role-name="$1" --policy-name="$3" --policy-doc="$4"
   radosgw-admin role get --role-name="$1"
 }
 
 # --- Table plane: the role Polaris assumes to vend per-table creds (warehouse/ only). ---
-# RGW admin user `root` has no tenant, so its ARN has an empty account field. Polaris
-# narrows further with a per-table session policy at vend time. Least-privilege: only the
-# object/bucket actions the catalog needs (no s3:*), objects confined to warehouse/.
+# Polaris authenticates as `polaris-catalog`, which holds no S3 rights of its own — only the
+# ability to assume this role — and narrows further with a per-table session policy at vend
+# time; it reads and writes table metadata with such credentials too. The user has no tenant,
+# so its ARN has an empty account field. Least-privilege: only the object/bucket actions the
+# catalog needs (no s3:*), objects confined to warehouse/.
 POLARIS_ROLE="${ROLE:-polaris-vendor}"
+POLARIS_UID="${POLARIS_S3_UID:-polaris-catalog}"
+POLARIS_KEY="${POLARIS_S3_KEY:-polaris-catalog}"
+POLARIS_SECRET="${POLARIS_S3_SECRET:-polaris-catalog-secret}"
+echo ">>> ensuring catalog user ${POLARIS_UID}"
+radosgw-admin user info --uid="$POLARIS_UID" >/dev/null 2>&1 \
+  || radosgw-admin user create --uid="$POLARIS_UID" --display-name="Polaris Catalog" \
+       --access-key="$POLARIS_KEY" --secret-key="$POLARIS_SECRET"
 POLARIS_TRUST=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[
-  {"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/root"]},"Action":["sts:AssumeRole"]}]}
+  {"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/${POLARIS_UID}"]},"Action":["sts:AssumeRole"]}]}
 JSON
 )
 POLARIS_PERM=$(cat <<JSON
@@ -43,7 +54,6 @@ POLARIS_PERM=$(cat <<JSON
 JSON
 )
 echo ">>> ensuring role ${POLARIS_ROLE}"
-radosgw-admin caps add --uid=root --caps="roles=*" >/dev/null 2>&1 || true  # grant AssumeRole (no-op if present)
 ensure_role "$POLARIS_ROLE" "$POLARIS_TRUST" s3access "$POLARIS_PERM"
 
 # --- Blob plane (Flow C): the role the broker assumes to vend per-dataset creds. The broker
@@ -57,7 +67,9 @@ echo ">>> ensuring broker user ${BLOB_UID}"
 radosgw-admin user info --uid="$BLOB_UID" >/dev/null 2>&1 \
   || radosgw-admin user create --uid="$BLOB_UID" --display-name="Blob Broker" \
        --access-key="$BLOB_KEY" --secret-key="$BLOB_SECRET"
-radosgw-admin caps add --uid="$BLOB_UID" --caps="roles=*" >/dev/null 2>&1 || true
+# No RGW capabilities: AssumeRole needs none (the role's trust policy decides), and `roles=*`
+# would let the broker read and rewrite role policies. Removed from a user that has it.
+radosgw-admin caps rm --uid="$BLOB_UID" --caps="roles=*" >/dev/null 2>&1 || true
 
 BLOB_TRUST=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[

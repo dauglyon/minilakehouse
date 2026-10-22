@@ -238,10 +238,12 @@ services:
       quarkus.datasource.username: ${POSTGRES_USER}
       quarkus.datasource.password: ${POSTGRES_PASSWORD}
       polaris.realm-context.realms: ${POLARIS_REALM}
-      # --- static S3 storage creds (RGW admin key); used while stsUnavailable ---
+      # --- storage: an RGW user whose only right is assuming the polaris-vendor role. Every
+      #     file access, Polaris's own metadata reads and writes included, uses a credential
+      #     from that role narrowed to one table's location. ---
       AWS_REGION: ${S3_REGION}
-      AWS_ACCESS_KEY_ID: ${RGW_ACCESS_KEY}
-      AWS_SECRET_ACCESS_KEY: ${RGW_SECRET_KEY}
+      AWS_ACCESS_KEY_ID: ${POLARIS_S3_KEY}
+      AWS_SECRET_ACCESS_KEY: ${POLARIS_S3_SECRET}
       # --- authn: MIXED — internal root (admin/bootstrap/catalog) + external Keycloak
       #     tokens (user-facing catalog ops). The external identity's principal name
       #     comes from the token's principal_name claim. ---
