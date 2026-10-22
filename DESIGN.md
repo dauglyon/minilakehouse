@@ -326,7 +326,7 @@ This is the PDP/PEP (XACML/ABAC) pattern ported onto open lakehouse parts, not a
 | **AWS Lake Formation** | The two-plane model (metadata vs storage) and "effective permissions → vended scope." |
 | **Apache Ranger + Atlas** | External PDP + discovery/classification driving policy. OPA in Ranger's seat; the registry in Atlas's. |
 | **Cloudera RAZ** | Proof an external-policy object-store authorization service works at scale. The broker is the STS (not hot-path) variant. |
-| **Polaris 1.5** | A pluggable Authorizer SPI that delegates the table-vend decision to OPA — the one open catalog that does. |
+| **Polaris 1.5** | A pluggable Authorizer SPI that delegates the table-vend decision to OPA. |
 
 ## 10. Implementation notes & key decisions
 
@@ -334,8 +334,7 @@ A chronological-ish log of decisions and hard-won details — for context, not c
 reference (the sections above are current-state).
 
 - **Catalog = Polaris.** Polaris 1.5's OPA authorizer calls OPA at `loadTable` and the
-  decision gates STS vending — the one open catalog that delegates the vend decision to your
-  policy. Blob vending is then ours to build (the broker), which is the project's actual
+  decision gates STS vending, so the vend decision is your policy's. Blob vending is then ours to build (the broker), which is the project's actual
   contribution.
 - **STS against Ceph RGW works**, with non-obvious requirements: `rgw_sts_key` (16 alnum) +
   `rgw_s3_auth_use_sts` in `ceph.conf`; an empty-account role ARN (`radosgw-admin role create`,
