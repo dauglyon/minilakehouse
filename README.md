@@ -394,7 +394,10 @@ PY
 - **Entry lookups answer only OPA.** Governance's `/internal/*` returns grants for datasets a
   user can't see, so it is served only on a TLS listener that requires OPA's client
   certificate (`governance/pki.py`). OPA reads the key from a file, which, unlike its
-  environment, its query API cannot return; and only its callers can reach OPA at all.
+  environment, its query API cannot return; and only its callers can reach OPA at all. The
+  gate's table create/drop reports use the same listener with a certificate named `gate`.
+- **Storage events carry a secret.** RGW puts a shared secret (the topic's opaque data) in
+  every bucket notification; governance refuses events without it.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`), prefix-
   scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further per
   request to one dataset prefix. No long-lived service holds an admin key: Polaris and the

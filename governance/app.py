@@ -45,12 +45,14 @@ DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 # The grant lookups OPA's rules make (/internal/*) return any entry's grants, including
-# datasets the person can't see, so they are served only on INTERNAL_PORT, a TLS listener that
-# requires OPA's client certificate (pki.py).
+# datasets the person can't see, and the gate's table create/drop reports set a table's status,
+# so both are served only on INTERNAL_PORT, a TLS listener that requires a client certificate
+# from the internal CA (pki.py): `opa` for the lookups, `gate` for the reports.
 INTERNAL_PORT = int(os.environ.get("INTERNAL_PORT", "8443"))
 PKI_DIR = os.environ.get("PKI_DIR", "/pki")
-# Bearer the gate presents when it reports a table created or dropped through Polaris.
-LIFECYCLE_TOKEN = os.environ["LIFECYCLE_TOKEN"]
+# RGW adds this to every bucket notification it sends (the topic's opaque data, rgw_setup.py);
+# /events ignores a delivery whose events lack it.
+EVENTS_SECRET = os.environ["EVENTS_SECRET"]
 # Polaris refuses a token whose name has no stored principal (released Polaris has no other
 # mode), so governance creates each person's, name only, the first time the gate sees them.
 # It logs in as `provisioner`, which OPA allows to create principals and nothing else.
@@ -313,13 +315,15 @@ internal_app = Flask("internal")
 
 
 @internal_app.before_request
-def only_opa():
-    # The listener already requires a certificate from the internal CA; that CA also signs
-    # governance's own server certificate, so the name is checked too.
+def known_caller():
+    # The listener already requires a certificate from the internal CA, which signs every
+    # internal caller's and governance's own, so the name decides the route: the gate may only
+    # report table events, OPA may only look up grants.
     sock = request.environ.get("werkzeug.socket")
     cert = sock.getpeercert() if sock is not None and hasattr(sock, "getpeercert") else None
     names = [v for rdn in (cert or {}).get("subject", ()) for k, v in rdn if k == "commonName"]
-    if names != ["opa"]:
+    allowed = "gate" if request.path == "/internal/table-events" else "opa"
+    if names != [allowed]:
         return jsonify({"error": "unauthorized"}), 401
     return None
 
@@ -471,14 +475,11 @@ def internal_namespaces():
     return jsonify({"entries": entries})
 
 
-@app.post("/internal/table-events")
+@internal_app.post("/internal/table-events")
 def table_events():
     # The gate's report that Polaris created or dropped a table: created sets a pending entry
     # live and records its location, dropped sets a live entry gone. Any other transition is
     # logged and ignored.
-    if not hmac.compare_digest(request.headers.get("Authorization", ""),
-                               f"Bearer {LIFECYCLE_TOKEN}"):
-        return jsonify({"error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {}
     table_id, event = body.get("id"), body.get("event")
     old, new = {"created": ("pending", "live"), "dropped": ("live", "gone")}.get(event, (None, None))
@@ -498,11 +499,17 @@ def events():
     # RGW bucket-notification sink. Events carry NO authority — they only TRIGGER a check of
     # the dataset a key falls under, which reads storage truth itself, so a forged event can only
     # cause a check. Any answer but 2xx makes RGW deliver the event again (persistent topic).
-    # Unauthenticated by design (trusted-network dev).
+    # RGW proves itself by the topic's secret, which it puts in every event as opaqueData; a
+    # secret in the push URL would instead land in this server's request log.
     body = request.get_json(silent=True) or {}
     records = body.get("Records", [])
     if len(records) > MAX_EVENT_RECORDS:
         return jsonify({"error": f"at most {MAX_EVENT_RECORDS} records per delivery"}), 413
+    if not records or not all(isinstance(r, dict) and isinstance(r.get("opaqueData"), str)
+                              and hmac.compare_digest(r["opaqueData"], EVENTS_SECRET)
+                              for r in records):
+        app.logger.warning("/events: delivery without the topic's secret refused")
+        return jsonify({"error": "unauthorized"}), 401
     with db() as cur:  # the registry once, not once per record
         cur.execute("SELECT id, prefix FROM datasets")
         registry = [(r["id"], r["prefix"]) for r in cur.fetchall()]

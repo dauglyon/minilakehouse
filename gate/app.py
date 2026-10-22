@@ -44,7 +44,10 @@ from flask import Flask, Response, jsonify, request
 POLARIS = os.environ.get("POLARIS_URL", "http://polaris:8181")
 OPA = os.environ["OPA_URL"]  # .../v1/data/lakehouse/tables
 GOVERNANCE = os.environ["GOVERNANCE_URL"]
-LIFECYCLE_TOKEN = os.environ["LIFECYCLE_TOKEN"]
+# Table create/drop reports go to governance's internal listener, which knows the gate by its
+# client certificate (governance/pki.py).
+GOVERNANCE_INTERNAL = os.environ["GOVERNANCE_INTERNAL_URL"]
+PKI = os.environ.get("PKI_DIR", "/pki")
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 AUDIENCE = os.environ["POLARIS_AUDIENCE"]
@@ -185,8 +188,8 @@ def report(table_id, event, location=None):
     """Tell governance a table was created or dropped. Best effort: a lost report leaves the
     entry's status stale, never its grants."""
     try:
-        _http.post(f"{GOVERNANCE}/internal/table-events", timeout=5,
-                   headers={"Authorization": f"Bearer {LIFECYCLE_TOKEN}"},
+        _http.post(f"{GOVERNANCE_INTERNAL}/internal/table-events", timeout=5,
+                   cert=(f"{PKI}/client.crt", f"{PKI}/client.key"), verify=f"{PKI}/ca.crt",
                    json={"id": table_id, "event": event, "location": location}).raise_for_status()
     except requests.RequestException as e:
         app.logger.warning("could not report %s %s: %s", event, table_id, e)

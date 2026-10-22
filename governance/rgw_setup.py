@@ -24,6 +24,8 @@ READER_KEY = os.environ.get("GOVERNANCE_READER_KEY", "")
 READER_SECRET = os.environ.get("GOVERNANCE_READER_SECRET", "")
 EVENTS = os.environ.get("EVENTS_ENDPOINT", "http://governance:8000/events")
 TOPIC = os.environ.get("EVENTS_TOPIC", "dataset-events")
+# RGW adds the topic's opaque data to every event it sends; governance refuses events without it.
+EVENTS_SECRET = os.environ["EVENTS_SECRET"]
 _cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
               retries={"max_attempts": 3})
 
@@ -46,8 +48,8 @@ def main():
     # arrives later. A failure here fails the setup.
     sns = boto3.client("sns", endpoint_url=RGW, aws_access_key_id=AK,
                        aws_secret_access_key=SK, region_name="us-east-1", config=_cfg)
-    arn = sns.create_topic(Name=TOPIC, Attributes={"push-endpoint": EVENTS,
-                                                   "persistent": "true"})["TopicArn"]
+    arn = sns.create_topic(Name=TOPIC, Attributes={"push-endpoint": EVENTS, "persistent": "true",
+                                                   "OpaqueData": EVENTS_SECRET})["TopicArn"]
     s3.put_bucket_notification_configuration(Bucket=BUCKET, NotificationConfiguration={
         "TopicConfigurations": [{
             "Id": "dataset-freshness", "TopicArn": arn,

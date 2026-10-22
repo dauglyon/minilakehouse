@@ -72,6 +72,7 @@ services:
       RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
       RGW_SECRET_KEY: ${RGW_SECRET_KEY}
       S3_BUCKET: ${S3_BUCKET}
+      EVENTS_SECRET: ${EVENTS_SECRET}
       GOVERNANCE_READER_UID: governance-reader
       # Reader creds too, so the one-shot can confirm the reader can actually list before exiting.
       GOVERNANCE_READER_KEY: ${GOVERNANCE_READER_KEY}
@@ -99,7 +100,7 @@ services:
       REGISTRY: /app/registry.json
       OPA_BASE: http://opa:8181
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
-      LIFECYCLE_TOKEN: ${LIFECYCLE_TOKEN}   # bearer the gate presents to report table creates/drops
+      EVENTS_SECRET: ${EVENTS_SECRET}   # RGW puts it in every notification it sends
       # Creating each person's Polaris principal on first use (POST /principals/me).
       POLARIS_URL: http://polaris:8181
       POLARIS_REALM: ${POLARIS_REALM}
@@ -168,8 +169,8 @@ services:
       - ./keycloak/setup.py:/keycloak/setup.py:ro
 
   pki:
-    # One-shot: a dev CA, governance's server certificate and OPA's client certificate, each
-    # on its own volume (governance/pki.py). Keeps existing files on a rerun.
+    # One-shot: a dev CA, governance's server certificate, and OPA's and the gate's client
+    # certificates, each on its own volume (governance/pki.py). Keeps existing files on a rerun.
     build: ./governance
     entrypoint: ["python", "/app/pki.py"]
     network_mode: none
@@ -179,6 +180,7 @@ services:
       - pki_ca:/pki/ca
       - pki_governance:/pki/governance
       - pki_opa:/pki/opa
+      - pki_gate:/pki/gate
 
   broker:
     # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
@@ -378,6 +380,8 @@ services:
     # and namespaces may be created, and reports creates and drops. See gate/app.py.
     build: ./gate
     depends_on:
+      pki:
+        condition: service_completed_successfully
       polaris:
         condition: service_healthy
       opa:
@@ -385,10 +389,13 @@ services:
     environment:
       OPA_URL: http://opa:8181/v1/data/lakehouse/tables
       GOVERNANCE_URL: http://governance:8000
-      LIFECYCLE_TOKEN: ${LIFECYCLE_TOKEN}
+      GOVERNANCE_INTERNAL_URL: https://governance:8443
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       POLARIS_AUDIENCE: ${POLARIS_CLIENT_ID}
+    volumes:
+      # Client certificate for its table reports to governance's internal listener.
+      - pki_gate:/pki:ro
     networks: [default, catalog, policy]
 
   trino:
@@ -480,3 +487,4 @@ volumes:
   pki_ca:
   pki_governance:
   pki_opa:
+  pki_gate:

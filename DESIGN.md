@@ -301,11 +301,17 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 - **Grant lookups answer only OPA.** `/internal/*` returns grants for datasets the user cannot
   see, so governance serves it only on a TLS listener (port 8443) that requires a client
   certificate from the internal CA with the name `opa` (`governance/pki.py` makes the CA and
-  both certificates, each on its own volume). OPA reads its key from a mounted file: OPA's API
+  every certificate, each on its own volume). The same listener takes the gate's table
+  create/drop reports, from a certificate named `gate`, and each name may call only its own
+  routes. OPA reads its key from a mounted file: OPA's API
   evaluates any query it receives, including one that reads its environment, so a bearer in
   the environment was readable by anyone who could reach OPA, and a file is not. OPA is also on
   a network shared only with its callers (Polaris, the broker, governance, the gate) and
   publishes no host port.
+- **Storage events carry a secret.** RGW adds the notification topic's opaque data, a shared
+  secret, to every event it sends; `/events` refuses a delivery whose events lack it. The
+  secret is not in the push URL, which governance's request log would record. A forged event
+  could only trigger a check of one folder, never set a status.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`),
   prefix-scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further
   per request. No long-lived service holds an admin key: Polaris authenticates as
@@ -433,8 +439,7 @@ reference (the sections above are current-state).
 - The dataset index's files live in governance's memory (a restart drops them; the next load rebuilds them).
 - Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
   token only over TLS; the container generates a self-signed keystore at each start), dev
-  credentials in `.env`, the OPA debug image, and unauthenticated `/events`
-  (trusted-network).
+  credentials in `.env`, and the OPA debug image.
 
 ## Glossary
 

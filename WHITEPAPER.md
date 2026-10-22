@@ -441,9 +441,10 @@ that entry, and the event triggers a check of that one entry:
   retry. A lost event leaves a stale status until the next event for that entry: a lost
   deletion leaves a `gone` dataset listed, a lost creation leaves a `live` dataset hidden
   while its grants already allow reading it. Both are the accepted price of having no sweep.
-- The events endpoint authenticates the sender with a shared secret carried in the push
-  endpoint's URL. Whether RGW supports credentials in the push URL is unverified. A forged
-  event can only trigger a check, never set a status directly.
+- The events endpoint authenticates the sender with a shared secret that RGW adds to every
+  event it sends (the notification topic's opaque data); a secret in the push URL would land
+  in the endpoint's request log. A forged event can only trigger a check, never set a status
+  directly.
 
 Grants are independent of status. Listings show `live` entries only.
 
@@ -516,7 +517,7 @@ object, and no sweep.
 Differs from this document: tables are entries in their own registry, not in the catalog
 with files; `share` is only the right to change grants, since there are no derived datasets
 to widen; no derived datasets, no widenings; events are checked as each delivery arrives
-rather than coalesced per folder; the events endpoint is unauthenticated.
+rather than coalesced per folder.
 
 ## 14. Questions for the reviewer
 
