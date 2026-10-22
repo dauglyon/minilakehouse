@@ -228,7 +228,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   namespace (its owners) — anything unnamed, including rename, register and set-location, is
   root-only. Polaris is on a
   network only the gate and its setup jobs share, so every client call passes the gate. Blobs (`blob.rego`): `allow` (read) / `visible`
-  (see) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
+  (see or read) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
   carry no groups.
 - **Grant changes are decided like access.** `PATCH /permissions/<dataset|table>/<id>` adds
   or removes groups from an entry's grants. OPA's `allow_change` decides it while

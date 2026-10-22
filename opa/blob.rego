@@ -33,10 +33,11 @@ vend := {"allow": true, "prefix": e.prefix} if {
 
 discover := {"visible": visible, "readable": readable}
 
+# `read` implies `see`: a dataset a group may read is listed for it.
 visible contains id if {
 	some id, e in _entries
 	some g in _groups
-	g in e.visibility
+	g in array.concat(e.visibility, e.access)
 }
 
 readable contains id if {

@@ -356,7 +356,7 @@ PY
   to what may be viewed) / creating (a registered table with the person in its `write`, or a
   schema under one their group owns) / writes and read-write credentials (`write`) /
   dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `allow`
-  (read) / `visible` (see) / `allow_register` (ingest). Grant changes (`allow_change` in
+  (read) / `visible` (see or read) / `allow_register` (ingest). Grant changes (`allow_change` in
   both): `see` and `read` by `share` holders; `share`, `write` and `delete` by root owners.
   Group changes (`opa/groups.rego`): a group's owners change its members and owners;
   `group-admins` create groups. Root ownership (`allow_change_root` in `blob.rego` and

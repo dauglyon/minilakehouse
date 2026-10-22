@@ -133,9 +133,10 @@ request, since every rule looks the person's groups up at decision time.
   not include dropping it. A file dataset has no `delete`: its `write` credential already
   deletes objects.
 
-No grant implies another, with one stated exception: for tables, `write` implies `read`,
-because writing an Iceberg table requires reading its metadata and the credential Polaris
-vends for writing is read-write. A dataset whose `see` includes a group and whose `read` does
+Two grants imply others, and no more: `read` implies `see`, so a dataset a group may read is
+listed for it; and for tables, `write` implies `read`, because writing an Iceberg table
+requires reading its metadata and the credential Polaris vends for writing is read-write. A
+dataset whose `see` includes a group and whose `read` does
 not is visible-not-readable: it appears in a listing with its name and description, a
 table's metadata can be loaded, and its contents cannot be read. Trino requests a credential
 with every table load, and Polaris refuses the whole load when neither credential check
@@ -371,7 +372,7 @@ everyone but root.
 
 | Rule | Caller | Input | Decision |
 |---|---|---|---|
-| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in effective `see` |
+| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in effective `see` or `read` |
 | `vend` (read) | broker | dataset id | allow, plus the entry's folder for the read session policy |
 | `vend_write` | broker | dataset id | allow, plus the entry's folder for the write session policy |
 | `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
@@ -484,10 +485,9 @@ and entries it needs with `http.send`; table names are
 confidential, so `see` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
 set-location are root-only; `group-admins` assign top-level folder roots and namespaces, and
-their owners delegate below them.
+their owners delegate below them; `read` implies `see`.
 
-1. Whether `read` should imply `see`. The model says no. Every comparator says yes.
-2. Explicit retirement distinct from the folder emptying or the table being dropped.
+1. Explicit retirement distinct from the folder emptying or the table being dropped.
 
 ## 13. Status against the repository
 
