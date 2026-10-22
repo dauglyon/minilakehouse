@@ -81,8 +81,9 @@ def derive_id(prefix):
 RGW_ENDPOINT = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
 # Where engines fetch the dataset index's files (index_table.py): the storage address every
 # engine already uses, by bucket-in-hostname addressing. Docker DNS points
-# governance-index.storage at this service's INDEX_PORT and <bucket>.storage at Ceph.
-INDEX_ENDPOINT = os.environ.get("INDEX_ENDPOINT", "http://storage:8080")
+# governance-index.storage.internal at this service's INDEX_PORT and <bucket>.storage.internal
+# at Ceph.
+INDEX_ENDPOINT = os.environ.get("INDEX_ENDPOINT", "http://storage.internal:8080")
 INDEX_PORT = int(os.environ.get("INDEX_PORT", "8080"))
 RGW_KEY = os.environ.get("RGW_ACCESS_KEY", "")
 RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")

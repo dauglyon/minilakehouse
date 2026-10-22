@@ -166,10 +166,12 @@ q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
 #  -> "0"
 ```
 
-Engines reach storage at one address, `storage:8080`, with the bucket in the host name, as
-AWS S3 routes buckets: Docker DNS sends `lakehouse.storage` to Ceph and
-`governance-index.storage` to governance, so no engine needs a setting that names the index.
-Ceph accepts that addressing because `rgw_dns_name` lists `storage` (`ceph/rgw-entrypoint.sh`).
+Engines reach storage at one address, `storage.internal:8080`, with the bucket in the host
+name, as AWS S3 routes buckets: Docker DNS sends `lakehouse.storage.internal` to Ceph and
+`governance-index.storage.internal` to governance, so no engine needs a setting that names
+the index. The names end in `.internal`, which never resolves publicly, so a location naming
+any other bucket reaches no host at all. Ceph accepts that addressing because `rgw_dns_name`
+lists `storage.internal` (`ceph/rgw-entrypoint.sh`).
 
 ## Flow B — Iceberg tables
 
