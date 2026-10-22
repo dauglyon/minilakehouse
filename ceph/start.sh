@@ -7,8 +7,9 @@
 set -e
 
 RGW_PORT="${RGW_PORT:-8080}"
-RGW_ACCESS_KEY="${RGW_ACCESS_KEY:-testaccesskey}"
-RGW_SECRET_KEY="${RGW_SECRET_KEY:-testsecretkey}"
+# No fallback to well-known keys. sts-bootstrap.sh resets the admin key from these at every
+# start, so a changed key in .env replaces the stored one.
+: "${RGW_ACCESS_KEY:?RGW_ACCESS_KEY must be set}" "${RGW_SECRET_KEY:?RGW_SECRET_KEY must be set}"
 DATA=/var/lib/ceph
 CONF=/etc/ceph/ceph.conf
 

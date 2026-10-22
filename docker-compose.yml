@@ -82,7 +82,7 @@ services:
   governance:
     # The PAP + dataset registry. Single source of truth: owns the registry + all grants
     # in a durable Postgres database; OPA's rules fetch them from /internal/* per decision.
-    # Serves discovery (Flow A). See governance/app.py.
+    # Serves the dataset index (Flow A). See governance/app.py.
     build: ./governance
     depends_on:
       keycloak:
@@ -179,6 +179,13 @@ services:
       RGW_ACCESS_KEY: ${RGW_ACCESS_KEY}
       RGW_SECRET_KEY: ${RGW_SECRET_KEY}
       RGW_STS_KEY: ${RGW_STS_KEY}
+      # Keys of the RGW users ceph/sts-bootstrap.sh keeps in step with .env at every start.
+      POLARIS_S3_KEY: ${POLARIS_S3_KEY}
+      POLARIS_S3_SECRET: ${POLARIS_S3_SECRET}
+      BLOB_BROKER_KEY: ${BLOB_BROKER_KEY}
+      BLOB_BROKER_SECRET: ${BLOB_BROKER_SECRET}
+      GOVERNANCE_READER_KEY: ${GOVERNANCE_READER_KEY}
+      GOVERNANCE_READER_SECRET: ${GOVERNANCE_READER_SECRET}
     entrypoint: ["/bin/sh", "/rgw-entrypoint.sh"]
     volumes:
       - ./ceph/rgw-entrypoint.sh:/rgw-entrypoint.sh:ro

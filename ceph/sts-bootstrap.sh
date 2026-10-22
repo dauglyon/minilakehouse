@@ -6,6 +6,18 @@
 set -e
 
 BUCKET="${BUCKET:-lakehouse}"
+
+# The cluster persists (ceph/start.sh), so a user's first key would otherwise outlive a change in
+# .env. On every run each user's only S3 key becomes the configured one: `key create` on an
+# existing access key replaces its secret, and every other key is removed.
+ensure_key() {  # uid access_key secret
+  radosgw-admin key create --uid="$1" --key-type=s3 --access-key="$2" --secret="$3" >/dev/null
+  for k in $(radosgw-admin user info --uid="$1" | jq -r '.keys[].access_key'); do
+    [ "$k" = "$2" ] || radosgw-admin key rm --uid="$1" --key-type=s3 --access-key="$k" >/dev/null
+  done
+}
+echo ">>> ensuring the admin user's key"
+ensure_key root "${RGW_ACCESS_KEY:?}" "${RGW_SECRET_KEY:?}"
 # The warehouse lives under this sub-prefix (must match the catalog's default-base-location
 # in polaris/bootstrap.sh). Confining the role here means a vended credential whose session
 # policy is somehow missing still can't reach beyond the warehouse.
@@ -32,12 +44,13 @@ ensure_role() {  # name  trust_doc  policy_name  policy_doc
 # catalog needs (no s3:*), objects confined to warehouse/.
 POLARIS_ROLE="${ROLE:-polaris-vendor}"
 POLARIS_UID="${POLARIS_S3_UID:-polaris-catalog}"
-POLARIS_KEY="${POLARIS_S3_KEY:-polaris-catalog}"
-POLARIS_SECRET="${POLARIS_S3_SECRET:-polaris-catalog-secret}"
+POLARIS_KEY="${POLARIS_S3_KEY:?}"
+POLARIS_SECRET="${POLARIS_S3_SECRET:?}"
 echo ">>> ensuring catalog user ${POLARIS_UID}"
 radosgw-admin user info --uid="$POLARIS_UID" >/dev/null 2>&1 \
   || radosgw-admin user create --uid="$POLARIS_UID" --display-name="Polaris Catalog" \
        --access-key="$POLARIS_KEY" --secret-key="$POLARIS_SECRET"
+ensure_key "$POLARIS_UID" "$POLARIS_KEY" "$POLARIS_SECRET"
 POLARIS_TRUST=$(cat <<JSON
 {"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Principal":{"AWS":["arn:aws:iam:::user/${POLARIS_UID}"]},"Action":["sts:AssumeRole"]}]}
@@ -61,12 +74,13 @@ ensure_role "$POLARIS_ROLE" "$POLARIS_TRUST" s3access "$POLARIS_PERM"
 # one dataset prefix per request via a session policy. The role is read-only, datasets/ only. ---
 BLOB_ROLE="${BLOB_ROLE:-blob-vendor}"
 BLOB_UID="${BLOB_BROKER_UID:-blob-broker}"
-BLOB_KEY="${BLOB_BROKER_KEY:-blob-broker}"
-BLOB_SECRET="${BLOB_BROKER_SECRET:-blob-broker-secret}"
+BLOB_KEY="${BLOB_BROKER_KEY:?}"
+BLOB_SECRET="${BLOB_BROKER_SECRET:?}"
 echo ">>> ensuring broker user ${BLOB_UID}"
 radosgw-admin user info --uid="$BLOB_UID" >/dev/null 2>&1 \
   || radosgw-admin user create --uid="$BLOB_UID" --display-name="Blob Broker" \
        --access-key="$BLOB_KEY" --secret-key="$BLOB_SECRET"
+ensure_key "$BLOB_UID" "$BLOB_KEY" "$BLOB_SECRET"
 # No RGW capabilities: AssumeRole needs none (the role's trust policy decides), and `roles=*`
 # would let the broker read and rewrite role policies. Removed from a user that has it.
 radosgw-admin caps rm --uid="$BLOB_UID" --caps="roles=*" >/dev/null 2>&1 || true
@@ -90,9 +104,10 @@ ensure_role "$BLOB_ROLE" "$BLOB_TRUST" blobread "$BLOB_PERM"
 # dataset prefixes (reconcile). It holds no rights of its own; the rgw-setup one-shot grants
 # it ListBucket on datasets/* via a bucket policy. So governance never holds the admin key. ---
 GR_UID="${GOVERNANCE_READER_UID:-governance-reader}"
-GR_KEY="${GOVERNANCE_READER_KEY:-governance-reader}"
-GR_SECRET="${GOVERNANCE_READER_SECRET:-governance-reader-secret}"
+GR_KEY="${GOVERNANCE_READER_KEY:?}"
+GR_SECRET="${GOVERNANCE_READER_SECRET:?}"
 echo ">>> ensuring reader user ${GR_UID}"
 radosgw-admin user info --uid="$GR_UID" >/dev/null 2>&1 \
   || radosgw-admin user create --uid="$GR_UID" --display-name="Governance Reader" \
        --access-key="$GR_KEY" --secret-key="$GR_SECRET"
+ensure_key "$GR_UID" "$GR_KEY" "$GR_SECRET"
