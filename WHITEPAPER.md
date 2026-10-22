@@ -194,7 +194,8 @@ and writes. OPA fetches the entry from governance like any other rule; every wri
 row takes its lock, so the entry OPA reads is the one the write replaces.
 
 - `see` and `read` of dataset d: callers holding effective `share` on d.
-- `share`, `write` and `delete` of d: callers in a group owning d's folder root.
+- `share`, `write` and `delete` of d: callers in a group owning the folder root (a file
+  dataset) or namespace (a table) that d sits under.
 - Adding a widening to d for grant g and group x: callers holding effective `share` on every
   input of d whose effective g lacks x. Removing one: callers holding effective `share` on d.
 - `inputs`: never.
@@ -390,7 +391,7 @@ everyone but root.
 | Polaris: update, commit table or view | Polaris | table id | group in effective `write` |
 | Polaris: drop table or view, with or without purging its files | Polaris | table id | group in `delete` |
 | Polaris: rename table or view, register table, set table location | Polaris | | root only. Rename would orphan the entry's id; register and set-location would let a table alias another table's folder |
-| Polaris: create or drop namespace, update namespace properties | Polaris | namespace | a caller group owns the folder root the namespace maps to |
+| Polaris: create or drop namespace, update namespace properties | Polaris | namespace | a caller group owns the namespace or one above it |
 | Polaris: admin operations | Polaris | | root only |
 
 Grant changes are decided while governance holds the dataset's row lock (4.4), so the
@@ -512,7 +513,7 @@ Differs from this document: tables are entries in their own registry, not in the
 with files, so the catalog's listing shows files only; `share` is only the right to change
 grants, since there are no derived datasets to widen; no `write` for files, no derived
 datasets, no widenings;
-namespace ownership is recorded by namespace, not derived from folder roots; one token
+one token
 audience serves every service, and only Trino and Polaris
 check it; the entry lookup is closed by a shared bearer token rather than by caller
 identity; the registering upload uses the storage admin key; the periodic listing is
