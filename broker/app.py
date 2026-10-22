@@ -14,7 +14,9 @@ Flow:
      and delete, no get, WHITEPAPER 4.2) with an inline session policy scoped to that prefix
      (the role permits datasets/*; the session policy narrows; the client cannot widen it)
      -> per-dataset temp credentials
-  4. return the scoped credentials; the client reads or writes those objects directly in RGW.
+  4. have governance log the credential against the person's current session (PROVENANCE.md
+     4.1); when the log refuses or cannot be reached, refuse the request
+  5. return the scoped credentials; the client reads or writes those objects directly in RGW.
 
 OPA denies an unknown dataset exactly as a denied one, so the broker reveals nothing about
 which datasets exist.
@@ -42,6 +44,10 @@ BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
 TTL = int(os.environ.get("CRED_TTL_SECONDS", "900"))
+# The access log, on governance's internal listener, which knows the broker by its client
+# certificate (governance/pki.py).
+GOVERNANCE_INTERNAL = os.environ["GOVERNANCE_INTERNAL_URL"]
+PKI = os.environ.get("PKI_DIR", "/pki")
 # A dataset id is a tenant-qualified name (e.g. projx/public).
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 
@@ -59,7 +65,7 @@ app = Flask(__name__)
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
 # separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token):
-    """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
+    """Cryptographically verify the caller's own Keycloak token -> its claims. PyJWT enforces
     signature, exp, issuer and audience; we add azp (the token must have been issued through our
     login client, not some other realm client). Groups are not read from the token: OPA gets
     them from governance."""
@@ -67,11 +73,15 @@ def verify_user(token):
     claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS, audience=AUDIENCE)
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
+    return claims
+
+
+def subject_of(claims):
     return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
 
 
 def authed_user():
-    """Verify the request's bearer token. Returns (subject, None) on success, or
+    """Verify the request's bearer token. Returns (claims, None) on success, or
     (None, error_response) for the caller to return as-is."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -90,6 +100,19 @@ def opa_vend(subject, dataset, mode):
                    timeout=5)
     r.raise_for_status()
     return r.json().get("result") or {"allow": False}
+
+
+def log_access(claims, dataset, mode, expiration):
+    """Have governance log this credential for the caller. Raises when the log refuses or cannot
+    be reached: a credential that is not logged would be missing from what the person's
+    outputs may derive from."""
+    _http.post(f"{GOVERNANCE_INTERNAL}/internal/accesses", timeout=5,
+               cert=(f"{PKI}/client.crt", f"{PKI}/client.key"), verify=f"{PKI}/ca.crt",
+               json={"person": subject_of(claims), "sub": claims.get("sub") or "",
+                     "sid": claims.get("sid") or "",
+                     "entries": [{"dataset": dataset, "kind": "files", "mode": mode,
+                                  "expires": int(expiration.timestamp() * 1000)}]}
+               ).raise_for_status()
 
 
 def session_policy(prefix, mode):
@@ -115,9 +138,10 @@ def health():
 
 @app.post("/vend")
 def vend():
-    subject, err = authed_user()
+    claims, err = authed_user()
     if err:
         return err
+    subject = subject_of(claims)
 
     body = request.get_json(silent=True) or {}
     dataset, mode = body.get("dataset"), body.get("mode", "read")
@@ -143,6 +167,11 @@ def vend():
         RoleSessionName=f"blob-{subject}"[:32],
         Policy=session_policy(prefix, mode), DurationSeconds=TTL,
     )["Credentials"]
+    try:
+        log_access(claims, dataset, mode, cr["Expiration"])
+    except requests.RequestException as e:
+        app.logger.warning("not logged, refusing %s subject=%s dataset=%s: %s", mode, subject, dataset, e)
+        return jsonify({"error": "service unavailable"}), 503
     app.logger.info("VEND %s subject=%s dataset=%s prefix=%s", mode, subject, dataset, prefix)
     return jsonify({
         "access_key_id": cr["AccessKeyId"],

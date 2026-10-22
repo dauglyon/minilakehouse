@@ -1,8 +1,8 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-This document describes a design that is not implemented. Section 10 lists what was run
-against the stack on 2026-10-22 and what each run showed; everything else is design. It
-extends `WHITEPAPER.md`, whose derivation rule (section 4.3) consumes each dataset's `inputs`.
+Build step 1 (section 10) is implemented; the rest is design. Section 10 lists what was run
+against the stack on 2026-10-22 and what each run showed. The document extends
+`WHITEPAPER.md`, whose derivation rule (section 4.3) consumes each dataset's `inputs`.
 
 ## 1. Purpose
 
@@ -51,9 +51,12 @@ A session is a unit of work a person names. A person has one until they ask for 
   it (section 4). The stamp never changes. No clock enters the mapping.
 
 Jobs and service connections are Keycloak service accounts, subjects like any other
-(`WHITEPAPER.md` section 6). An orchestrator that starts many agents gives each its own login
-and inserts a session name as each agent's first statement, so each agent's work is its own
-session. Whether Keycloak gives each client-credentials grant its own `sid` is unverified.
+(`WHITEPAPER.md` section 6). A client-credentials token carries no `sid` (checked 2026-10-22
+on `service-account-trino`), so every token of one service account is one login with one
+pointer, keyed by the account. An orchestrator that wants each agent's work in its own
+session therefore gives each agent its own service account, or a login that has a `sid`, and
+inserts a session name as each agent's first statement; agents sharing one account share a
+pointer, and an insert by one moves it for all.
 
 What a session is not: an environment or a login. Two environments can work in one session;
 one environment can move through several. Data that stays in an environment across a session
@@ -63,16 +66,22 @@ boundary is out-of-band carry-over, section 8, the same as a download.
 
 ### 4.1 The vend log
 
-Governance holds one row per credential issued: person, Keycloak subject, `sid`, session,
-dataset id, kind, `read` or `write`, issued, expires. Two writers:
+Governance holds one row per credential issued and per table write (`accesses` in
+`governance/app.py`): person, Keycloak subject, `sid`, session, dataset id, kind, `read` or
+`write`, time, expires. Two writers, each calling governance's internal listener with its own
+client certificate:
 
 - The broker, for every file vend (`broker/app.py`, `vend`).
-- The gate, for every table load answered with a storage credential, and for every table
-  create and commit it forwards (`gate/app.py`, `proxy`).
+- The gate (`gate/app.py`, `proxy`), for every response that hands out a table's storage
+  credential: a load, a refresh from the credentials endpoint Polaris advertises as
+  `client.refresh-credentials-endpoint`, and a 304 to a credentialed load, where the engine
+  reuses a credential it already holds. And for every table create and commit it forwards.
 
-Both record before they return the credential, and a failed record refuses the request. A
-lost record would silently shorten a candidate list, which is the one failure the design
-exists to prevent, so the record is synchronous and fail-closed. OPA decision logs were
+Both record before they return the credential, and the gate records a write before it
+forwards the create or commit, so a failed record stops the write before the catalog sees
+it. A failed record refuses the request. A lost record would silently shorten a candidate
+list, which is the one failure the design exists to prevent, so the record is synchronous
+and fail-closed. OPA decision logs were
 considered and rejected: they are buffered and best-effort. Side effects inside Rego were
 rejected: a rule may evaluate more than once per decision.
 
@@ -151,11 +160,15 @@ Read only. One row per dataset per session.
 | `session` | the session the credential was stamped with |
 | `first_access`, `last_access` | when credentials were issued |
 
-With no filter, the rows of the current session. With `WHERE output = <id>`, the candidates
-for that output: the rows of every session that wrote it, each cut at that session's last
-write to it. That is how a later session declares something built earlier, and how an
-output touched in two sessions gets both. An output is not its own candidate; a sibling
-output of the same session is.
+The rows of the current session's reads. A table the session appended to is among them,
+since loading a table to write it hands out a credential that can read it.
+
+The candidates for an output are the rows of every session that wrote it, each cut at that
+session's last write to it. That is how a later session declares something built earlier,
+and how an output touched in two sessions gets both. An output is not its own candidate; a
+sibling output of the same session is. Serving them as `WHERE output = <id>` on this table
+cannot work: no filter reaches the catalog (section 10, item 6), so a table's rows cannot
+depend on the query's `WHERE`. How the candidates are served is open (section 9).
 
 ### 5.3 `governance.derivations`
 
@@ -188,7 +201,8 @@ all of them; declaring can only widen.
 
 ### 5.4 Examples
 
-All examples assume the current session's `accessed` holds `lakehouse.db.t1` (table),
+The examples that read candidates with `WHERE output =` wait on section 9's choice of how
+candidates are served. All examples assume the current session's `accessed` holds `lakehouse.db.t1` (table),
 `projx/public` (files) and `lakehouse.db.weather` (table).
 
 Start or resume a session:
@@ -339,7 +353,13 @@ login that outlives Keycloak's session maximum forces a re-login mid-work, which
 pointer absorbs. Setting the maximum to an environment's intended lifetime removes the
 interruption. Whether offline sessions keep a stable `sid` is unverified.
 
-**Service-account logins.** Whether each client-credentials grant carries its own `sid`.
+**How candidates are served.** Section 5.2's `WHERE output = <id>` cannot reach governance.
+Options: a separate table with one row per candidate of every output the person may declare,
+`output` a column, filtered by an ordinary `WHERE`, the way Unity Catalog's
+`system.access.table_lineage` and Snowflake's `ACCESS_HISTORY` serve lineage; or an `output`
+column on `accessed`, empty on the current session's rows, so an unfiltered read needs
+`WHERE output IS NULL`. Either way, the declaration examples in 5.4 read the candidates, not
+`accessed`, since a session that appended to its output has read it.
 
 **The broker's exchange audience.** Section 4.2's trust condition depends on Keycloak
 restricting one audience to the broker's client.
@@ -361,6 +381,25 @@ container, all artefacts removed afterwards:
    account: the event named `$oidc$997d4829-…`, alice's Keycloak subject. A provider created
    under an account is not found by an account-less role: `Couldn't get oidc provider info`.
 3. alice's access token carries `sid`.
+4. A client-credentials token for `service-account-trino` carries no `sid`.
+5. Trino 484 loads a table through the gate on every query: two runs of one `SELECT` made two
+   loads, both answered 200 with a storage credential. Polaris also sends an `ETag`; a
+   credentialed load sent with `If-None-Match` got 304, which the gate logs as a read.
+6. Trino 484 never sends a query's filter to the catalog. Iceberg 1.12, which it bundles,
+   plans a scan on the server when a load's config sets `scan-planning-mode=server`
+   (`RESTSessionCatalog.restTableForScanPlanning` returns a `RESTTable`), but
+   `TrinoRestCatalog.loadTable` wraps every loaded table in a new `BaseTable` built from its
+   operations, which plans on the client. Read from the bytecode of the jars in the running
+   Trino image.
+7. Build step 1, run on the stack. As alice: a Trino read of `db.t1` and a broker read
+   credential for `projx/public` appear in `governance.accessed`, both in session `default`,
+   and `governance.sessions` shows `default` as current, though each command used a new
+   login. A CTAS into a registered pending table logged one write: Trino's staged create logs
+   nothing, its completing commit logs the write. bob's refused read logged nothing. With the
+   log's address made unreachable, a gate given a credentialed load answered 503, a gate
+   given a commit answered 503 and Polaris logged no request for the table, a load without a
+   credential still answered 200, and the broker answered 503. On the internal listener, the
+   `opa` certificate is refused on the log, and `broker` is refused everywhere else.
 
 Gotchas recorded on the way: RGW merges a put of the bucket notification configuration into
 the existing one rather than replacing it, so removing an entry needs
@@ -369,8 +408,8 @@ the existing one rather than replacing it, so removing an entry needs
 
 Build order, each step usable on its own:
 
-1. The vend log and the session pointer in governance; the broker and the gate recording
-   fail-closed; `governance.sessions` and `governance.accessed` served read-only.
+1. Built. The vend log and the session pointer in governance; the broker and the gate
+   recording fail-closed; `governance.sessions` and `governance.accessed` served read-only.
 2. Write attribution: the OIDC provider registered in `ceph/sts-bootstrap.sh` by an
    account-less setup user; the broker's exchanged audience; `blob-writer` trusting it; the
    broker's write vend on `AssumeRoleWithWebIdentity`; the event join in governance.

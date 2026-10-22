@@ -45,9 +45,10 @@ DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 # The grant lookups OPA's rules make (/internal/*) return any entry's grants, including
-# datasets the person can't see, and the gate's table create/drop reports set a table's status,
-# so both are served only on INTERNAL_PORT, a TLS listener that requires a client certificate
-# from the internal CA (pki.py): `opa` for the lookups, `gate` for the reports.
+# datasets the person can't see, the gate's table create/drop reports set a table's status, and
+# access log entries decide what a person's outputs may be derived from, so all three are served
+# only on INTERNAL_PORT, a TLS listener that requires a client certificate from the internal CA
+# (pki.py): `opa` for the lookups, `gate` for the reports, `gate` and `broker` for the log.
 INTERNAL_PORT = int(os.environ.get("INTERNAL_PORT", "8443"))
 PKI_DIR = os.environ.get("PKI_DIR", "/pki")
 # RGW adds this to every bucket notification it sends (the topic's opaque data, rgw_setup.py);
@@ -169,6 +170,36 @@ ALTER TABLE datasets DROP COLUMN IF EXISTS object_count, DROP COLUMN IF EXISTS t
 CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((visibility || access));
 CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((see || read || write));
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
+-- Provenance (PROVENANCE.md 3, 4.1). A session is a unit of work a person names; each login
+-- points at one of the person's sessions, and every access is stamped with the session its
+-- login pointed at when the access was logged.
+CREATE TABLE IF NOT EXISTS sessions (
+    id        BIGSERIAL PRIMARY KEY,
+    person    TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    started   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (person, name)
+);
+CREATE TABLE IF NOT EXISTS logins (
+    person  TEXT NOT NULL,
+    sid     TEXT NOT NULL,                   -- the token's Keycloak login session; '' when it has none
+    session BIGINT NOT NULL REFERENCES sessions (id),
+    PRIMARY KEY (person, sid)
+);
+CREATE TABLE IF NOT EXISTS accesses (
+    id      BIGSERIAL PRIMARY KEY,
+    person  TEXT NOT NULL,
+    sub     TEXT NOT NULL,                   -- Keycloak subject, which storage events name
+    sid     TEXT NOT NULL,
+    session BIGINT NOT NULL REFERENCES sessions (id),
+    dataset TEXT NOT NULL,                   -- a file dataset's id or a table's id
+    kind    TEXT NOT NULL,                   -- files | table
+    mode    TEXT NOT NULL,                   -- read: a credential issued | write: a credential or table commit
+    at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires TIMESTAMPTZ                      -- the credential's expiry; none for a table commit
+);
+CREATE INDEX IF NOT EXISTS accesses_session ON accesses (session, mode, dataset);
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -279,7 +310,7 @@ def _entry(row):
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
 # separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token, audience):
-    """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
+    """Cryptographically verify the caller's own Keycloak token -> its claims. PyJWT enforces
     signature, exp, issuer and audience; we add azp (the token must have been issued through our
     login client, not some other realm client). Groups are not read from the token: OPA gets
     them from governance."""
@@ -287,11 +318,15 @@ def verify_user(token, audience):
     claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS, audience=audience)
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
+    return claims
+
+
+def subject_of(claims):
     return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
 
 
-def authed_user(audience=AUDIENCE):
-    """Verify the request's bearer token. Returns (subject, None) on success, or
+def authed_claims(audience=AUDIENCE):
+    """Verify the request's bearer token. Returns (claims, None) on success, or
     (None, error_response) for the caller to return as-is."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
@@ -303,6 +338,12 @@ def authed_user(audience=AUDIENCE):
         return None, (jsonify({"error": "invalid token"}), 401)
 
 
+def authed_user(audience=AUDIENCE):
+    """(subject, None) for the request's verified bearer token, or (None, error_response)."""
+    claims, err = authed_claims(audience)
+    return (subject_of(claims), None) if claims else (None, err)
+
+
 def opa(rule, inp, package="blob"):
     """Evaluate one lakehouse.<package> rule; returns its result."""
     r = _http.post(f"{OPA_BASE}/v1/data/lakehouse/{package}/{rule}", json={"input": inp},
@@ -312,18 +353,19 @@ def opa(rule, inp, package="blob"):
 
 
 internal_app = Flask("internal")
+# The certificate names that may call each internal route; every other route is a grant lookup,
+# OPA's alone.
+INTERNAL_CALLERS = {"/internal/table-events": {"gate"}, "/internal/accesses": {"gate", "broker"}}
 
 
 @internal_app.before_request
 def known_caller():
     # The listener already requires a certificate from the internal CA, which signs every
-    # internal caller's and governance's own, so the name decides the route: the gate may only
-    # report table events, OPA may only look up grants.
+    # internal caller's and governance's own, so the name decides the route.
     sock = request.environ.get("werkzeug.socket")
     cert = sock.getpeercert() if sock is not None and hasattr(sock, "getpeercert") else None
     names = [v for rdn in (cert or {}).get("subject", ()) for k, v in rdn if k == "commonName"]
-    allowed = "gate" if request.path == "/internal/table-events" else "opa"
-    if names != [allowed]:
+    if len(names) != 1 or names[0] not in INTERNAL_CALLERS.get(request.path, {"opa"}):
         return jsonify({"error": "unauthorized"}), 401
     return None
 
@@ -492,6 +534,66 @@ def table_events():
         changed = cur.fetchone() is not None
     app.logger.info("TABLE %s %s%s", event, table_id, "" if changed else " (no matching entry; ignored)")
     return jsonify({"ok": True, "changed": changed})
+
+
+def _pointer(cur, person, sid, create=False):
+    """The id of the session this login points at. A login with no pointer yet continues the
+    person's most recently used session; with create, that becomes the login's pointer, and a
+    person with no session gets one named `default`. None when there is nothing to point at
+    and create is false."""
+    cur.execute("SELECT session FROM logins WHERE person = %s AND sid = %s", (person, sid))
+    if row := cur.fetchone():
+        return row["session"]
+    cur.execute("SELECT id FROM sessions WHERE person = %s ORDER BY last_used DESC LIMIT 1", (person,))
+    row = cur.fetchone()
+    if not create:
+        return row and row["id"]
+    if row is None:
+        cur.execute("INSERT INTO sessions (person, name) VALUES (%s, 'default') "
+                    "ON CONFLICT (person, name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+                    (person,))
+        row = cur.fetchone()
+    # A concurrent first access by the same login may have set the pointer since the SELECT;
+    # theirs stands.
+    cur.execute("INSERT INTO logins (person, sid, session) VALUES (%s, %s, %s) "
+                "ON CONFLICT (person, sid) DO NOTHING", (person, sid, row["id"]))
+    cur.execute("SELECT session FROM logins WHERE person = %s AND sid = %s", (person, sid))
+    return cur.fetchone()["session"]
+
+
+def _accesses_valid(body):
+    entries = body.get("entries")
+    return (all(isinstance(body.get(k), str) for k in ("person", "sub", "sid"))
+            and body["person"] and body["sub"] and isinstance(entries, list) and entries
+            and all(isinstance(e, dict) and isinstance(e.get("dataset"), str) and e["dataset"]
+                    and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write")
+                    and (e.get("expires") is None or isinstance(e["expires"], int))
+                    for e in entries))
+
+
+@internal_app.post("/internal/accesses")
+def record_accesses():
+    # The access log (PROVENANCE.md 4.1): the broker logs each file credential it issues, the
+    # gate each table credential it passes on and each table write it forwards. Both log before
+    # handing anything on and refuse the request when this fails, so the log holds every
+    # access that reached a person. Body: {person, sub, sid, entries: [{dataset, kind, mode,
+    # expires}]}, expires in epoch milliseconds or null. Answers the session they were
+    # stamped with.
+    body = request.get_json(silent=True) or {}
+    if not _accesses_valid(body):
+        return jsonify({"error": "person, sub, sid and entries [{dataset, kind, mode, expires}] required"}), 400
+    with db(commit=True) as cur:
+        session = _pointer(cur, body["person"], body["sid"], create=True)
+        for e in body["entries"]:
+            cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0))",
+                        (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
+                         e["mode"], e.get("expires")))
+        cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
+        name = cur.fetchone()["name"]
+    app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,
+                    " ".join(f"{e['mode']}:{e['dataset']}" for e in body["entries"]))
+    return jsonify({"ok": True, "session": name})
 
 
 @app.post("/events")
@@ -873,15 +975,49 @@ def _index_rows(subject):
     return sorted(rows, key=lambda r: (r["kind"], r["id"]))
 
 
+def _session_rows(subject, sid):
+    """The person's sessions; `current` marks the one this login's next access would be
+    stamped with."""
+    with db() as cur:
+        current = _pointer(cur, subject, sid)
+        cur.execute("SELECT id, name, started, last_used FROM sessions WHERE person = %s "
+                    "ORDER BY started", (subject,))
+        return [{"name": r["name"], "started": r["started"], "last_used": r["last_used"],
+                 "current": r["id"] == current} for r in cur.fetchall()]
+
+
+def _accessed_rows(subject, sid):
+    """One row per dataset read in this login's current session: what an output made in it
+    may derive from."""
+    with db() as cur:
+        current = _pointer(cur, subject, sid)
+        cur.execute("SELECT a.dataset, a.kind, s.name AS session, min(a.at) AS first_access, "
+                    "max(a.at) AS last_access FROM accesses a JOIN sessions s ON s.id = a.session "
+                    "WHERE a.session = %s AND a.mode = 'read' "
+                    "GROUP BY a.dataset, a.kind, s.name ORDER BY a.dataset", (current,))
+        return cur.fetchall()
+
+
 @app.post("/index/load")
 def index_load():
-    # The gate's answer to a catalog load of <catalog>.governance.datasets, on the person's own
-    # token: an Iceberg LoadTableResult for that person's index, whose files this service
-    # serves below with the storage credential in `config`.
-    subject, err = authed_user(CATALOG_AUDIENCE)
+    # The gate's answer to a catalog load of one of <catalog>.governance's tables
+    # (index_table.TABLES), on the person's own token: an Iceberg LoadTableResult for that
+    # person's table, whose files this service serves below with the storage credential in
+    # `config`.
+    claims, err = authed_claims(CATALOG_AUDIENCE)
     if err:
         return err
-    table = index_table.build(subject, _index_rows(subject))
+    subject, sid = subject_of(claims), claims.get("sid") or ""
+    name = (request.get_json(silent=True) or {}).get("table", "datasets")
+    if name == "datasets":
+        rows = _index_rows(subject)
+    elif name == "sessions":
+        rows = _session_rows(subject, sid)
+    elif name == "accessed":
+        rows = _accessed_rows(subject, sid)
+    else:
+        return jsonify({"error": "no such table"}), 404
+    table = index_table.build(subject, name, rows)
     config = {**index_table.mint(subject), "s3.endpoint": INDEX_ENDPOINT,
               "s3.force-virtual-addressing": "true", "s3.region": "us-east-1",
               "client.region": "us-east-1"}

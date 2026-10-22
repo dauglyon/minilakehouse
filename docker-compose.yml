@@ -169,8 +169,9 @@ services:
       - ./keycloak/setup.py:/keycloak/setup.py:ro
 
   pki:
-    # One-shot: a dev CA, governance's server certificate, and OPA's and the gate's client
-    # certificates, each on its own volume (governance/pki.py). Keeps existing files on a rerun.
+    # One-shot: a dev CA, governance's server certificate, and OPA's, the gate's and the broker's
+    # client certificates, each on its own volume (governance/pki.py). Keeps existing files on a
+    # rerun.
     build: ./governance
     entrypoint: ["python", "/app/pki.py"]
     network_mode: none
@@ -181,6 +182,7 @@ services:
       - pki_governance:/pki/governance
       - pki_opa:/pki/opa
       - pki_gate:/pki/gate
+      - pki_broker:/pki/broker
 
   broker:
     # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
@@ -197,16 +199,22 @@ services:
         condition: service_started
       governance:
         condition: service_healthy
+      pki:
+        condition: service_completed_successfully
     environment:
       KEYCLOAK_JWKS: http://keycloak:8080/realms/${KC_REALM}/protocol/openid-connect/certs
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       OPA_BLOB_URL: http://opa:8181/v1/data/lakehouse/blob
+      GOVERNANCE_INTERNAL_URL: https://governance:8443
       RGW_ENDPOINT: http://ceph:8080
       BLOB_ROLE_ARN: ${BLOB_ROLE_ARN}
       BLOB_WRITE_ROLE_ARN: ${BLOB_WRITE_ROLE_ARN}
       BUCKET: ${S3_BUCKET}
       BLOB_BROKER_KEY: ${BLOB_BROKER_KEY}
       BLOB_BROKER_SECRET: ${BLOB_BROKER_SECRET}
+    volumes:
+      # Client certificate for logging each credential it issues to governance's internal listener.
+      - pki_broker:/pki:ro
     networks: [default, policy]
     ports:
       - "19091:9100"
@@ -394,7 +402,8 @@ services:
       KEYCLOAK_ISS: http://keycloak:8080/realms/${KC_REALM}
       POLARIS_AUDIENCE: ${POLARIS_CLIENT_ID}
     volumes:
-      # Client certificate for its table reports to governance's internal listener.
+      # Client certificate for its table reports and access log entries to governance's
+      # internal listener.
       - pki_gate:/pki:ro
     networks: [default, catalog, policy]
 
@@ -488,3 +497,4 @@ volumes:
   pki_governance:
   pki_opa:
   pki_gate:
+  pki_broker:

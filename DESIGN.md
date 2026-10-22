@@ -93,11 +93,11 @@ files/blobs over S3) under the *same* governance model as tables.
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
-| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, builds and serves each person's dataset index table, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
+| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `accessed`), and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
-| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance create a person's Polaris principal before their first request; answers for the dataset index table, `governance.datasets`, itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
+| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance log each table credential it passes on and each table write it forwards, refusing the request when the log fails; has governance create a person's Polaris principal before their first request; answers for the `governance` namespace's tables itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
-| **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision: `blob-vendor` to read (get, list), `blob-writer` to write (put, delete, no get). No engine in the byte path. |
+| **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision: `blob-vendor` to read (get, list), `blob-writer` to write (put, delete, no get), and has governance log it before returning it. No engine in the byte path. |
 | **Ceph RGW** | Object store + native STS + bucket notifications. Enforces the vended credential. |
 | **Postgres** | Polaris metastore and the durable `governance` registry database. |
 | **rgw-setup** (one-shot) | Admin-credentialed startup step: sets the bucket policy granting the governance reader `ListBucket` on `datasets/*`, and wires bucket notifications — so the long-lived governance service never holds the admin key. |
@@ -118,7 +118,9 @@ files/blobs over S3) under the *same* governance model as tables.
 2. Polaris's Authorizer asks OPA: may this user read X? OPA fetches X's readers from
    governance.
 3. On allow, Polaris mints a per-table STS credential scoped to X's files.
-4. Trino reads X's files from RGW directly — no OPA, no broker on the byte path.
+4. The gate has governance log the read against the person's current session, then passes
+   the credential on; when the log fails, the load is refused.
+5. Trino reads X's files from RGW directly — no OPA, no broker on the byte path.
 
 **Flow C — read a blob dataset** — lazy, per-dataset, true end-to-end.
 1. Client presents its **own** Keycloak token to the broker, naming dataset X.
@@ -127,7 +129,9 @@ files/blobs over S3) under the *same* governance model as tables.
    returns allow plus X's registered prefix. An unknown X gets the same 403 as a denied one.
 4. On allow, the broker `AssumeRole`s with an inline session policy scoped to that prefix
    (narrowing a broad role; the client can't widen it).
-5. The client reads those objects from RGW directly — no engine in the byte path.
+5. The broker has governance log the credential against the person's current session, then
+   returns it; when the log fails, the request is refused.
+6. The client reads those objects from RGW directly — no engine in the byte path.
 
 ## 5. The OPA contract
 
@@ -302,12 +306,25 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   see, so governance serves it only on a TLS listener (port 8443) that requires a client
   certificate from the internal CA with the name `opa` (`governance/pki.py` makes the CA and
   every certificate, each on its own volume). The same listener takes the gate's table
-  create/drop reports, from a certificate named `gate`, and each name may call only its own
-  routes. OPA reads its key from a mounted file: OPA's API
+  create/drop reports, from a certificate named `gate`, and access log entries from `gate`
+  and `broker`; each name may call only its own routes. OPA reads its key from a mounted file: OPA's API
   evaluates any query it receives, including one that reads its environment, so a bearer in
   the environment was readable by anyone who could reach OPA, and a file is not. OPA is also on
   a network shared only with its callers (Polaris, the broker, governance, the gate) and
   publishes no host port.
+- **Every access is logged before it reaches the person** (`PROVENANCE.md` 4.1). Governance's
+  `accesses` table holds one row per credential handed out and per table write: person,
+  Keycloak subject, login (`sid`), session, dataset, `files` or `table`, `read` or `write`,
+  time, credential expiry. The broker logs each credential after `AssumeRole` and before
+  returning it. The gate logs a read for any table response that carries a storage
+  credential (a load or a refresh from Polaris's credentials endpoint) and for a 304 to a
+  credentialed load, where the engine reuses a credential it already holds; it logs a write
+  before forwarding a create that is not staged, a commit, or a multi-table commit, so a
+  failed log stops the write before Polaris sees it. Each row is stamped with the session the
+  login points at when it is written (`logins`); a login's first row points it at the
+  person's most recently used session, or at a new `default` one. A token with no `sid`, which
+  is every service-account token, is one login per account. `governance.sessions` and
+  `governance.accessed` (the current session's reads) are served like the dataset index.
 - **Storage events carry a secret.** RGW adds the notification topic's opaque data, a shared
   secret, to every event it sends; `/events` refuses a delivery whose events lack it. The
   secret is not in the push URL, which governance's request log would record. A forged event
@@ -435,7 +452,8 @@ reference (the sections above are current-state).
 - Polaris maps an external token's `principal_name` onto the principal of the same name; the
   gate refuses tokens naming Polaris's own principals (`root`, `provisioner`).
 - Every decision reads governance: a governance outage denies every read, and table checks
-  are uncached.
+  are uncached. Every credential and every table write is also logged in governance first, so
+  an outage refuses those even where a decision would pass.
 - The dataset index's files live in governance's memory (a restart drops them; the next load rebuilds them).
 - Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
   token only over TLS; the container generates a self-signed keystore at each start), dev

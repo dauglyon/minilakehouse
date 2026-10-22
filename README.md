@@ -26,6 +26,7 @@ vending broker) — with a real **metadata-visibility plane** (see-but-not-read)
 - [Changing grants](#changing-grants)
 - [Changing groups](#changing-groups)
 - [Assigning roots](#assigning-roots)
+- [Sessions and the access log](#sessions-and-the-access-log)
 - [Security model](#security-model)
 - [Limitations](#limitations)
 
@@ -62,13 +63,13 @@ byte path.
 | Service | Role |
 |---|---|
 | **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. |
-| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (persistent RGW bucket notifications), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), builds and serves each person's dataset index table, and creates each person's Polaris account on first use. |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (persistent RGW bucket notifications), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), keeps the access log and each login's current session, builds and serves each person's tables in the `governance` namespace, and creates each person's Polaris account on first use. |
 | **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
-| **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. Answers for the dataset index table, `governance.datasets`, itself. |
+| **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. Has governance log every table credential it passes on and every table write it forwards, and refuses the request when that fails. Answers for the `governance` namespace's tables itself. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
 | **loginproxy** | Sits in front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client, holds the person's refresh token, and puts a fresh token on every forwarded request as the bearer and the `token` extra credential. |
-| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision: to read (get and list, on the dataset's `read`) or to write (put and delete, no get, on its `write`). |
+| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision: to read (get and list, on the dataset's `read`) or to write (put and delete, no get, on its `write`). Has governance log each credential before returning it. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
 | **postgres** | Polaris metastore **and** the durable `governance` registry database. |
 
@@ -369,6 +370,30 @@ PY
 #     bob tries to take projx/sub            : (403, None)
 #     alice takes both back                  : (200, []) (200, [])
 ```
+
+## Sessions and the access log
+
+Build step 1 of `PROVENANCE.md`. Governance logs every dataset credential handed to a person
+and every table write, stamped with the session the person's login points at, before the gate
+or the broker passes it on; when the log fails, the request is refused. A person's first
+access starts a session named `default`, and a new login continues the most recently used
+session. Naming and switching sessions, and declaring what an output was derived from, are
+not built yet.
+
+After alice's reads in Flow B and Flow C:
+
+```bash
+q alice --execute "SELECT * FROM iceberg.governance.sessions"
+#  -> "default","2026-10-22 23:21:58.824845 UTC","2026-10-22 23:21:59.143470 UTC","true"
+q alice --execute "SELECT dataset, kind, session FROM iceberg.governance.accessed"
+#  -> "lakehouse.db.t1","table","default"
+#     "projx/public","files","default"
+q bob --execute "SELECT count(*) FROM iceberg.governance.accessed"
+#  -> "0"     bob's refused read handed him no credential, so nothing is logged
+```
+
+`accessed` holds the current session's reads. A table someone writes to is also read: loading
+it to append hands out a credential that can read it.
 
 ## Security model
 

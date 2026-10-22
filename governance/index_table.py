@@ -1,14 +1,16 @@
 """
-index_table — the per-person dataset index, an Iceberg table whose files governance builds
-when they are asked for.
+index_table — the tables of the `governance` namespace, Iceberg tables whose files governance
+builds per person when they are asked for: `datasets` (every live dataset and table the
+person may see, decided by OPA), `sessions` (their sessions) and `accessed` (what their
+current session has read; PROVENANCE.md 5).
 
-The gate answers the catalog's load request for `<catalog>.governance.datasets` by calling
+The gate answers the catalog's load request for `<catalog>.governance.<table>` by calling
 governance's POST /index/load with the person's own token. Governance works out that person's
-rows (every live dataset and table they may see, decided by OPA), builds an Iceberg table
-holding them in memory under s3://governance-index/<subject>/<version>/, and returns its
-metadata with a short-lived storage credential bound to the person. The engine then reads the
-table's files from governance's S3-style endpoint (GET/HEAD /governance-index/<key>), which
-checks each request's SigV4 signature and serves a person only their own prefix.
+rows, builds an Iceberg table holding them in memory under
+s3://governance-index/<subject>/<table>/<version>/, and returns its metadata with a short-lived
+storage credential bound to the person. The engine then reads the table's files from
+governance's S3-style endpoint (GET/HEAD /governance-index/<key>), which checks each request's
+SigV4 signature and serves a person only their own prefix.
 
 Nothing is written to storage. The version is a hash of the rows, so a changed row set gets
 new file paths: a cache keyed by path can never return stale rows or someone else's.
@@ -29,23 +31,32 @@ import pyarrow as pa
 from pyiceberg.catalog.sql import SqlCatalog
 from pyiceberg.io import FileIO
 from pyiceberg.schema import Schema
-from pyiceberg.types import BooleanType, NestedField, StringType
+from pyiceberg.types import BooleanType, NestedField, StringType, TimestamptzType
 
 BUCKET = "governance-index"
-SCHEMA = Schema(
-    NestedField(1, "id", StringType(), required=False),
-    NestedField(2, "kind", StringType(), required=False),       # table | files
-    NestedField(3, "description", StringType(), required=False),
-    NestedField(4, "steward", StringType(), required=False),
-    NestedField(5, "can_read", BooleanType(), required=False),
-)
+
+
+def _schema(*columns):
+    return Schema(*(NestedField(i, name, typ(), required=False)
+                    for i, (name, typ) in enumerate(columns, start=1)))
+
+
+TABLES = {
+    "datasets": _schema(("id", StringType), ("kind", StringType),   # kind: table | files
+                        ("description", StringType), ("steward", StringType),
+                        ("can_read", BooleanType)),
+    "sessions": _schema(("name", StringType), ("started", TimestamptzType),
+                        ("last_used", TimestamptzType), ("current", BooleanType)),
+    "accessed": _schema(("dataset", StringType), ("kind", StringType), ("session", StringType),
+                        ("first_access", TimestamptzType), ("last_access", TimestamptzType)),
+}
 MAX_TABLES = 256          # built tables kept, least recently loaded evicted first
 CREDENTIAL_TTL = 900      # seconds a storage credential from /index/load stays valid
 CLOCK_SKEW = 900          # seconds a signed request's date may differ from now
 
 _lock = threading.Lock()
 _files = {}               # s3 path -> bytes, for every built table
-_tables = OrderedDict()   # (subject, version) -> {"metadata-location", "metadata"}
+_tables = OrderedDict()   # (subject, table, version) -> {"metadata-location", "metadata"}
 _keys = {}                # access key -> (secret, session token, subject, expires)
 
 
@@ -95,29 +106,30 @@ class MemIO(FileIO):
             _files.pop(getattr(location, "location", location), None)
 
 
-def build(subject, rows):
-    """The person's index table for these rows: its metadata location and metadata, built
-    once per (subject, row set) and kept until evicted."""
-    version = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()[:16]
-    key = (subject, version)
+def build(subject, name, rows):
+    """The person's table `name` (a key of TABLES) holding these rows: its metadata location
+    and metadata, built once per (subject, table, row set) and kept until evicted."""
+    version = hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    key = (subject, name, version)
     with _lock:
         if key in _tables:
             _tables.move_to_end(key)
             return _tables[key]
+    schema = TABLES[name]
     catalog = SqlCatalog("index", uri="sqlite:///:memory:", warehouse=f"s3://{BUCKET}",
                          **{"py-io-impl": f"{__name__}.MemIO"})
     catalog.create_namespace("governance")
-    table = catalog.create_table("governance.datasets", schema=SCHEMA,
-                                 location=f"s3://{BUCKET}/{subject}/{version}")
+    table = catalog.create_table(f"governance.{name}", schema=schema,
+                                 location=f"s3://{BUCKET}/{subject}/{name}/{version}")
     if rows:
-        table.append(pa.Table.from_pylist(rows, schema=SCHEMA.as_arrow()))
+        table.append(pa.Table.from_pylist(rows, schema=schema.as_arrow()))
     built = {"metadata-location": table.metadata_location,
              "metadata": json.loads(table.metadata.model_dump_json())}
     with _lock:
         _tables[key] = built
         while len(_tables) > MAX_TABLES:
-            (old_subject, old_version), _ = _tables.popitem(last=False)
-            prefix = f"s3://{BUCKET}/{old_subject}/{old_version}/"
+            (old_subject, old_name, old_version), _ = _tables.popitem(last=False)
+            prefix = f"s3://{BUCKET}/{old_subject}/{old_name}/{old_version}/"
             for path in [p for p in _files if p.startswith(prefix)]:
                 del _files[path]
     return built

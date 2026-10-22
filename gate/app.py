@@ -19,10 +19,15 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    must lie under one the person's group owns. It reports each table created or dropped to
    governance, which marks the entry live or gone. Registering and renaming tables are refused
    (root-only in Polaris too).
-6. The dataset index. The gate answers for one namespace itself, `governance`, holding one
-   read-only table, `datasets`: a load of it returns governance's per-person index
-   (governance/index_table.py), whose files governance serves. Polaris holds neither.
-7. Accounts. Polaris 1.5 refuses a token whose name has no stored principal, and logs the
+6. The governance namespace. The gate answers for one namespace itself, `governance`, holding
+   read-only tables: `datasets` (the dataset index), `sessions` and `accessed`. A load of one
+   returns governance's per-person table (governance/index_table.py), whose files governance
+   serves. Polaris holds neither.
+7. The access log (PROVENANCE.md 4.1). Before it passes on a response that hands out a table's
+   storage credential, a load or a credential refresh, the gate has governance log the read;
+   before it forwards a table create or commit, the write. When the log refuses or is
+   unreachable, the gate refuses the request.
+8. Accounts. Polaris 1.5 refuses a token whose name has no stored principal, and logs the
    token when it does. Before a person's first request reaches Polaris, the gate has
    governance create their principal (governance verifies the person's own token). A token
    naming one of Polaris's own principals is refused.
@@ -55,7 +60,7 @@ RESERVED = {"root", "provisioner"}  # Polaris's own principals
 DELEGATION = "x-iceberg-access-delegation"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
-INDEX_NS, INDEX_TABLE = "governance", "datasets"
+INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "accessed")
 # Hop-by-hop headers, and ones requests recomputes after decoding the body.
 DROP = {"host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authorization", "proxy-authenticate", "content-length", "content-encoding"}
@@ -71,19 +76,17 @@ _provisioned_lock = threading.Lock()
 
 
 def caller():
-    """The subject of the request's verified Keycloak token, or None."""
+    """The claims of the request's verified Keycloak token, or None."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
     try:
         token = auth[7:]
-        claims = jwt.decode(token, _jwks.get_signing_key_from_jwt(token).key, algorithms=["RS256"],
-                            issuer=KEYCLOAK_ISS, audience=AUDIENCE)
+        return jwt.decode(token, _jwks.get_signing_key_from_jwt(token).key, algorithms=["RS256"],
+                          issuer=KEYCLOAK_ISS, audience=AUDIENCE)
     except Exception as e:  # noqa: BLE001
         app.logger.info("token refused: %s", e)
         return None
-    # The claim Polaris names the principal by (polaris.oidc.principal-mapper).
-    return claims.get("principal_name")
 
 
 def ident(parts):
@@ -134,28 +137,28 @@ def may_view(subject, kind, catalog, levels, name):
 
 
 def index_answer(named, segments):
-    """The gate's own answer for the index namespace and its table, or None for any other
+    """The gate's own answer for the governance namespace and its tables, or None for any other
     path."""
     if not named or named[2] != [INDEX_NS]:
         return None
     kind, name = named[0], named[3]
-    if request.method == "HEAD" and (kind == "namespace" or (kind == "table" and name == INDEX_TABLE)):
+    if request.method == "HEAD" and (kind == "namespace" or (kind == "table" and name in INDEX_TABLES)):
         return "", 204
     if request.method == "GET" and kind == "namespace" and segments[-1] == INDEX_NS:
         return jsonify({"namespace": [INDEX_NS], "properties": {}})
     if request.method == "GET" and kind in ("tables", "views"):
-        ids = [{"namespace": [INDEX_NS], "name": INDEX_TABLE}] if kind == "tables" else []
+        ids = [{"namespace": [INDEX_NS], "name": t} for t in INDEX_TABLES] if kind == "tables" else []
         return jsonify({"identifiers": ids})
-    if kind == "table" and name == INDEX_TABLE:
-        if request.method == "GET" and segments[-1] == INDEX_TABLE:
-            r = _http.post(f"{GOVERNANCE}/index/load", timeout=60,
+    if kind == "table" and name in INDEX_TABLES:
+        if request.method == "GET" and segments[-1] == name:
+            r = _http.post(f"{GOVERNANCE}/index/load", timeout=60, json={"table": name},
                            headers={"Authorization": request.headers["Authorization"]})
             return relay(r)
         if request.method == "POST" and segments[-1] == "metrics":
             return "", 204
     if kind in ("table", "view"):
         return not_found(kind, named[2], name)
-    return forbidden("the governance namespace is the read-only dataset index")
+    return forbidden("the governance namespace holds read-only tables")
 
 
 def forbidden(message):
@@ -182,6 +185,55 @@ def creates(segments, body):
                 for c in body.get("table-changes") or []
                 if any(q.get("type") == "assert-create" for q in c.get("requirements") or [])], []
     return [], []
+
+
+def writes(segments, body):
+    """The table ids a POST commits to: a create that is not staged, a commit to one table
+    (completing a staged create included), or each table of a multi-table commit. A name with
+    no id is None."""
+    if segments[:3] != ["api", "catalog", "v1"] or len(segments) < 5:
+        return []
+    catalog, rest = segments[3], segments[4:]
+    if len(rest) == 3 and rest[0] == "namespaces" and rest[2] == "tables":
+        return [] if body.get("stage-create") else [ident([catalog, *rest[1].split(SEP), body.get("name") or ""])]
+    if len(rest) == 4 and rest[0] == "namespaces" and rest[2] == "tables":
+        return [ident([catalog, *rest[1].split(SEP), rest[3]])]
+    if rest == ["transactions", "commit"]:
+        return [ident([catalog, *(c.get("identifier") or {}).get("namespace", []),
+                       (c.get("identifier") or {}).get("name") or ""])
+                for c in body.get("table-changes") or []]
+    return []
+
+
+def vended(r):
+    """(whether this catalog response hands out a storage credential, its expiry in epoch ms or
+    None)."""
+    if r.status_code != 200:
+        return False, None
+    try:
+        body = r.json()
+    except ValueError:
+        return False, None
+    configs = [c.get("config") or {} for c in body.get("storage-credentials") or []]
+    configs += [body.get("config") or {}]
+    creds = [c for c in configs if "s3.access-key-id" in c]
+    if not creds and not body.get("storage-credentials"):
+        return False, None
+    expiry = next((c["s3.session-token-expires-at-ms"] for c in creds
+                   if str(c.get("s3.session-token-expires-at-ms", "")).isdigit()), None)
+    return True, int(expiry) if expiry is not None else None
+
+
+def log_access(claims, entries):
+    """Have governance log these accesses for the caller (PROVENANCE.md 4.1). Raises when the
+    log refuses or cannot be reached, and the request is then refused: an access that is not
+    logged would be missing from what the person's outputs may derive from."""
+    if any(e["dataset"] is None for e in entries):
+        raise requests.RequestException("an access to a name with no id cannot be logged")
+    _http.post(f"{GOVERNANCE_INTERNAL}/internal/accesses", timeout=5,
+               cert=(f"{PKI}/client.crt", f"{PKI}/client.key"), verify=f"{PKI}/ca.crt",
+               json={"person": claims["principal_name"], "sub": claims.get("sub") or "",
+                     "sid": claims.get("sid") or "", "entries": entries}).raise_for_status()
 
 
 def report(table_id, event, location=None):
@@ -290,7 +342,9 @@ def health():
 
 @app.route("/<path:_>", methods=["GET", "HEAD", "POST", "PUT", "DELETE"])
 def proxy(_):
-    subject = caller()
+    claims = caller() or {}
+    # The claim Polaris names the principal by (polaris.oidc.principal-mapper).
+    subject = claims.get("principal_name")
     if subject is None or subject in RESERVED:
         return jsonify({"error": {"message": "invalid or missing token",
                                   "type": "NotAuthorizedException", "code": 401}}), 401
@@ -323,7 +377,7 @@ def proxy(_):
         new_tables, new_namespaces = creates(segments, body) if request.method == "POST" else ([], [])
         for n in new_namespaces:
             if n is not None and n.split(".")[1:2] == [INDEX_NS]:
-                return forbidden("the governance namespace is the read-only dataset index")
+                return forbidden("the governance namespace holds read-only tables")
             if n is None or opa("allow_namespace", {"subject": subject, "id": n}) is not True:
                 return forbidden(f"none of your groups owns {n} or a namespace above it")
         for t in new_tables:
@@ -332,6 +386,10 @@ def proxy(_):
                     return not_found("namespace", named[2], None)
                 return forbidden(f"{t} is not registered for creation, or you are not in its write grant")
 
+        if request.method == "POST" and (written := writes(segments, body)):
+            log_access(claims, [{"dataset": t, "kind": "table", "mode": "write", "expires": None}
+                                for t in written])
+        delegated = any(k.lower() == DELEGATION for k in headers)
         r = forward(raw, headers)
         if r.ok:
             created = new_tables if not body.get("stage-create") else []
@@ -349,7 +407,15 @@ def proxy(_):
         if (r.status_code == 403 and request.method == "GET" and named and named[0] == "table"
                 and any(k.lower() == DELEGATION for k in headers)):
             app.logger.info("credential refused for %s; loading without one", raw)
+            delegated = False
             r = forward(raw, {k: v for k, v in headers.items() if k.lower() != DELEGATION})
+        if request.method == "GET" and named and named[0] == "table":
+            # A 304 to a credentialed load means the engine reuses the credential it was given
+            # with this table earlier, possibly in another session.
+            issued, expires = vended(r)
+            if issued or (r.status_code == 304 and delegated):
+                log_access(claims, [{"dataset": ident([named[1], *named[2], named[3]]),
+                                     "kind": "table", "mode": "read", "expires": expires}])
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.

@@ -2,12 +2,13 @@
 pki.py — one-shot: the certificates that let governance know its internal callers.
 
 Governance serves /internal/* on a TLS listener that accepts only client certificates from this
-CA: `opa` for the grant lookups, `gate` for its table create/drop reports. Each caller presents
+CA: `opa` for the grant lookups, `gate` for its table create/drop reports, and `gate` and
+`broker` for the access log (PROVENANCE.md 4.1). Each caller presents
 its certificate from files it mounts; a file, unlike OPA's environment, cannot be read back
 through OPA's query API.
 
 Each party gets its own volume: /pki/ca (the CA, this job only), /pki/governance (the server
-certificate), /pki/opa and /pki/gate (client certificates). Existing files are kept and a
+certificate), /pki/opa, /pki/gate and /pki/broker (client certificates). Existing files are kept and a
 missing certificate is added under the existing CA, so the job is safe to rerun.
 """
 import datetime
@@ -18,16 +19,18 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-CA_DIR, GOV_DIR, OPA_DIR, GATE_DIR = "/pki/ca", "/pki/governance", "/pki/opa", "/pki/gate"
+CA_DIR, GOV_DIR = "/pki/ca", "/pki/governance"
+OPA_DIR, GATE_DIR, BROKER_DIR = "/pki/opa", "/pki/gate", "/pki/broker"
 DAYS = 3650
-# Each private key is readable only by the user its container runs as: governance and the gate
-# run as root, the OPA image as OPA_UID.
+# Each private key is readable only by the user its container runs as: governance, the gate and
+# the broker run as root, the OPA image as OPA_UID.
 OPA_UID = int(os.environ.get("OPA_UID", "1000"))
 # directory: (file stem, certificate name, key usage, DNS names, key owner)
 PARTIES = {
     GOV_DIR: ("server", "governance", ExtendedKeyUsageOID.SERVER_AUTH, ["governance"], 0),
     OPA_DIR: ("client", "opa", ExtendedKeyUsageOID.CLIENT_AUTH, None, OPA_UID),
     GATE_DIR: ("client", "gate", ExtendedKeyUsageOID.CLIENT_AUTH, None, 0),
+    BROKER_DIR: ("client", "broker", ExtendedKeyUsageOID.CLIENT_AUTH, None, 0),
 }
 
 
