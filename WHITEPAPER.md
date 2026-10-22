@@ -231,7 +231,8 @@ tokens themselves; placing the gate in front of them is optional.
 
 Every caller of OPA sends the person's subject and groups and the ids it names, never
 grants; OPA fetches entries from governance. The entry lookup returns any dataset's grants,
-including datasets the person cannot see, so it is reachable only by OPA. An unknown id has
+including datasets the person cannot see, so it is reachable only by OPA, which governance
+knows by its TLS client certificate. An unknown id has
 no entry and is denied exactly as a dataset the person has no grant on. A dataset's folder is
 fixed at registration, as a table's is (set-location is root-only, section 8), so the folder
 in OPA's decision is the folder the grants were written for.
@@ -510,11 +511,10 @@ and forwarding a fresh token to Trino; OPA reachable only by its callers; storag
 listing.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files; `share` is only the right to change
-grants, since there are no derived datasets to widen; no derived datasets, no widenings; one token audience serves every service, and only Trino and Polaris
-check it; the entry lookup is closed by a shared bearer token rather than by caller
-identity; the periodic listing is
-authoritative and notifications are not persistent; the events endpoint is unauthenticated.
+with files; `share` is only the right to change grants, since there are no derived datasets
+to widen; no derived datasets, no widenings; one token audience serves every service, and
+only Trino and Polaris check it; the periodic listing is authoritative and notifications are
+not persistent; the events endpoint is unauthenticated.
 
 ## 14. Questions for the reviewer
 

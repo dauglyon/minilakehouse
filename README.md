@@ -378,9 +378,10 @@ PY
   username is the token's `principal_name` and impersonation is refused; the engine's own
   service account is granted nothing. Blobs: the broker verifies the user's **own** token (no
   engine in the byte path).
-- **Entry lookups are closed.** Governance's `/internal/*` returns grants for datasets a user
-  can't see, so it requires a bearer held only by OPA. OPA answers any query, including one
-  that reads that bearer, so only Polaris, the broker and governance can reach it.
+- **Entry lookups answer only OPA.** Governance's `/internal/*` returns grants for datasets a
+  user can't see, so it is served only on a TLS listener that requires OPA's client
+  certificate (`governance/pki.py`). OPA reads the key from a file, which, unlike its
+  environment, its query API cannot return; and only its callers can reach OPA at all.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`), prefix-
   scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further per
   request to one dataset prefix. No long-lived service holds an admin key: Polaris and the

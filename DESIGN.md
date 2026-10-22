@@ -279,11 +279,14 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 - **Token checks.** Trino and Polaris verify signature, issuer, expiry, and audience
   `polaris`. Governance and the broker verify signature, issuer, and expiry, and pin `azp` to
   the login client (so a token minted for another realm client can't be replayed).
-- **Grant lookups are closed.** `/internal/*` returns grants for datasets the user cannot
-  see, so it requires a bearer (`ENTRY_TOKEN`) held only by OPA. OPA's API evaluates any
-  query it receives, including one that reads `ENTRY_TOKEN` from its environment, so OPA is
-  on a network shared only with its callers (Polaris, the broker, governance) and publishes
-  no host port.
+- **Grant lookups answer only OPA.** `/internal/*` returns grants for datasets the user cannot
+  see, so governance serves it only on a TLS listener (port 8443) that requires a client
+  certificate from the internal CA with the name `opa` (`governance/pki.py` makes the CA and
+  both certificates, each on its own volume). OPA reads its key from a mounted file: OPA's API
+  evaluates any query it receives, including one that reads its environment, so a bearer in
+  the environment was readable by anyone who could reach OPA, and a file is not. OPA is also on
+  a network shared only with its callers (Polaris, the broker, governance, the gate) and
+  publishes no host port.
 - **Least privilege on every credential.** STS roles use specific actions (no `s3:*`),
   prefix-scoped (`warehouse/` for tables, `datasets/` for blobs); the broker narrows further
   per request. No long-lived service holds an admin key: Polaris authenticates as

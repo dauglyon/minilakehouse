@@ -6,11 +6,13 @@ package lakehouse.governance
 # they name.
 #
 # The result is the response body, or undefined on any failure (raise_error=false turns a
-# transport error into a status code), so a rule that depends on it denies.
+# transport error into a status code), so a rule that depends on it denies. Governance serves
+# these lookups only to OPA's client certificate (governance/pki.py), read from files: unlike an
+# environment variable, a file cannot be read back through OPA's query API.
 
 import future.keywords.if
 
-get(path) := _send({"method": "GET", "url": _url(path), "headers": _auth})
+get(path) := _send({"method": "GET", "url": _url(path)})
 
 # The groups a person (subject or Polaris principal name) belongs to.
 groups(subject) := get(concat("/", ["/internal/groups", urlquery.encode(subject)])).groups
@@ -18,14 +20,18 @@ groups(subject) := get(concat("/", ["/internal/groups", urlquery.encode(subject)
 # http.send serializes `body` as JSON but sets no Content-Type; governance needs it to parse.
 post(path, body) := _send({
 	"method": "POST", "url": _url(path), "body": body,
-	"headers": object.union(_auth, {"Content-Type": "application/json"}),
+	"headers": {"Content-Type": "application/json"},
 })
 
 _url(path) := concat("", [opa.runtime().env.GOVERNANCE_URL, path])
 
-_auth := {"Authorization": concat(" ", ["Bearer", opa.runtime().env.ENTRY_TOKEN])}
 
 _send(req) := resp.body if {
-	resp := http.send(object.union(req, {"timeout": "2s", "raise_error": false}))
+	resp := http.send(object.union(req, {
+		"timeout": "2s", "raise_error": false,
+		"tls_ca_cert_file": "/pki/ca.crt",
+		"tls_client_cert_file": "/pki/client.crt",
+		"tls_client_key_file": "/pki/client.key",
+	}))
 	resp.status_code == 200
 }

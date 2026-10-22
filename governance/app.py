@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import ssl
 import threading
 import time
 from contextlib import contextmanager
@@ -43,9 +44,11 @@ OPA_BASE = os.environ.get("OPA_BASE", "http://opa:8181")
 DB_DSN = os.environ["GOVERNANCE_DB_DSN"]
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
-# Bearer OPA presents to /internal/*. Those return any entry's grants, including datasets the
-# person can't see, so they are closed to everyone else.
-ENTRY_TOKEN = os.environ["ENTRY_TOKEN"]
+# The grant lookups OPA's rules make (/internal/*) return any entry's grants, including
+# datasets the person can't see, so they are served only on INTERNAL_PORT, a TLS listener that
+# requires OPA's client certificate (pki.py).
+INTERNAL_PORT = int(os.environ.get("INTERNAL_PORT", "8443"))
+PKI_DIR = os.environ.get("PKI_DIR", "/pki")
 # Bearer the gate presents when it reports a table created or dropped through Polaris.
 LIFECYCLE_TOKEN = os.environ["LIFECYCLE_TOKEN"]
 # Polaris refuses a token whose name has no stored principal (released Polaris has no other
@@ -296,11 +299,26 @@ def opa(rule, inp, package="blob"):
     return r.json().get("result")
 
 
-def internal_caller():
-    """None if the request carries ENTRY_TOKEN, else the 401 to return."""
-    if hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {ENTRY_TOKEN}"):
-        return None
-    return jsonify({"error": "unauthorized"}), 401
+internal_app = Flask("internal")
+
+
+@internal_app.before_request
+def only_opa():
+    # The listener already requires a certificate from the internal CA; that CA also signs
+    # governance's own server certificate, so the name is checked too.
+    sock = request.environ.get("werkzeug.socket")
+    cert = sock.getpeercert() if sock is not None and hasattr(sock, "getpeercert") else None
+    names = [v for rdn in (cert or {}).get("subject", ()) for k, v in rdn if k == "commonName"]
+    if names != ["opa"]:
+        return jsonify({"error": "unauthorized"}), 401
+    return None
+
+
+def internal_server():
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=f"{PKI_DIR}/ca.crt")
+    ctx.load_cert_chain(f"{PKI_DIR}/server.crt", f"{PKI_DIR}/server.key")
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return make_server("0.0.0.0", INTERNAL_PORT, internal_app, threaded=True, ssl_context=ctx)
 
 
 def _confined_prefix(prefix):
@@ -379,14 +397,12 @@ def health():
     return jsonify({"ok": True})
 
 
-# Grant lookups for OPA's rules (opa/governance.rego), behind ENTRY_TOKEN.
+# Grant lookups for OPA's rules (opa/governance.rego), on the internal listener only.
 
 
-@app.post("/internal/datasets")
+@internal_app.post("/internal/datasets")
 def internal_datasets():
     # {id: entry} for the named ids that exist; an unknown id is simply absent.
-    if err := internal_caller():
-        return err
     ids = (request.get_json(silent=True) or {}).get("ids")
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
@@ -397,29 +413,23 @@ def internal_datasets():
     return jsonify({"entries": {r["id"]: _entry(r) for r in rows}})
 
 
-@app.get("/internal/register-grants")
+@internal_app.get("/internal/register-grants")
 def internal_register_grants():
-    if err := internal_caller():
-        return err
     with db() as cur:
         cur.execute("SELECT grp, prefixes FROM register_grants")
         rows = cur.fetchall()
     return jsonify({r["grp"]: r["prefixes"] for r in rows})
 
 
-@app.get("/internal/groups/<subject>")
+@internal_app.get("/internal/groups/<subject>")
 def internal_groups(subject):
-    if err := internal_caller():
-        return err
     with db() as cur:
         cur.execute("SELECT grp FROM group_members WHERE member = %s ORDER BY grp", (subject,))
         return jsonify({"groups": [r["grp"] for r in cur.fetchall()]})
 
 
-@app.get("/internal/group-owners/<grp>")
+@internal_app.get("/internal/group-owners/<grp>")
 def internal_group_owners(grp):
-    if err := internal_caller():
-        return err
     with db() as cur:
         cur.execute("SELECT owner FROM group_owners WHERE grp = %s ORDER BY owner", (grp,))
         return jsonify({"owners": [r["owner"] for r in cur.fetchall()]})
@@ -435,21 +445,17 @@ def _ids_from_body():
     return ids
 
 
-@app.get("/internal/tables/<table_id>")
+@internal_app.get("/internal/tables/<table_id>")
 def internal_table(table_id):
     # A table's grants, as sets of groups; an unregistered table is 404, so its rules deny.
-    if err := internal_caller():
-        return err
     with db() as cur:
         cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = %s", (table_id,))
         row = cur.fetchone()
     return (jsonify(row), 200) if row else (jsonify({"error": "not found"}), 404)
 
 
-@app.post("/internal/tables")
+@internal_app.post("/internal/tables")
 def internal_tables():
-    if err := internal_caller():
-        return err
     if (ids := _ids_from_body()) is None:
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
@@ -457,14 +463,12 @@ def internal_tables():
         return jsonify({"entries": {r["id"]: r for r in cur.fetchall()}})
 
 
-@app.post("/internal/namespaces")
+@internal_app.post("/internal/namespaces")
 def internal_namespaces():
     # {id: {id, owners: [group], viewers: [group]}}. Owners own the namespace or one above it;
     # viewers hold see, read or write on some table at any depth under it (`lakehouse.db`
     # covers `lakehouse.db.t1` and `lakehouse.db.x.t2`). Ids are compared with starts_with,
     # not LIKE, so "_" and "%" in a name are plain characters.
-    if err := internal_caller():
-        return err
     if (ids := _ids_from_body()) is None:
         return jsonify({"error": "ids must be a list of strings"}), 400
     entries = {}
@@ -926,6 +930,7 @@ if __name__ == "__main__":
     threading.Thread(target=reconcile_loop, daemon=True).start()
     threading.Thread(target=make_server("0.0.0.0", INDEX_PORT, index_app, threaded=True).serve_forever,
                      daemon=True).start()
+    threading.Thread(target=internal_server().serve_forever, daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
     # owns a connection pool and a single reconcile timer thread.
     app.run(host="0.0.0.0", port=8000, use_reloader=False)

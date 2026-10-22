@@ -93,11 +93,12 @@ services:
         condition: service_completed_successfully
       rgw-setup:
         condition: service_completed_successfully
+      pki:
+        condition: service_completed_successfully
     environment:
       REGISTRY: /app/registry.json
       OPA_BASE: http://opa:8181
       GOVERNANCE_DB_DSN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/governance
-      ENTRY_TOKEN: ${ENTRY_TOKEN}   # bearer OPA must present to /internal/*
       LIFECYCLE_TOKEN: ${LIFECYCLE_TOKEN}   # bearer the gate presents to report table creates/drops
       # Creating each person's Polaris principal on first use (POST /principals/me).
       POLARIS_URL: http://polaris:8181
@@ -113,6 +114,8 @@ services:
       S3_BUCKET: ${S3_BUCKET}
     volumes:
       - ./seed:/seed:ro   # for the register-at-ingest demo (seed/ingest-demo.py)
+      # Server certificate for the grant-lookup listener (port 8443), which accepts only OPA.
+      - pki_governance:/pki:ro
     networks:
       # Serves the dataset index's files on port 8080 by bucket-in-hostname addressing
       # (governance/index_table.py).
@@ -128,21 +131,37 @@ services:
     # Policy only, from the mount. OPA holds no grants: its rules fetch them from governance
     # per decision (opa/governance.rego).
     command: ["run", "--server", "--addr=0.0.0.0:8181", "--log-level=debug", "/policies"]
+    depends_on:
+      pki:
+        condition: service_completed_successfully
     environment:
       # Read by opa/governance.rego through opa.runtime().env.
-      GOVERNANCE_URL: http://governance:8000
-      ENTRY_TOKEN: ${ENTRY_TOKEN}
+      GOVERNANCE_URL: https://governance:8443
     volumes:
       - ./opa:/policies:ro
-    # OPA's API answers anyone who reaches it: any query, including ENTRY_TOKEN from its
-    # environment and every grant through governance. So it sits only on `policy`, with
-    # its callers (polaris, broker, governance, gate), and publishes no host port.
+      # OPA's client certificate for governance's grant lookups. Files, not environment
+      # variables: OPA's query API can read its environment but not its files.
+      - pki_opa:/pki:ro
+    # OPA's API answers anyone who reaches it: any query, including its environment and every
+    # grant through governance. So it sits only on `policy`, with its callers (polaris,
+    # broker, governance, gate), and publishes no host port.
     networks: [policy]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:8181/health"]
       interval: 5s
       timeout: 3s
       retries: 20
+
+  pki:
+    # One-shot: a dev CA, governance's server certificate and OPA's client certificate, each
+    # on its own volume (governance/pki.py). Keeps existing files on a rerun.
+    build: ./governance
+    entrypoint: ["python", "/app/pki.py"]
+    network_mode: none
+    volumes:
+      - pki_ca:/pki/ca
+      - pki_governance:/pki/governance
+      - pki_opa:/pki/opa
 
   broker:
     # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
@@ -437,3 +456,6 @@ networks:
 volumes:
   postgres_data:
   ceph_data:
+  pki_ca:
+  pki_governance:
+  pki_opa:
