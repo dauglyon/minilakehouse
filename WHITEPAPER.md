@@ -492,28 +492,31 @@ their owners delegate below them; `read` implies `see`.
 
 ## 13. Status against the repository
 
-Implemented today: the catalog with `see`, `read` and `share` for file datasets; the file listing;
-the dataset index as a per-person table, `governance.datasets`, listing both kinds;
+Implemented today: the catalog with `see`, `read` and `share` for file datasets; the file
+listing; the dataset index as a per-person table, `governance.datasets`, listing both kinds;
 the broker, scoping credentials to the folder in OPA's decision; Polaris delegating to OPA
 with per-table credentials, viewing a table gated on `see` or `read` and read-write
-credentials on `write`, drops on `delete`; registration gated by `stewards` and root ownership; OPA holding
-policy and no grants, every rule fetching what it needs from governance with `http.send`; Trino
-authenticating people by their Keycloak token over HTTPS and forwarding it to Polaris as the
-`token` extra credential; the gate as the only way to Polaris, verifying the token, trimming
-listings (every upstream page, one filter, its own page tokens), answering not-found for a
-refused name the person may not view, and repeating a refused credentialed load without the
-credential request, deciding table and namespace creation, and reporting table creates and
-drops; tables registered as entries with `see`, `read`, `share`, `write` and `delete` by
-group; `write` for file datasets, a broker credential that puts and deletes in the folder; grant changes through governance, decided by OPA under the entry's row lock as in 4.4;
-group membership and owners, and root ownership, in governance, changed through it as in 4.4; each person's Polaris principal created on first use; a login
-proxy that keeps a client session past the token's 5-minute life by holding the refresh token
-and forwarding a fresh token to Trino; OPA reachable only by its callers; storage events plus a periodic
-listing.
+credentials on `write`, drops on `delete`; registration gated by `stewards` and root
+ownership; OPA holding policy and no grants, every rule fetching what it needs from
+governance with `http.send`; Trino authenticating people by their Keycloak token over HTTPS
+and forwarding it to Polaris as the `token` extra credential; the gate as the only way to
+Polaris, verifying the token, trimming listings (every upstream page, one filter, its own
+page tokens), answering not-found for a refused name the person may not view, and repeating
+a refused credentialed load without the credential request, deciding table and namespace
+creation, and reporting table creates and drops; tables registered as entries with `see`,
+`read`, `share`, `write` and `delete` by group; `write` for file datasets, a broker
+credential that puts and deletes in the folder; grant changes through governance, decided by
+OPA under the entry's row lock as in 4.4; group membership and owners, and root ownership,
+in governance, changed through it as in 4.4; each person's Polaris principal created on
+first use; a login proxy that keeps a client session past the token's 5-minute life by
+holding the refresh token and forwarding a fresh token to Trino; OPA reachable only by its
+callers; persistent storage events, each checking one folder with a listing capped at one
+object, and no sweep.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
 with files; `share` is only the right to change grants, since there are no derived datasets
-to widen; no derived datasets, no widenings; the periodic listing is authoritative and
-notifications are not persistent; the events endpoint is unauthenticated.
+to widen; no derived datasets, no widenings; events are checked as each delivery arrives
+rather than coalesced per folder; the events endpoint is unauthenticated.
 
 ## 14. Questions for the reviewer
 

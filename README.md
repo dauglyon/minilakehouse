@@ -62,7 +62,7 @@ byte path.
 | Service | Role |
 |---|---|
 | **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. |
-| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), builds and serves each person's dataset index table, and creates each person's Polaris account on first use. |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (persistent RGW bucket notifications), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), builds and serves each person's dataset index table, and creates each person's Polaris account on first use. |
 | **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. Answers for the dataset index table, `governance.datasets`, itself. |
@@ -223,12 +223,14 @@ denied one.
 
 The registry is the **mutable single source of truth**, so it lives in a real datastore (a
 `governance` Postgres database) and is kept **honest against storage**. Two truths, reconciled
-not merged: storage owns *existence/stats*, the registry owns *meaning/grants*.
+not merged: storage owns *existence*, the registry owns *meaning/grants*.
 
-- **Freshness.** `reconcile()` lists a dataset's prefix and sets `status`: non-empty → `live`;
-  emptied-after-being-live → `gone`. The dataset index lists only `live` datasets. It runs on a
-  timer (convergence) **and** is triggered by RGW bucket notifications (near-real-time); a
-  missed event self-heals on the next sweep.
+- **Freshness.** Each object created or deleted under a dataset's folder makes RGW notify
+  governance, which checks that one folder (a listing capped at one object) and sets `status`:
+  non-empty → `live`; emptied-after-being-live → `gone`. The dataset index lists only `live`
+  datasets. The notification topic is persistent: RGW queues each event and retries it until
+  governance accepts it, so an event sent while governance is down arrives once it is back.
+  There is no periodic sweep.
 - **Register-at-ingest.** A *new* dataset is born through a governed write path that registers
   it **with its meaning** (prefix, description, grants — only a human can supply these; the id
   derives from the prefix). Authenticated by the caller's own token, **authorized by OPA**: the
@@ -265,7 +267,7 @@ PY
 #     register under datasets/projw/ (not owned): 403
 ```
 
-Delete `projz`'s objects and within a tick it flips to `gone` and leaves the index; re-add one
+Delete `projz`'s objects and it flips to `gone` and leaves the index; re-add one
 and it returns `live`. `bob` (not a steward) is denied registration entirely.
 
 Because an id is the prefix's tenant slice, two stewards in different groups can each register

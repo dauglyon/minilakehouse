@@ -188,15 +188,20 @@ grant sets `visibility` / `access`.
 
 A registry beside storage drifts, so it is reconciled against storage continuously:
 
-- **Two truths, reconciled not merged.** Storage is truth for *existence/stats*; the registry
-  is truth for *meaning/grants*. A `datasets` row carries both, written by disjoint paths —
-  meaning/grants by ingest+seed, existence/stats by `reconcile()` only.
-- **Lifecycle `pending → live → gone`.** `reconcile()` lists a dataset's prefix and sets
-  `status`: non-empty → `live`; emptied-after-being-live → `gone`; a never-populated dataset
-  stays `pending`. The dataset index lists only `live` datasets.
-- **One reconcile path, two triggers.** A periodic timer (convergence) and RGW bucket
-  notifications (near-real-time). Events carry no authority — they only *trigger* a reconcile,
-  which reads storage truth itself, so a missed or forged event self-heals on the next sweep.
+- **Two truths, reconciled not merged.** Storage is truth for *existence*; the registry is
+  truth for *meaning/grants*. A `datasets` row carries both, written by disjoint paths —
+  meaning/grants by ingest+seed, `status` by `reconcile()` only.
+- **Lifecycle `pending → live → gone`.** `reconcile()` lists a dataset's prefix, at most one
+  object, and sets `status`: non-empty → `live`; emptied-after-being-live → `gone`; a
+  never-populated dataset stays `pending`. The dataset index lists only `live` datasets.
+- **Events are the only trigger, and they are persistent.** RGW notifies governance of each
+  object created or deleted under `datasets/`; governance checks the dataset the key falls
+  under. The topic is persistent (`rgw_setup.py`): RGW queues each event in RADOS and retries
+  it, with no expiry or retry limit by default, until governance answers 2xx, and governance
+  answers 503 when a check fails, so an event is never dropped for governance being down or
+  storage being slow. There is no periodic sweep. Events carry no authority — they only
+  trigger a check, which reads storage itself, so a forged event can only cause a check.
+  Registration, and the first seed, check a new dataset's folder once.
 - **Register-at-ingest** brings *new* datasets in: a steward uploads objects, then registers
   the dataset with its meaning (prefix, description, grants — only a human can supply these;
   its id derives from the prefix). There is no auto-discovery of datasets from raw storage: a
@@ -270,8 +275,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   took 2.39 s offering OPA every entry and 0.25 s narrowed. `seed/check-index-narrowing.py`
   compares the narrowed rows with OPA's decision over every entry for every person in a group;
   a rule that makes an entry visible by anything other than those grants must change the
-  narrowing query too. The gate's table listings and the periodic re-listing of every dataset
-  folder still grow with the whole catalog.
+  narrowing query too. The gate's table listings still grow with the whole catalog.
 - **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
   a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
   changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`):
@@ -366,7 +370,7 @@ reference (the sections above are current-state).
   dedicated `governance` database (created idempotently at runtime by a bootstrap one-shot —
   there are no init scripts and the volume persists across `down`). Reconcile's status
   transition is a single atomic `UPDATE` under a row lock (no read-modify-write race between
-  the timer, events, and register); the seed and register paths use advisory locks.
+  concurrent events and register); the seed and register paths use advisory locks.
 - **RGW notifications on this image.** Ceph 20.2.1 supports them, but the image's `ceph.conf`
   narrows the enabled APIs and drops `notifications`; the entrypoint re-adds it. Topics are
   created via the SNS/S3 API (boto3) — `radosgw-admin` has no `topic create`.

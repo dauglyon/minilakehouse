@@ -7,9 +7,9 @@ included, sends OPA only who is asking and what they name; OPA's rules fetch the
 need from the /internal/* lookups here, at decision time. Durable state lives in a dedicated
 `governance` Postgres DB.
 
-Two truths, reconciled not merged: storage is truth for existence/stats; the registry is
-truth for meaning/grants. The `datasets` row carries both, written by disjoint paths —
-meaning/grants by ingest+seed, existence/stats by reconcile. Entries served to OPA carry
+Two truths, reconciled not merged: storage is truth for existence; the registry is truth for
+meaning/grants. The `datasets` row carries both, written by disjoint paths — meaning/grants by
+ingest+seed, existence (status) by reconcile. Entries served to OPA carry
 meaning/grants only, so storage churn never changes a decision.
 
 Two permission planes per dataset, as separate grant sets: visibility (may you SEE it
@@ -96,13 +96,12 @@ INDEX_PORT = int(os.environ.get("INDEX_PORT", "8080"))
 RGW_KEY = os.environ.get("RGW_ACCESS_KEY", "")
 RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
-RECONCILE_INTERVAL = int(os.environ.get("RECONCILE_INTERVAL", "30"))
-MAX_EVENT_RECORDS = 1000  # cap the per-request reconcile fan-out (the endpoint is unauthenticated)
+MAX_EVENT_RECORDS = 1000  # refuse larger deliveries: the endpoint is unauthenticated
 SEED_LOCK_KEY = 0x6D6C68      # arbitrary fixed key: serialize the one-time registry seed
 REGISTER_LOCK_KEY = 0x6D6C72  # arbitrary fixed key: serialize register-at-ingest
 ROOTS_LOCK_KEY = 0x6D6C6F     # arbitrary fixed key: serialize changes to root ownership
-# Short timeouts: storage calls are best-effort; the periodic reconcile timer is the
-# authority and self-heals, so governance must never hang/crash on RGW being slow/absent.
+# Short timeouts: a slow or absent RGW fails the check quickly, and the event that triggered it
+# is delivered again (persistent topic), so governance never hangs on storage.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
                    retries={"max_attempts": 2})
 # One reusable client/session each (thread-safe), instead of rebuilding per reconcile/poll.
@@ -124,9 +123,6 @@ CREATE TABLE IF NOT EXISTS datasets (
     share           TEXT[] NOT NULL DEFAULT '{}',
     write           TEXT[] NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
-    object_count    BIGINT NOT NULL DEFAULT 0,
-    total_bytes     BIGINT NOT NULL DEFAULT 0,
-    last_modified   TIMESTAMPTZ,
     last_reconciled TIMESTAMPTZ
 );
 CREATE TABLE IF NOT EXISTS group_members (
@@ -164,6 +160,10 @@ ALTER TABLE datasets ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}'
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS write TEXT[] NOT NULL DEFAULT '{}';
 -- The dataset index narrows its candidates to entries whose viewing grants name one of the
 -- person's groups (_index_rows); these keep that query proportional to the matches.
+-- Object count, bytes and last-modified were recorded by a periodic full listing and read by
+-- nothing; status needs only whether a folder is empty.
+ALTER TABLE datasets DROP COLUMN IF EXISTS object_count, DROP COLUMN IF EXISTS total_bytes,
+    DROP COLUMN IF EXISTS last_modified;
 CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((visibility || access));
 CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((see || read || write));
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
@@ -198,8 +198,8 @@ def connect_pool(retries=30, delay=1):
 
 @contextmanager
 def db(commit=False):
-    """A pooled connection + RealDict cursor. Per-operation, thread-safe (request threads and
-    the reconcile timer all borrow from the pool); the gate bounds concurrency to the pool."""
+    """A pooled connection + RealDict cursor. Per-operation, thread-safe (every request thread
+    borrows from the pool); the gate bounds concurrency to the pool."""
     with _db_gate:
         conn = _pool.getconn()
         try:
@@ -214,8 +214,9 @@ def db(commit=False):
 
 
 def init_db():
-    """Create the schema, and seed from registry.json once (when datasets is empty).
-    registry.json is now a one-time fixture; Postgres is the source of truth thereafter."""
+    """Create the schema, and seed from registry.json once (when datasets is empty); returns
+    the ids of datasets seeded now. registry.json is a one-time fixture; Postgres is the
+    source of truth thereafter."""
     with db(commit=True) as cur:
         cur.execute(SCHEMA)
     with db(commit=True) as cur:
@@ -223,7 +224,7 @@ def init_db():
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (SEED_LOCK_KEY,))
         cur.execute("SELECT count(*) AS n FROM datasets")
         if cur.fetchone()["n"]:
-            return
+            return []
         with open(REGISTRY_PATH) as f:
             reg = json.load(f)
         for d in reg.get("datasets", []):
@@ -263,6 +264,7 @@ def init_db():
             cur.execute("INSERT INTO register_grants (grp, prefixes) VALUES (%s, %s) "
                         "ON CONFLICT (grp) DO NOTHING", (grp, roots))
         app.logger.info("seeded governance registry from %s", REGISTRY_PATH)
+        return [derive_id(d["prefix"]) for d in reg.get("datasets", [])]
 
 
 def _entry(row):
@@ -336,66 +338,43 @@ def _confined_prefix(prefix):
 
 
 # Lifecycle, expressed in SQL so the status transition reads `status` at write time under
-# the row lock — no read-modify-write window where a concurrent reconcile (timer vs event)
-# loses the update or resurrects a gone dataset. Non-empty => live; empty => gone ONLY if it
-# was live (was-populated-now-empty), else unchanged (pending stays pending, gone stays gone).
+# the row lock — no read-modify-write window where two concurrent checks of one dataset (two
+# events) lose the update or resurrect a gone dataset. Non-empty => live; empty => gone ONLY if
+# it was live (was-populated-now-empty), else unchanged (pending stays pending, gone stays gone).
 _RECONCILE_SQL = """
 WITH prev AS (SELECT status AS old FROM datasets WHERE id = %(n)s FOR UPDATE)
 UPDATE datasets d SET
-    status = CASE WHEN %(c)s > 0 THEN 'live'
+    status = CASE WHEN %(nonempty)s THEN 'live'
                   WHEN d.status = 'live' THEN 'gone'
                   ELSE d.status END,
-    object_count = %(c)s, total_bytes = %(t)s,
-    last_modified = %(m)s, last_reconciled = now()
+    last_reconciled = now()
 FROM prev WHERE d.id = %(n)s
 RETURNING prev.old AS old, d.status AS new
 """
 
 
-def _stat_prefix(prefix):
-    """List a dataset's prefix; stats come straight from the listing (no GetObject)."""
-    count, total, last = 0, 0, None
-    for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for o in page.get("Contents", []):
-            count += 1
-            total += o["Size"]
-            if last is None or o["LastModified"] > last:
-                last = o["LastModified"]
-    return count, total, last
+def _nonempty(prefix):
+    """Whether any object exists under the prefix: a listing capped at one object."""
+    return _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1).get("KeyCount", 0) > 0
 
 
-def reconcile(ds_id=None):
-    """The ONLY writer of the existence/stats columns. With `ds_id`: just that dataset (the
-    event path). Without: a full sweep (the timer). Storage is the truth here; the registry
-    grants are untouched, so reconcile never moves OPA."""
+def reconcile(ds_id):
+    """The ONLY writer of `status`: set one dataset live or gone from whether its folder holds
+    anything. Storage is the truth here; grants are untouched, so reconcile never moves OPA.
+    There is no periodic sweep: each bucket notification triggers this for the dataset it
+    names, and the notification topic is persistent (rgw_setup.py), so a check that fails here
+    raises and the event is delivered again."""
     with db() as cur:
-        # ds_id=None => full sweep (NULL IS NULL matches every row); else just that dataset.
-        cur.execute("SELECT id, prefix FROM datasets WHERE (%s IS NULL OR id = %s)",
-                    (ds_id, ds_id))
-        rows = cur.fetchall()
-    for row in rows:
-        try:
-            count, total, last = _stat_prefix(row["prefix"])
-        except Exception as e:  # noqa: BLE001
-            app.logger.warning("reconcile %s: list failed: %s", row["id"], e)
-            continue
-        with db(commit=True) as cur:
-            cur.execute(_RECONCILE_SQL, {"n": row["id"], "c": count, "t": total, "m": last})
-            r = cur.fetchone()
-        if r and r["old"] != r["new"]:
-            app.logger.info("reconcile %s: %s -> %s (count=%s)",
-                            row["id"], r["old"], r["new"], count)
-
-
-def reconcile_loop():
-    """Periodic full sweep — convergence. Catches anything events missed (events are a
-    latency optimization, not the authority)."""
-    while True:
-        time.sleep(RECONCILE_INTERVAL)
-        try:
-            reconcile()
-        except Exception as e:  # noqa: BLE001
-            app.logger.warning("reconcile sweep failed: %s", e)
+        cur.execute("SELECT prefix FROM datasets WHERE id = %s", (ds_id,))
+        row = cur.fetchone()
+    if row is None:
+        return
+    nonempty = _nonempty(row["prefix"])
+    with db(commit=True) as cur:
+        cur.execute(_RECONCILE_SQL, {"n": ds_id, "nonempty": nonempty})
+        r = cur.fetchone()
+    if r and r["old"] != r["new"]:
+        app.logger.info("reconcile %s: %s -> %s", ds_id, r["old"], r["new"])
 
 
 @app.get("/health")
@@ -516,14 +495,14 @@ def table_events():
 
 @app.post("/events")
 def events():
-    # RGW bucket-notification sink. Events carry NO authority — they only TRIGGER a
-    # reconcile, which reads storage truth itself; a missed/forged event is harmless and
-    # self-heals on the next timer sweep. Unauthenticated by design (trusted-network dev).
+    # RGW bucket-notification sink. Events carry NO authority — they only TRIGGER a check of
+    # the dataset a key falls under, which reads storage truth itself, so a forged event can only
+    # cause a check. Any answer but 2xx makes RGW deliver the event again (persistent topic).
+    # Unauthenticated by design (trusted-network dev).
     body = request.get_json(silent=True) or {}
     records = body.get("Records", [])
-    if len(records) > MAX_EVENT_RECORDS:  # bound the fan-out; the timer reconcile covers the rest
-        app.logger.warning("/events: truncating %d records to %d", len(records), MAX_EVENT_RECORDS)
-        records = records[:MAX_EVENT_RECORDS]
+    if len(records) > MAX_EVENT_RECORDS:
+        return jsonify({"error": f"at most {MAX_EVENT_RECORDS} records per delivery"}), 413
     with db() as cur:  # the registry once, not once per record
         cur.execute("SELECT id, prefix FROM datasets")
         registry = [(r["id"], r["prefix"]) for r in cur.fetchall()]
@@ -537,8 +516,12 @@ def events():
             touched.add(match[0])
         else:
             app.logger.info("EVENT key=%s is ungoverned (no registered dataset)", key)
-    for ds in touched:
-        reconcile(ds)
+    try:
+        for ds in touched:
+            reconcile(ds)
+    except Exception as e:  # noqa: BLE001 — RGW redelivers on a non-2xx answer
+        app.logger.warning("/events: check failed, asking RGW to redeliver: %s", e)
+        return jsonify({"error": "check failed"}), 503
     return jsonify({"ok": True, "received": len(records), "reconciled": sorted(touched)})
 
 
@@ -581,13 +564,13 @@ def register_dataset():
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset unavailable"}), 409
 
-    # The dataset is registered; classify it now (pending->live if its bytes already exist) so
-    # callers see it immediately. Best-effort: a slow/absent RGW must not fail a committed
-    # registration — the periodic timer will classify it regardless.
+    # The dataset is registered; check its folder once (pending->live if its bytes already
+    # exist) so callers see it immediately. Best-effort: a slow/absent RGW must not fail a
+    # committed registration, and the next object written under it triggers the check again.
     try:
         reconcile(ds_id)
     except Exception as e:  # noqa: BLE001
-        app.logger.warning("post-register reconcile failed (timer will classify %s): %s", ds_id, e)
+        app.logger.warning("post-register check of %s failed: %s", ds_id, e)
     app.logger.info("REGISTER subject=%s id=%s prefix=%s", subject, ds_id, prefix)
     return jsonify({"ok": True, "id": ds_id, "registered_by": subject}), 201
 
@@ -941,15 +924,14 @@ def index_object(key):
 
 if __name__ == "__main__":
     connect_pool()
-    init_db()
-    try:
-        reconcile()           # startup sweep: classify seeded datasets (pending -> live/gone)
-    except Exception as e:    # noqa: BLE001 — RGW trouble must not abort boot; the timer retries
-        app.logger.warning("startup reconcile failed: %s", e)
-    threading.Thread(target=reconcile_loop, daemon=True).start()
+    for ds_id in init_db():   # datasets seeded just now are registered: check each folder once
+        try:
+            reconcile(ds_id)
+        except Exception as e:  # noqa: BLE001 — RGW trouble must not abort boot
+            app.logger.warning("check of seeded %s failed: %s", ds_id, e)
     threading.Thread(target=make_server("0.0.0.0", INDEX_PORT, index_app, threaded=True).serve_forever,
                      daemon=True).start()
     threading.Thread(target=internal_server().serve_forever, daemon=True).start()
     # use_reloader=False: a reloader spawns a second process — wrong for a service that
-    # owns a connection pool and a single reconcile timer thread.
+    # owns a connection pool and its own listener threads.
     app.run(host="0.0.0.0", port=8000, use_reloader=False)

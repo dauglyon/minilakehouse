@@ -39,21 +39,22 @@ def main():
     }]}))
     print(f"bucket policy set: {READER} may ListBucket datasets/*")
 
-    # Best-effort: push object create/remove under datasets/ to governance /events. If RGW
-    # lacks the notifications API, the reconcile timer still keeps freshness honest.
-    try:
-        sns = boto3.client("sns", endpoint_url=RGW, aws_access_key_id=AK,
-                           aws_secret_access_key=SK, region_name="us-east-1", config=_cfg)
-        arn = sns.create_topic(Name=TOPIC, Attributes={"push-endpoint": EVENTS})["TopicArn"]
-        s3.put_bucket_notification_configuration(Bucket=BUCKET, NotificationConfiguration={
-            "TopicConfigurations": [{
-                "Id": "dataset-freshness", "TopicArn": arn,
-                "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
-                "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "datasets/"}]}},
-            }]})
-        print(f"notifications wired: {arn} -> {EVENTS}")
-    except Exception as e:  # noqa: BLE001
-        print(f"WARN: notification wiring failed (timer reconcile still works): {e}")
+    # Push object create/remove under datasets/ to governance /events: the only way a dataset's
+    # status changes after registration (there is no periodic sweep). The topic is persistent:
+    # RGW queues each event in RADOS and retries it, with no expiry and no retry limit by
+    # default, until governance answers 2xx, so an event sent while governance is down or failing
+    # arrives later. A failure here fails the setup.
+    sns = boto3.client("sns", endpoint_url=RGW, aws_access_key_id=AK,
+                       aws_secret_access_key=SK, region_name="us-east-1", config=_cfg)
+    arn = sns.create_topic(Name=TOPIC, Attributes={"push-endpoint": EVENTS,
+                                                   "persistent": "true"})["TopicArn"]
+    s3.put_bucket_notification_configuration(Bucket=BUCKET, NotificationConfiguration={
+        "TopicConfigurations": [{
+            "Id": "dataset-freshness", "TopicArn": arn,
+            "Events": ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
+            "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": "datasets/"}]}},
+        }]})
+    print(f"notifications wired (persistent): {arn} -> {EVENTS}")
 
     # Post-condition: don't exit 0 until governance-reader can ACTUALLY list datasets/. The
     # reader user is created asynchronously by sts-bootstrap, and a UID/key mismatch would
