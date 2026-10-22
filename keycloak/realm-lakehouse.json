@@ -66,17 +66,6 @@
             "id.token.claim": "true",
             "introspection.token.claim": "true"
           }
-        },
-        {
-          "name": "polaris-audience",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-audience-mapper",
-          "consentRequired": false,
-          "config": {
-            "included.custom.audience": "polaris",
-            "access.token.claim": "true",
-            "id.token.claim": "false"
-          }
         }
       ]
     },

@@ -276,9 +276,14 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   so a client cannot run as someone else. The engine holds no credential that names a user:
   its own service account is granted nothing. Blobs: the broker verifies the user's *own*
   token — no engine in the byte path.
-- **Token checks.** Trino and Polaris verify signature, issuer, expiry, and audience
-  `polaris`. Governance and the broker verify signature, issuer, and expiry, and pin `azp` to
-  the login client (so a token minted for another realm client can't be replayed).
+- **Token checks: one audience per service.** Every service verifies signature, issuer,
+  expiry and its own audience: Trino, the gate and Polaris `polaris`, the broker `broker`,
+  governance `governance`, so a token issued for one is refused by the others. A client asks
+  for an audience with the optional client scope `aud-<service>` on the login client
+  (`keycloak/setup.py`), and a token carries only the audiences it asked for. Governance's two
+  endpoints the gate calls for the catalog (`POST /index/load`, `POST /principals/me`) take the
+  person's catalog token, audience `polaris`. Governance and the broker also pin `azp` to the
+  login client, so a token minted for another realm client can't be replayed.
 - **Grant lookups answer only OPA.** `/internal/*` returns grants for datasets the user cannot
   see, so governance serves it only on a TLS listener (port 8443) that requires a client
   certificate from the internal CA with the name `opa` (`governance/pki.py` makes the CA and

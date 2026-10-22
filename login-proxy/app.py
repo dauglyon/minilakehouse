@@ -70,7 +70,7 @@ PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")  # how the client reaches this
 TRINO_CA = os.environ["TRINO_CA"]                  # where to pin and read Trino's cert
 TRINO_PIN_HOST = os.environ["TRINO_PIN_HOST"]      # host:port to pin that cert from at startup
 PROXY_CRT, PROXY_KEY = "/tmp/proxy-tls.crt", "/tmp/proxy-tls.key"
-SCOPE = "openid"
+SCOPE = "openid aud-polaris"  # Trino and Polaris take only audience `polaris` (keycloak/setup.py)
 # Refresh the access token when it is within this many seconds of expiring, so a forwarded
 # request never carries an about-to-expire token. Set very high to refresh on every request.
 REFRESH_SKEW = int(os.environ.get("REFRESH_SKEW", "30"))

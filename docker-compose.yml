@@ -152,6 +152,21 @@ services:
       timeout: 3s
       retries: 20
 
+  keycloak-setup:
+    # One-shot: one token audience per service, as optional client scopes on the login
+    # client (keycloak/setup.py). Safe to rerun.
+    build: ./governance
+    entrypoint: ["python", "/keycloak/setup.py"]
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    environment:
+      KC_REALM: ${KC_REALM}
+      KC_ADMIN: ${KC_ADMIN}
+      KC_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD}
+    volumes:
+      - ./keycloak/setup.py:/keycloak/setup.py:ro
+
   pki:
     # One-shot: a dev CA, governance's server certificate and OPA's client certificate, each
     # on its own volume (governance/pki.py). Keeps existing files on a rerun.
@@ -389,6 +404,8 @@ services:
         -validity 3650 -dname CN=trino -ext SAN=dns:localhost,dns:trino &&
         exec /usr/lib/trino/bin/launcher run --etc-dir /etc/trino
     depends_on:
+      keycloak-setup:
+        condition: service_completed_successfully
       polaris-setup:
         condition: service_completed_successfully
       keycloak:
@@ -423,6 +440,8 @@ services:
     # fresh token to Trino as the bearer and the `token` extra credential. See login-proxy/app.py.
     build: ./login-proxy
     depends_on:
+      keycloak-setup:
+        condition: service_completed_successfully
       trino:
         condition: service_healthy
       keycloak:

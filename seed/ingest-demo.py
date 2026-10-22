@@ -22,18 +22,18 @@ BROKER = os.environ.get("BROKER_URL", "http://broker:9100")
 PREFIX = "datasets/projz/"
 
 
-def token(user):
+def token(user, audience):
     r = requests.post(KC, data={"grant_type": "password", "client_id": "trino",
                                 "client_secret": "trino-secret",
-                                "username": user, "password": user})
+                                "username": user, "password": user,
+                                "scope": f"openid aud-{audience}"})
     r.raise_for_status()
     return r.json()["access_token"]
 
 
 def main():
-    h = {"Authorization": f"Bearer {token('alice')}"}
     # 1. register the dataset WITH ITS MEANING, as a steward whose group owns datasets/projz/
-    r = requests.post(f"{GOV}/datasets", headers=h, json={
+    r = requests.post(f"{GOV}/datasets", headers={"Authorization": f"Bearer {token('alice', 'governance')}"}, json={
         "prefix": PREFIX,
         "description": "projz ingested dataset",
         "visibility": ["jgi-writers"],
@@ -45,7 +45,8 @@ def main():
         r.raise_for_status()
 
     # 2. a write credential for that folder only (put and delete, no get), then the upload
-    c = requests.post(f"{BROKER}/vend", headers=h, json={"dataset": "projz", "mode": "write"})
+    c = requests.post(f"{BROKER}/vend", headers={"Authorization": f"Bearer {token('alice', 'broker')}"},
+                      json={"dataset": "projz", "mode": "write"})
     c.raise_for_status()
     c = c.json()
     s3 = boto3.client("s3", endpoint_url=c["endpoint"], aws_access_key_id=c["access_key_id"],

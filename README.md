@@ -118,7 +118,9 @@ Trino's cert, pinned at startup.
 governance/the broker, which validate the token's issuer. Run them **in-network** (service
 hostnames) so the issuer matches — the snippets use `docker compose exec` from inside a
 container that already has `requests`/`boto3`. (A token fetched from the host `localhost` port
-has a different issuer and would be rejected.)
+has a different issuer and would be rejected.) Each service accepts only tokens issued for it,
+so each demo asks Keycloak for that service's audience: `scope=openid aud-broker`,
+`aud-governance`, or `aud-polaris` for Trino and the catalog (`keycloak/setup.py`).
 
 ## Flow A — discovery (see-but-not-read)
 
@@ -174,7 +176,7 @@ q bob --execute "SELECT * FROM iceberg.db.t1"
 # then someone in its `write` grant creates it. An unregistered table is refused.
 docker compose exec -T governance python -c "
 import subprocess, requests
-t = subprocess.run(['python', '/seed/user_token.py', 'alice'], capture_output=True, text=True).stdout.strip()
+t = subprocess.run(['python', '/seed/user_token.py', 'alice', 'governance'], capture_output=True, text=True).stdout.strip()
 print(requests.post('http://localhost:8000/tables', headers={'Authorization': 'Bearer ' + t},
       json={'id': 'lakehouse.db.t2', 'read': ['jgi-writers'], 'write': ['jgi-writers']}).json())"
 #  -> {'id': 'lakehouse.db.t2', 'ok': True, 'status': 'pending'}
@@ -199,7 +201,8 @@ docker compose exec -T governance python - <<'PY'
 import requests
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
 def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id="trino",
-    client_secret="trino-secret", username=u, password=u)).json()["access_token"]
+    client_secret="trino-secret", username=u, password=u,
+    scope="openid aud-broker")).json()["access_token"]
 def vend(u, ds): return requests.post("http://broker:9100/vend",
     headers={"Authorization": f"Bearer {tok(u)}"}, json={"dataset": ds}).status_code
 print("alice projx/public :", vend("alice", "projx/public"))    # 200 -> scoped temp creds
@@ -242,16 +245,17 @@ docker compose exec -T governance python - <<'PY'
 import requests
 from pyiceberg.catalog.rest import RestCatalog
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-t = requests.post(KC, data=dict(grant_type="password", client_id="trino",
-    client_secret="trino-secret", username="alice", password="alice")).json()["access_token"]
-h = {"Authorization": f"Bearer {t}"}
+def tok(aud): return requests.post(KC, data=dict(grant_type="password", client_id="trino",
+    client_secret="trino-secret", username="alice", password="alice",
+    scope=f"openid aud-{aud}")).json()["access_token"]
 index = RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse",
-                    token=t).load_table("governance.datasets")
+                    token=tok("polaris")).load_table("governance.datasets")
 print("index:", [r["id"] for r in index.scan().to_arrow().to_pylist()])
-print("vend projz:", requests.post("http://broker:9100/vend", headers=h, json={"dataset": "projz"}).status_code)
+print("vend projz:", requests.post("http://broker:9100/vend", json={"dataset": "projz"},
+      headers={"Authorization": "Bearer " + tok("broker")}).status_code)
 print("register under datasets/projw/ (not owned):",
-      requests.post("http://governance:8000/datasets", headers=h,
-                    json={"prefix": "datasets/projw/x/"}).status_code)
+      requests.post("http://governance:8000/datasets", json={"prefix": "datasets/projw/x/"},
+                    headers={"Authorization": "Bearer " + tok("governance")}).status_code)
 PY
 #  -> index: ['projx/private', 'projx/public', 'projz', 'lakehouse.db.t1']
 #     vend projz: 200
@@ -278,13 +282,14 @@ decision.
 docker compose exec -T governance python - <<'PY'
 import requests
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-t = requests.post(KC, data=dict(grant_type="password", client_id="trino",
-    client_secret="trino-secret", username="alice", password="alice")).json()["access_token"]
-h = {"Authorization": f"Bearer {t}"}
+def h(aud): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
+    client_id="trino", client_secret="trino-secret", username="alice", password="alice",
+    scope=f"openid aud-{aud}")).json()["access_token"]}
 def change(op):
-    return requests.patch("http://governance:8000/permissions/dataset/projx/private", headers=h,
+    return requests.patch("http://governance:8000/permissions/dataset/projx/private",
+        headers=h("governance"),
         json={"changes": [{"group": "jgi-writers", op: ["read"]}]}).json()["grants"]["read"]
-vend = lambda: requests.post("http://broker:9100/vend", headers=h,
+vend = lambda: requests.post("http://broker:9100/vend", headers=h("broker"),
                              json={"dataset": "projx/private"}).status_code
 print("grant read :", change("add"), vend())
 print("revoke read:", change("remove"), vend())
@@ -310,12 +315,13 @@ seed has `jgi-writers` and `projw-team` own themselves, and `group-admins` (caro
 docker compose exec -T governance python - <<'PY'
 import requests
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-def h(u): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
-    client_id="trino", client_secret="trino-secret", username=u, password=u)).json()["access_token"]}
+def h(u, aud): return {"Authorization": "Bearer " + requests.post(KC, data=dict(
+    grant_type="password", client_id="trino", client_secret="trino-secret", username=u,
+    password=u, scope=f"openid aud-{aud}")).json()["access_token"]}
 def members(op):  # alice is in jgi-writers, which owns itself
-    return requests.patch("http://governance:8000/groups/jgi-writers", headers=h("alice"),
-        json={"members": {op: ["bob"]}}).json()["members"]
-vend = lambda: requests.post("http://broker:9100/vend", headers=h("bob"),
+    return requests.patch("http://governance:8000/groups/jgi-writers",
+        headers=h("alice", "governance"), json={"members": {op: ["bob"]}}).json()["members"]
+vend = lambda: requests.post("http://broker:9100/vend", headers=h("bob", "broker"),
                              json={"dataset": "projx/public"}).status_code
 print("add bob   :", members("add"), vend())
 print("remove bob:", members("remove"), vend())
@@ -340,7 +346,8 @@ docker compose exec -T governance python - <<'PY'
 import requests
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
 def h(u): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
-    client_id="trino", client_secret="trino-secret", username=u, password=u)).json()["access_token"]}
+    client_id="trino", client_secret="trino-secret", username=u, password=u,
+    scope="openid aud-governance")).json()["access_token"]}
 def owners(u, root, op, group):
     r = requests.patch(f"http://governance:8000/roots/dataset/{root}", headers=h(u),
                        json={"owners": {op: [group]}})
@@ -374,10 +381,11 @@ PY
   `tables.rego`): `group-admins` for top-level roots, owners of a root or one above it below. Group membership and every grant
   come from governance at decision time; tokens carry no groups.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
-  Tables: Trino and Polaris both validate it (issuer, expiry, audience `polaris`); Trino's
-  username is the token's `principal_name` and impersonation is refused; the engine's own
-  service account is granted nothing. Blobs: the broker verifies the user's **own** token (no
-  engine in the byte path).
+  Each service accepts only tokens issued for it (audience `polaris` for Trino, the gate and
+  Polaris; `broker`; `governance`). Tables: Trino and Polaris both validate it (issuer,
+  expiry, audience); Trino's username is the token's `principal_name` and impersonation is
+  refused; the engine's own service account is granted nothing. Blobs: the broker verifies the
+  user's **own** token (no engine in the byte path).
 - **Entry lookups answer only OPA.** Governance's `/internal/*` returns grants for datasets a
   user can't see, so it is served only on a TLS listener that requires OPA's client
   certificate (`governance/pki.py`). OPA reads the key from a file, which, unlike its

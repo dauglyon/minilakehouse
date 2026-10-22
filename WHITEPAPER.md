@@ -512,9 +512,8 @@ listing.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
 with files; `share` is only the right to change grants, since there are no derived datasets
-to widen; no derived datasets, no widenings; one token audience serves every service, and
-only Trino and Polaris check it; the periodic listing is authoritative and notifications are
-not persistent; the events endpoint is unauthenticated.
+to widen; no derived datasets, no widenings; the periodic listing is authoritative and
+notifications are not persistent; the events endpoint is unauthenticated.
 
 ## 14. Questions for the reviewer
 

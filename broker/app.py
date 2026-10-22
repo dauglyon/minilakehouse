@@ -32,6 +32,8 @@ from flask import Flask, jsonify, request
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
 KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
+# The broker accepts only tokens issued for it (keycloak/setup.py): `scope=openid aud-broker`.
+AUDIENCE = os.environ.get("TOKEN_AUDIENCE", "broker")
 OPA_BLOB = os.environ["OPA_BLOB_URL"]  # .../v1/data/lakehouse/blob
 RGW_ENDPOINT = os.environ["RGW_ENDPOINT"]
 BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
@@ -58,12 +60,11 @@ app = Flask(__name__)
 # separate container images, no shared module. Keep the two copies in sync.
 def verify_user(token):
     """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
-    signature + exp; we add issuer and azp (the token must have been issued through our login
-    client, not some other realm client). Groups are not read from the token: OPA gets them
-    from governance."""
+    signature, exp, issuer and audience; we add azp (the token must have been issued through our
+    login client, not some other realm client). Groups are not read from the token: OPA gets
+    them from governance."""
     key = _jwks.get_signing_key_from_jwt(token).key
-    claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
-                        options={"verify_aud": False})
+    claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS, audience=AUDIENCE)
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
     return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")

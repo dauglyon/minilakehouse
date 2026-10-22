@@ -64,6 +64,11 @@ TABLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+){2,}$")
 # Only tokens issued THROUGH our login client are accepted (azp), so a token minted for some
 # other realm client can't be replayed here as a user credential.
 EXPECTED_AZP = os.environ.get("EXPECTED_AZP", "trino")
+# Each service accepts only tokens issued for it (keycloak/setup.py). Governance's own API takes
+# `governance`; the two calls the gate makes for the catalog, a load of the dataset index and
+# creating a person's Polaris principal, carry the person's catalog token, audience `polaris`.
+AUDIENCE = os.environ.get("TOKEN_AUDIENCE", "governance")
+CATALOG_AUDIENCE = os.environ.get("CATALOG_AUDIENCE", "polaris")
 # A prefix becomes an STS resource ARN; it's from an authenticated steward but still
 # untrusted. Confine it: datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
 # policy-size limit and restricted so no control/space/unicode reaches the ARN.
@@ -265,27 +270,26 @@ def _entry(row):
 
 # NOTE: verify_user + authed_user are duplicated in the other service (governance/broker) —
 # separate container images, no shared module. Keep the two copies in sync.
-def verify_user(token):
+def verify_user(token, audience):
     """Cryptographically verify the caller's own Keycloak token -> subject. PyJWT enforces
-    signature + exp; we add issuer and azp (the token must have been issued through our login
-    client, not some other realm client). Groups are not read from the token: OPA gets them
-    from governance."""
+    signature, exp, issuer and audience; we add azp (the token must have been issued through our
+    login client, not some other realm client). Groups are not read from the token: OPA gets
+    them from governance."""
     key = _jwks.get_signing_key_from_jwt(token).key
-    claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS,
-                        options={"verify_aud": False})
+    claims = jwt.decode(token, key, algorithms=["RS256"], issuer=KEYCLOAK_ISS, audience=audience)
     if claims.get("azp") != EXPECTED_AZP:
         raise jwt.InvalidTokenError(f"unexpected azp {claims.get('azp')!r}")
     return claims.get("principal_name") or claims.get("preferred_username") or claims.get("sub")
 
 
-def authed_user():
+def authed_user(audience=AUDIENCE):
     """Verify the request's bearer token. Returns (subject, None) on success, or
     (None, error_response) for the caller to return as-is."""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None, (jsonify({"error": "missing bearer token"}), 401)
     try:
-        return verify_user(auth[7:]), None
+        return verify_user(auth[7:], audience), None
     except Exception as e:  # noqa: BLE001
         app.logger.warning("token verification failed: %s", e)
         return None, (jsonify({"error": "invalid token"}), 401)
@@ -589,7 +593,7 @@ def provision_principal():
     # Create the caller's Polaris principal if it doesn't exist. Authenticated by the person's
     # own token, so it creates only that person's; the gate calls it before a person's first
     # request reaches Polaris, which would otherwise refuse it (and log the token).
-    subject, err = authed_user()
+    subject, err = authed_user(CATALOG_AUDIENCE)
     if err:
         return err
     if subject in RESERVED_PRINCIPALS:
@@ -869,7 +873,7 @@ def index_load():
     # The gate's answer to a catalog load of <catalog>.governance.datasets, on the person's own
     # token: an Iceberg LoadTableResult for that person's index, whose files this service
     # serves below with the storage credential in `config`.
-    subject, err = authed_user()
+    subject, err = authed_user(CATALOG_AUDIENCE)
     if err:
         return err
     table = index_table.build(subject, _index_rows(subject))
