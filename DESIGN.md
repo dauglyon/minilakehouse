@@ -93,9 +93,9 @@ files/blobs over S3) under the *same* governance model as tables.
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
-| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
+| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves discovery, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, builds and serves each person's dataset index table, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
-| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance create a person's Polaris principal before their first request. Holds no permissions; Polaris and OPA decide everything it forwards. |
+| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance create a person's Polaris principal before their first request; answers for the dataset index table, `governance.datasets`, itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
 | **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision. No engine in the byte path. |
 | **Ceph RGW** | Object store + native STS + bucket notifications. Enforces the vended credential. |
@@ -146,8 +146,8 @@ allow_change    governance  {subject, dataset: id,             POST /internal/da
                              grants: [grant]}                    GET /internal/register-grants
 table lanes     Polaris     {actor, action, resource}          GET /internal/tables/<id>,   true | false
                                                                  POST /internal/namespaces
-tables.decide   gate        {subject, tables: [id],            POST /internal/tables,       {tables: [id], namespaces: [id]}
-                             namespaces: [id]}                   POST /internal/namespaces
+tables.decide   gate,       {subject, tables: [id],            POST /internal/tables,       {tables: [id], namespaces: [id],
+                governance   namespaces: [id]}                   POST /internal/namespaces     readable: [id]}
 tables.allow_create     gate        {subject, id}              GET /internal/tables/<id>    true | false
 tables.allow_namespace  gate        {subject, id}              POST /internal/namespaces    true | false
 tables.allow_register   governance  {subject, id}              POST /internal/namespaces    true | false
@@ -242,6 +242,15 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   group (`POST /groups`). Governance refuses a change that leaves a group without an owner,
   and refuses to create a group under a name any grant or ownership already uses: a dangling
   grant to that name would otherwise pass to whoever joined the new group.
+- **The dataset index is built per person, on demand.** The gate answers a catalog load of
+  `governance.datasets` by calling governance's `POST /index/load` with the person's token.
+  Governance computes that person's rows (live datasets from `discover`, live tables from
+  `tables.decide`), builds an Iceberg table of them in memory with pyiceberg under
+  `s3://governance-index/<subject>/<hash of the rows>/`, and returns its metadata with a
+  15-minute storage credential bound to the person. Its S3-style endpoint checks each
+  request's SigV4 signature against that credential and serves only the person's own prefix.
+  Nothing is written to storage, and the row hash in every path means a cache keyed by path
+  never returns stale rows or another person's. Every dataset's actual data stays in Ceph.
 - **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
   a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
   changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`):
@@ -387,7 +396,10 @@ reference (the sections above are current-state).
   gate refuses tokens naming Polaris's own principals (`root`, `provisioner`).
 - Every decision reads governance: a governance outage denies every read, and table checks
   are uncached.
-- Discovery is blob-only; table discovery rides Polaris's own listing.
+- `/discover` lists file datasets only; the `governance.datasets` table lists both kinds. Its
+  files live in governance's memory (a restart drops them; the next load rebuilds them), and
+  Trino reads them only through the mapping rule in `trino/etc/s3-security-mapping.json`,
+  because Trino takes no storage endpoint from the catalog.
 - Dev-environment only: plaintext/no-TLS except Trino's HTTPS port (Trino's clients send a
   token only over TLS; the container generates a self-signed keystore at each start), dev
   credentials in `.env`, the OPA debug image, and unauthenticated `/events`

@@ -17,6 +17,7 @@ exists) vs access (may you READ the bytes) — so a dataset can be see-but-not-r
 
 Governance builds every list; OPA only says which of the candidates it was given pass.
 """
+import hashlib
 import hmac
 import json
 import logging
@@ -27,11 +28,12 @@ import time
 from contextlib import contextmanager
 
 import boto3
+import index_table
 import jwt
 import psycopg2
 import requests
 from botocore.config import Config
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 
@@ -76,6 +78,8 @@ def derive_id(prefix):
 # Least-privilege reader creds (ListBucket on datasets/* via a bucket policy set by the
 # rgw-setup one-shot). Governance does NOT hold the RGW admin key; reconcile only lists.
 RGW_ENDPOINT = os.environ.get("RGW_ENDPOINT", "http://ceph:8080")
+# Where engines fetch the dataset index's files (index_table.py): this service.
+INDEX_ENDPOINT = os.environ.get("INDEX_ENDPOINT", "http://governance:8000")
 RGW_KEY = os.environ.get("RGW_ACCESS_KEY", "")
 RGW_SECRET = os.environ.get("RGW_SECRET_KEY", "")
 S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
@@ -825,6 +829,77 @@ def change_root_owners(kind, root_id):
         now = [r["grp"] for r in cur.fetchall()]
     app.logger.info("CHANGE-ROOT subject=%s %s=%s owners=%s", subject, kind, root, owners)
     return jsonify({"ok": True, "root": root, "owners": now})
+
+
+def _index_rows(subject):
+    """Every live dataset and table the subject may see, with whether they may read it."""
+    with db() as cur:
+        cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live'")
+        files = cur.fetchall()
+        cur.execute("SELECT id, description, steward FROM table_entries WHERE status = 'live'")
+        tables = cur.fetchall()
+    f = opa("discover", {"subject": subject, "datasets": [r["id"] for r in files]})
+    t = opa("decide", {"subject": subject, "tables": [r["id"] for r in tables], "namespaces": []},
+            package="tables")
+    rows = [{"id": r["id"], "kind": "files", "description": r["description"],
+             "steward": r["steward"], "can_read": r["id"] in f["readable"]}
+            for r in files if r["id"] in f["visible"]]
+    rows += [{"id": r["id"], "kind": "table", "description": r["description"],
+              "steward": r["steward"], "can_read": r["id"] in t["readable"]}
+             for r in tables if r["id"] in t["tables"]]
+    return sorted(rows, key=lambda r: (r["kind"], r["id"]))
+
+
+@app.post("/index/load")
+def index_load():
+    # The gate's answer to a catalog load of <catalog>.governance.datasets, on the person's own
+    # token: an Iceberg LoadTableResult for that person's index, whose files this service
+    # serves below with the storage credential in `config`.
+    subject, err = authed_user()
+    if err:
+        return err
+    table = index_table.build(subject, _index_rows(subject))
+    config = {**index_table.mint(subject), "s3.endpoint": INDEX_ENDPOINT,
+              "s3.path-style-access": "true", "s3.region": "us-east-1", "client.region": "us-east-1"}
+    return jsonify({**table, "config": config})
+
+
+def _s3_error(status, code):
+    return Response(f"<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code></Error>",
+                    status=status, content_type="application/xml")
+
+
+@app.route(f"/{index_table.BUCKET}/<path:key>", methods=["GET", "HEAD"])
+def index_object(key):
+    # S3 GetObject/HeadObject for the index's files. The signature names the person; they may
+    # read only their own prefix.
+    raw_path, _, raw_query = (request.environ.get("RAW_URI") or request.path).partition("?")
+    subject = index_table.verify(request.method, raw_path, raw_query, request.headers)
+    if subject is None or not key.startswith(subject + "/"):
+        return _s3_error(403, "AccessDenied")
+    data = index_table.read(f"s3://{index_table.BUCKET}/{key}")
+    if data is None:
+        return _s3_error(404, "NoSuchKey")
+    headers = {"Accept-Ranges": "bytes", "ETag": f'"{hashlib.md5(data).hexdigest()}"',
+               "Last-Modified": "Thu, 01 Jan 2026 00:00:00 GMT"}
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", request.headers.get("Range", ""))
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), len(data) - 1) if m.group(2) else len(data) - 1
+        else:
+            start, end = max(len(data) - int(m.group(2)), 0), len(data) - 1
+        if start >= len(data) or start > end:
+            return _s3_error(416, "InvalidRange")
+        headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+        body, status = data[start:end + 1], 206
+    else:
+        body, status = data, 200
+    headers["Content-Length"] = str(len(body))
+    # A HEAD answer has no body but must report the object's length; an iterable body keeps
+    # Flask from replacing Content-Length with the empty body's 0.
+    return Response([] if request.method == "HEAD" else [body], status=status, headers=headers,
+                    content_type="application/octet-stream")
 
 
 @app.get("/discover")

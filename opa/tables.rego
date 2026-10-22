@@ -9,7 +9,8 @@ package lakehouse.tables
 # request bodies and list responses; a name containing "." has no id and nothing allows it.
 #
 #   decide           input {subject, tables: [id], namespaces: [id]}
-#                    gate: {tables: [id], namespaces: [id]}, the ones the subject may view
+#                    gate, governance: {tables: [id], namespaces: [id]}, the ones the subject
+#                    may view, and readable: [id], the tables they may read
 #   allow_create     input {subject, id}   gate: may create this table or view now
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
@@ -24,12 +25,18 @@ import future.keywords.every
 import future.keywords.if
 import future.keywords.in
 
-decide := {"tables": tables, "namespaces": namespaces}
+decide := {"tables": tables, "namespaces": namespaces, "readable": readable_tables}
 
 tables contains id if {
 	gs := governance.groups(input.subject)
 	some id, e in governance.post("/internal/tables", {"ids": input.tables}).entries
 	viewable(gs, e)
+}
+
+readable_tables contains id if {
+	gs := governance.groups(input.subject)
+	some id, e in governance.post("/internal/tables", {"ids": input.tables}).entries
+	readable(gs, e)
 }
 
 namespaces contains id if {

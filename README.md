@@ -62,10 +62,10 @@ byte path.
 | Service | Role |
 |---|---|
 | **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. |
-| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), and creates each person's Polaris account on first use. |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves discovery (Flow A), keeps the registry fresh (RGW events + a reconcile timer), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH /groups/<name>`) and root ownership changes (`PATCH /roots/...`), builds and serves each person's dataset index table, and creates each person's Polaris account on first use. |
 | **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
-| **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. |
+| **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read. Decides which tables and schemas may be created, and reports creates and drops to governance. Answers for the dataset index table, `governance.datasets`, itself. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
 | **loginproxy** | Sits in front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client, holds the person's refresh token, and puts a fresh token on every forwarded request as the bearer and the `token` extra credential. |
 | **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision. |
@@ -145,6 +145,30 @@ PY
 ```
 
 Governance builds the candidate list; OPA only says which candidates pass.
+
+### The same list as a table
+
+Every engine connected to the catalog can query the list as an Iceberg table,
+`governance.datasets`: one row per live dataset or table the person may see, with whether they
+may read it. The gate answers for this table itself. Governance builds its files for the
+person loading it (one database query and one OPA decision), keeps them in memory, and serves
+them from an S3-style endpoint that accepts only the short-lived credential issued with that
+load, signed per request. Every dataset's actual data stays in Ceph. The file paths carry a
+hash of the rows, so a grant change appears at the next query and no cache can serve one
+person's rows to another.
+
+```bash
+q alice --execute "SELECT * FROM iceberg.governance.datasets"
+#  -> "projx/private","files","projx private data","alice","false"
+#     "projx/public","files","projx public data","alice","true"
+#     "lakehouse.db.t1","table","demo table","alice","true"
+q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
+#  -> "0"
+```
+
+pyiceberg reads the files from the endpoint the catalog sends with the table. Trino reads
+every file from its own configured endpoint, so its catalog has one mapping rule that sends
+`s3://governance-index/` to governance (`trino/etc/s3-security-mapping.json`).
 
 ## Flow B — Iceberg tables
 
@@ -397,7 +421,9 @@ PY
   time each person shows up. When a Polaris release has the `external` credential mode, that
   step goes away.
 - Every decision reads governance: if governance is down, every read is denied.
-- Discovery is blob-only; table discovery is via the catalog's own listing.
+- `/discover` lists file datasets only; the `governance.datasets` table lists both kinds.
+- The dataset index's files are held in governance's memory: a restart drops them and the next
+  load rebuilds them. Trino needs the mapping rule above to read them.
 - Plaintext/no-TLS everywhere except Trino's token port, which uses a self-signed keystore
   generated at container start; dev credentials in `.env` — all dev-only.
 - RGW storage is ephemeral (no volume), so `docker compose down` then `up` clears it: the

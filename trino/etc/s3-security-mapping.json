@@ -1,0 +1,6 @@
+{
+  "mappings": [
+    {"prefix": "s3://governance-index/", "accessKey": "unused", "secretKey": "unused", "endpoint": "http://governance:8000"},
+    {"useClusterDefault": true}
+  ]
+}

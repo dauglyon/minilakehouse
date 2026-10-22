@@ -19,7 +19,10 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    must lie under one the person's group owns. It reports each table created or dropped to
    governance, which marks the entry live or gone. Registering and renaming tables are refused
    (root-only in Polaris too).
-6. Accounts. Polaris 1.5 refuses a token whose name has no stored principal, and logs the
+6. The dataset index. The gate answers for one namespace itself, `governance`, holding one
+   read-only table, `datasets`: a load of it returns governance's per-person index
+   (governance/index_table.py), whose files governance serves. Polaris holds neither.
+7. Accounts. Polaris 1.5 refuses a token whose name has no stored principal, and logs the
    token when it does. Before a person's first request reaches Polaris, the gate has
    governance create their principal (governance verifies the person's own token). A token
    naming one of Polaris's own principals is refused.
@@ -49,6 +52,7 @@ RESERVED = {"root", "provisioner"}  # Polaris's own principals
 DELEGATION = "x-iceberg-access-delegation"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
+INDEX_NS, INDEX_TABLE = "governance", "datasets"
 # Hop-by-hop headers, and ones requests recomputes after decoding the body.
 DROP = {"host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authorization", "proxy-authenticate", "content-length", "content-encoding"}
@@ -124,6 +128,31 @@ def may_view(subject, kind, catalog, levels, name):
         return i is not None and i in visible(subject, tables=[i])[0]
     i = ident([catalog, *levels])
     return i is not None and i in visible(subject, namespaces=[i])[1]
+
+
+def index_answer(named, segments):
+    """The gate's own answer for the index namespace and its table, or None for any other
+    path."""
+    if not named or named[2] != [INDEX_NS]:
+        return None
+    kind, name = named[0], named[3]
+    if request.method == "HEAD" and (kind == "namespace" or (kind == "table" and name == INDEX_TABLE)):
+        return "", 204
+    if request.method == "GET" and kind == "namespace" and segments[-1] == INDEX_NS:
+        return jsonify({"namespace": [INDEX_NS], "properties": {}})
+    if request.method == "GET" and kind in ("tables", "views"):
+        ids = [{"namespace": [INDEX_NS], "name": INDEX_TABLE}] if kind == "tables" else []
+        return jsonify({"identifiers": ids})
+    if kind == "table" and name == INDEX_TABLE:
+        if request.method == "GET" and segments[-1] == INDEX_TABLE:
+            r = _http.post(f"{GOVERNANCE}/index/load", timeout=60,
+                           headers={"Authorization": request.headers["Authorization"]})
+            return relay(r)
+        if request.method == "POST" and segments[-1] == "metrics":
+            return "", 204
+    if kind in ("table", "view"):
+        return not_found(kind, named[2], name)
+    return forbidden("the governance namespace is the read-only dataset index")
 
 
 def forbidden(message):
@@ -234,6 +263,8 @@ def listing(path, headers, kind, catalog, levels, subject):
         ids = [ident([catalog, *it["namespace"], it["name"]]) for it in items]
         keep = visible(subject, tables=ids)[0]
     items = [it for it, i in zip(items, ids) if i in keep]
+    if kind == "namespaces" and "parent" not in request.args and [INDEX_NS] not in items:
+        items.append([INDEX_NS])
 
     if "pageToken" not in request.args and "pageSize" not in request.args:
         return jsonify({key: items})
@@ -272,6 +303,8 @@ def proxy(_):
         return jsonify({"error": {"message": "path not in canonical form",
                                   "type": "BadRequestException", "code": 400}}), 400
     named = route(segments)
+    if (answer := index_answer(named, segments)) is not None:
+        return answer
     headers = {k: v for k, v in request.headers if k.lower() not in DROP}
     if request.method == "POST" and (segments[-1:] == ["register"] or segments[-1:] == ["rename"]):
         return forbidden("registering and renaming tables and views are root-only")
@@ -286,6 +319,8 @@ def proxy(_):
         body = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
         new_tables, new_namespaces = creates(segments, body) if request.method == "POST" else ([], [])
         for n in new_namespaces:
+            if n is not None and n.split(".")[1:2] == [INDEX_NS]:
+                return forbidden("the governance namespace is the read-only dataset index")
             if n is None or opa("allow_namespace", {"subject": subject, "id": n}) is not True:
                 return forbidden(f"none of your groups owns {n} or a namespace above it")
         for t in new_tables:

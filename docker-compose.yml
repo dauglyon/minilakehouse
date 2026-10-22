@@ -364,6 +364,7 @@ services:
     volumes:
       - ./trino/etc/config.properties:/etc/trino/config.properties:ro
       - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      - ./trino/etc/s3-security-mapping.json:/etc/trino/s3-security-mapping.json:ro
       - ./seed:/seed:ro
     ports:
       - "8083:8080"
