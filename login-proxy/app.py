@@ -296,6 +296,15 @@ def token_poll(key):
     return jsonify({"token": session})
 
 
+@app.delete("/auth/token/<key>")
+def token_done(key):
+    # Trino's client deletes the URI it last polled once it holds the token
+    # (HttpTokenPoller.tokenReceived). The login record was dropped when the session was handed
+    # over, and after a refresh-only challenge the key is the live session id, which must stay;
+    # so this does nothing. Without it the DELETE fell through to proxy() and minted a challenge.
+    return "", 204
+
+
 @app.get("/healthz")
 def health():
     return {"ok": True}
