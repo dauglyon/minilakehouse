@@ -49,8 +49,12 @@ discover := {"visible": visible, "readable": readable}
 # (governance/app.py _index_rows); a change to what makes a dataset visible changes that too.
 visible contains id if {
 	some id, e in _entries
-	some g in _groups
-	g in array.concat(e.describe, e.access)
+	_holds(e.describe)
+}
+
+visible contains id if {
+	some id, e in _entries
+	_reads(e)
 }
 
 readable contains id if {
@@ -84,8 +88,10 @@ allow_change if {
 
 _may_change(e, g) if {
 	g in {"describe", "read"}
-	some x in _groups
-	x in e.share
+	_holds(e.share)
+	every s in object.get(e, "sources", []) {
+		_holds(s.share)
+	}
 }
 
 _may_change(e, g) if {
@@ -120,7 +126,17 @@ _entries := governance.post("/internal/datasets", {"ids": _ids}).entries
 
 _groups := governance.groups(input.subject)
 
+# A dataset's `read` (stored as access), and every source its files carry (PROVENANCE.md 6,
+# rule 3): governance lists each with its own grants and whether a declaration says it was
+# used; the shipped rule treats an undeclared source like a declared one.
 _reads(e) if {
+	_holds(e.access)
+	every s in object.get(e, "sources", []) {
+		_holds(s.read)
+	}
+}
+
+_holds(grant) if {
 	some g in _groups
-	g in e.access
+	g in grant
 }

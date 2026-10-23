@@ -93,8 +93,7 @@ allow_change if {
 
 _may_change(gs, e, g) if {
 	g in {"describe", "read"}
-	some x in gs
-	x in e.share
+	shares(gs, e)
 }
 
 _may_change(gs, _, g) if {
@@ -119,24 +118,47 @@ _parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
 	count(parts) >= 3
 }
 
-# A table's grants. For tables, write implies read: writing an Iceberg table reads its
-# metadata, and the credential Polaris vends for writing can read the files.
+# A table's grants, and the sources its files carry (PROVENANCE.md 6, rule 3). Governance's
+# entry lists each source with its own `read` and `share` grants and whether a declaration says
+# it was used (`declared`), or it is there because a writer has not declared yet. The shipped
+# rules treat both alike: a person may read or write the table only if they may also read every
+# source, through any of their groups. A deployment changes how undeclared data is treated
+# here, for example by requiring `s.declared` in viewable's describe clause. For tables, write
+# implies read: writing an Iceberg table reads its metadata, and the credential Polaris vends
+# for writing can read the files.
 readable(groups, e) if {
-	some g in groups
-	g in array.concat(e.read, e.write)
+	_holds(groups, array.concat(e.read, e.write))
+	sources_allow(groups, e)
 }
 
 # Governance's dataset index offers OPA only tables whose describe, read or write names one of the
 # person's groups (governance/app.py _index_rows); a change to what makes a table viewable
-# changes that too.
-viewable(groups, e) if {
-	some g in groups
-	g in array.concat(e.describe, array.concat(e.read, e.write))
-}
+# changes that too. `describe` is not cut by sources (WHITEPAPER 4.3).
+viewable(groups, e) if readable(groups, e)
+
+viewable(groups, e) if _holds(groups, e.describe)
 
 writable(groups, e) if {
+	_holds(groups, e.write)
+	sources_allow(groups, e)
+}
+
+shares(groups, e) if {
+	_holds(groups, e.share)
+	every s in object.get(e, "sources", []) {
+		_holds(groups, s.share)
+	}
+}
+
+sources_allow(groups, e) if {
+	every s in object.get(e, "sources", []) {
+		_holds(groups, s.read)
+	}
+}
+
+_holds(groups, grant) if {
 	some g in groups
-	g in e.write
+	g in grant
 }
 
 droppable(groups, e) if {

@@ -342,9 +342,12 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   (its reader may list `datasets/` and `warehouse/`), records every file's last-modified
   time, and attributes each file to the write credentials and commits valid at that time,
   so a file carries what its writers had read before writing it, minus what they declared
-  unused. The lookups OPA makes return a dataset's `read`, a table's `write`, and `share`
-  cut down to groups that may also read, or share, every carried source; `describe` and
-  `delete` are not cut. A write still under way counts before a listing can see its files.
+  unused. The lookups OPA makes return each dataset's own grants and the sources its files
+  carry, with each source's own `read` and `share` and whether a declaration says it was used;
+  OPA's rules let a person read, or for a table write, only if they may also read every
+  source, and change `describe` and `read` only if they also hold `share` on every source.
+  `describe` and `delete` are not cut. How undeclared data is treated is a rule a deployment
+  can change. A commit counts before a listing can see its files.
 - **A declaration is a commit, checked before it is accepted** (`PROVENANCE.md` 5.3, 5.5). An
   engine inserting into `governance.derivations` uploads its files to governance's S3-style
   endpoint and commits through the gate. The endpoint takes uploads only under the signer's

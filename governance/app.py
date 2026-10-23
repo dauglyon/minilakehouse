@@ -564,24 +564,29 @@ WITH f AS (
          AND r.at < fw.lm + %(slack)s * interval '1 second'
          AND (r.session = fw.session OR (r.sid = fw.sid AND r.at >= fw.at))
     CROSS JOIN LATERAL unnest(COALESCE(r.sources, ARRAY[r.dataset])) AS s(source)
-)
-SELECT DISTINCT b.source FROM brought b
-WHERE b.source <> %(t)s AND NOT EXISTS (
-    SELECT 1 FROM declared_sources ds JOIN declarations dd ON dd.id = ds.declaration
-    WHERE ds.source = b.source AND NOT ds.used AND ds.declaration = (
+), covered AS (  -- each file's source with the writer's declaration covering the file, if any
+    SELECT b.source, (
         SELECT max(d.id) FROM declarations d
         WHERE d.person = b.person AND d.target = %(t)s AND NOT d.reattach
-          AND d.declared_at >= b.lm + %(slack)s * interval '1 second')
+          AND d.declared_at >= b.lm + %(slack)s * interval '1 second') AS declaration
+    FROM brought b WHERE b.source <> %(t)s
+)
+SELECT c.source, bool_and(c.declaration IS NOT NULL) AS declared FROM covered c
+WHERE NOT EXISTS (
+    SELECT 1 FROM declared_sources ds JOIN declarations dd ON dd.id = ds.declaration
+    WHERE ds.declaration = c.declaration AND ds.source = c.source AND NOT ds.used
       AND NOT EXISTS (
         SELECT 1 FROM declarations r JOIN declared_sources rs ON rs.declaration = r.id
-        WHERE r.reattach AND r.target = %(t)s AND rs.source = b.source
+        WHERE r.reattach AND r.target = %(t)s AND rs.source = c.source
           AND r.declared_at > dd.declared_at))
-ORDER BY 1
+GROUP BY c.source ORDER BY 1
 """
 
 
 def carried(ds_id):
-    """The sources the files in a dataset's folder carry. The folder is listed first if it never
+    """The sources the files in a dataset's folder carry, each with whether a declaration says it
+    was used (declared) rather than its being there because a writer has not declared yet,
+    as [{id, declared}]. The folder is listed first if it never
     has been, or if a credential that could write it has expired since the last listing, so
     that what it wrote, or did not, is settled by storage even if a notification was lost."""
     unlisted = _folder(ds_id) is None
@@ -600,32 +605,27 @@ def carried(ds_id):
     with db() as cur:
         cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "slack": FILE_TIME_SLACK,
                                    "unlisted": unlisted})
-        return [r["source"] for r in cur.fetchall()]
+        return [{"id": r["source"], "declared": r["declared"]} for r in cur.fetchall()]
 
 
 def _own_grants(ids):
-    """{id: (groups that may read it, groups holding share)} by each dataset's own grants: a
-    table's write implies read."""
+    """{id: {read, share}} by each dataset's own grants, as groups: a table's write implies read."""
     with db() as cur:
-        cur.execute("SELECT id, access AS readers, share FROM datasets WHERE id = ANY(%s)", (ids,))
-        own = {r["id"]: (set(r["readers"]), set(r["share"])) for r in cur.fetchall()}
-        cur.execute("SELECT id, read || write AS readers, share FROM table_entries WHERE id = ANY(%s)", (ids,))
-        own.update({r["id"]: (set(r["readers"]), set(r["share"])) for r in cur.fetchall()})
+        cur.execute("SELECT id, access AS read, share FROM datasets WHERE id = ANY(%s)", (ids,))
+        own = {r["id"]: {"read": sorted(r["read"]), "share": sorted(r["share"])} for r in cur.fetchall()}
+        cur.execute("SELECT id, ARRAY(SELECT DISTINCT unnest(read || write)) AS read, share "
+                    "FROM table_entries WHERE id = ANY(%s)", (ids,))
+        own.update({r["id"]: {"read": sorted(r["read"]), "share": sorted(r["share"])} for r in cur.fetchall()})
     return own
 
 
-def _effective(ds_id, entry, grants):
-    """The entry with the grants rule 3 cuts down: each named grant keeps only groups that may
-    read, or for share hold share on, every source its files carry. describe is not inherited,
-    and neither is delete, which reads nothing. A source with no entry admits no one."""
+def _with_sources(ds_id, entry):
+    """The entry as stored, with the sources its files carry: each source's own read and share
+    grants and whether a declaration says it was used. OPA's rules decide what they mean
+    (PROVENANCE.md 6, rule 3); a source with no entry has no grants, so it admits no one."""
     sources = carried(ds_id)
-    if not sources:
-        return entry
-    own = _own_grants(sources)
-    readers = set.intersection(*(own.get(s, (set(), set()))[0] for s in sources))
-    sharers = set.intersection(*(own.get(s, (set(), set()))[1] for s in sources))
-    cut = {g: sorted(set(entry[g]) & (sharers if g == "share" else readers)) for g in grants}
-    return {**entry, **cut, "sources": sources}
+    own = _own_grants([c["id"] for c in sources])
+    return {**entry, "sources": [{**c, **own.get(c["id"], {"read": [], "share": []})} for c in sources]}
 
 
 def reconcile(ds_id):
@@ -667,9 +667,7 @@ def internal_datasets():
         cur.execute("SELECT id, prefix, describe, access, share, write, detach FROM datasets WHERE id = ANY(%s)",
                     (ids,))
         rows = cur.fetchall()
-    # Who may read follows rule 3 (PROVENANCE.md 6): write on a file dataset reads nothing.
-    return jsonify({"entries": {r["id"]: _effective(r["id"], _entry(r), ("access", "share"))
-                                for r in rows}})
+    return jsonify({"entries": {r["id"]: _with_sources(r["id"], _entry(r)) for r in rows}})
 
 
 @internal_app.get("/internal/register-grants")
@@ -695,9 +693,6 @@ def internal_group_owners(grp):
 
 
 _TABLE_COLS = 'id, describe, read, share, write, "delete", detach, status'
-# Rule 3 cuts a table's write as well as its read: writing a table reads it, and the credential
-# Polaris vends for writing can read the files.
-_TABLE_CUT = ("read", "write", "share")
 
 
 def _ids_from_body():
@@ -715,7 +710,7 @@ def internal_table(table_id):
         row = cur.fetchone()
     if row is None:
         return jsonify({"error": "not found"}), 404
-    return jsonify(_effective(table_id, row, _TABLE_CUT)), 200
+    return jsonify(_with_sources(table_id, row)), 200
 
 
 @internal_app.post("/internal/tables")
@@ -725,7 +720,7 @@ def internal_tables():
     with db() as cur:
         cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = ANY(%s)", (ids,))
         rows = cur.fetchall()
-    return jsonify({"entries": {r["id"]: _effective(r["id"], r, _TABLE_CUT) for r in rows}})
+    return jsonify({"entries": {r["id"]: _with_sources(r["id"], r) for r in rows}})
 
 
 @internal_app.post("/internal/namespaces")
@@ -816,7 +811,7 @@ def record_accesses():
     if not _accesses_valid(body):
         return jsonify({"error": "person, sub, sid and entries [{dataset, kind, mode, expires}] required"}), 400
     # A read keeps the sources it brought in: the dataset and what its files carry now (rule 1).
-    brought = {i: [e["dataset"], *carried(e["dataset"])] if e["mode"] == "read" else None
+    brought = {i: [e["dataset"], *(c["id"] for c in carried(e["dataset"]))] if e["mode"] == "read" else None
                for i, e in enumerate(body["entries"])}
     with db(commit=True) as cur:
         session = _pointer(cur, body["person"], body["sid"], create=True)

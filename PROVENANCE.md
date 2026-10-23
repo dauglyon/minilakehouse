@@ -351,14 +351,26 @@ markings follow data along lineage. Three rules:
    they brought in before that time, through their session's reads and their login's reads
    while the credential was valid (4.2), minus the sources a declaration of theirs covering
    the file marked unused (6.3).
-3. **Who may read a dataset** is its own `read` grant, cut down by the own `read` grant of
-   every source carried by any file in its folder. `share` follows the same rule, as
-   `WHITEPAPER.md` 4.3 has both inherit.
+3. **Who may read a dataset**: a person in its own `read` grant who is also in the own `read`
+   grant of every source carried by any file in its folder, through any of their groups.
+   `share` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit.
 
 This replaces `WHITEPAPER.md` 4.3's per-dataset `inputs`. A file's sources already include
 everything upstream of it, so rule 3 needs no chain of inputs-of-inputs: it looks up each
 source's own grant at decision time, and a grant change takes effect at the next decision
 with nothing to recompute.
+
+OPA applies rule 3, not governance (decided 2026-10-22). Governance's lookups return a
+dataset's own grants and its carried sources, each with that source's own `read` and `share`
+and whether a declaration says it was used (`declared`) or it is there because a writer has
+not declared yet. The rules in `opa/tables.rego` (`readable`, `writable`, `shares`) and
+`opa/blob.rego` (`_reads`) do the cut, so how undeclared data is treated is policy: the shipped
+rules treat an undeclared source like a declared one, and a deployment can, for example,
+require `declared` for someone who may describe a table but not read it. This reverses
+`WHITEPAPER.md` 4.3's "OPA receives only effective sets", whose reason, keeping the chain of
+inputs out of Rego, is gone. The rule checks people, not groups: the whitepaper's formula
+intersects group sets, which would refuse someone who reaches the dataset and a source
+through different groups.
 
 ### 6.1 What follows
 
@@ -491,8 +503,8 @@ Extending `WHITEPAPER.md` section 11:
 platform: no credential without a record. Until declared, everything on that list limits who
 may read the output. A declaration covers the list exactly.
 
-**Decided by OPA.** Registration, grants and vends as before, with who may read a dataset
-given by section 6's rule 3.
+**Decided by OPA.** Registration, grants and vends as before, and section 6's rule 3, from
+the sources governance reports with each dataset.
 
 **Declared and trusted.** Which candidates were used. External inputs. The content of any
 dataset.
@@ -638,6 +650,14 @@ attribution (4.2).
     down to the second: `y2`'s files, written a third of a second after alice's read of
     `x2`, looked older than the read, so `y2` carried nothing once the commit's own window
     passed. Comparisons now lean two seconds the safe way (section 8).
+14. Rule 3 in OPA, run on the stack. alice, in a fresh session, read `t1` and created `z2`,
+    readable by `jgi-writers` and `projw-team`. The lookup OPA gets showed `z2`'s own `read`
+    with `t1` among its sources, `declared` false, and carol was refused; after alice declared
+    `t1` used, `declared` was true and carol still refused; after she declared it unused,
+    `z2` carried nothing and carol read it. alice's read of `t1`, `SHOW TABLES`, carol's
+    index, a broker vend and `seed/check-index-narrowing.py` were as before. A syntax error
+    in the lookup's query denied every read during the change, which is the fail-closed path
+    working.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
