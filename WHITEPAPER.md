@@ -465,6 +465,13 @@ Grants are independent of status. Listings show `live` entries only.
 - **Granularity is the dataset.** No row filters, no column masks. A credential cannot
   express either, and nothing on the byte path could apply them. A narrower audience for part
   of a dataset is a separate dataset.
+- **A dataset is one unit, as a repository is.** Every file in a dataset's folder shares its
+  grants and the sources its files carry, as every file in a GitHub or GitLab repository shares
+  the repository's permissions; no file has grants of its own. Roots and namespaces nest and
+  hold datasets, as GitLab groups and subgroups hold projects. Datasets do not nest: a folder
+  inside a dataset is part of it, because a write credential for the dataset reaches every
+  file under its prefix. This differs from Google Drive, where any file or folder can be
+  shared on its own.
 - **No per-person dynamic filtering.** "Rows where owner is the current user" is not a
   dataset.
 - **Revocation lag.** A grant or group membership change reaches the next decision and
