@@ -12,6 +12,8 @@ package lakehouse.tables
 #                    gate, governance: {tables: [id], namespaces: [id]}, the ones the subject
 #                    may view, and readable: [id], the tables they may read
 #   allow_create     input {subject, id}   gate: may create this table or view now
+#   allow_write      input {subject, id}   governance: may declare what this table was derived
+#                                          from (PROVENANCE.md 5.3)
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
 #   allow_change     input {subject, id, grants: [grant]}
@@ -54,6 +56,11 @@ allow_create if {
 	e.status == "pending"
 	writable(governance.groups(input.subject), e)
 }
+
+# Declaring what a table was derived from needs a group in its write grant.
+default allow_write := false
+
+allow_write if writable(governance.groups(input.subject), table(input.id))
 
 default allow_namespace := false
 

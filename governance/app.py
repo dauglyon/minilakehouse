@@ -17,16 +17,21 @@ exists) vs access (may you READ the bytes) — so a dataset can be see-but-not-r
 
 Governance builds every list; OPA only says which of the candidates it was given pass.
 """
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import ssl
 import threading
 import time
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import boto3
 import index_table
@@ -34,6 +39,7 @@ import jwt
 import psycopg2
 import requests
 from botocore.config import Config
+from cryptography.hazmat.primitives import serialization
 from flask import Flask, Response, jsonify, request
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
@@ -79,6 +85,11 @@ PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}/$")
 GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$")  # <catalog>.<namespace...>
 SUBJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$")
+# An input from outside the platform is named by the hash of its content (PROVENANCE.md 5.3).
+EXTERNAL_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Governance signs each declaration it accepts with this key (pki.py), as a DSSE envelope.
+SIGNING_KEY = os.environ.get("SIGNING_KEY", f"{os.environ.get('PKI_DIR', '/pki')}/signing.key")
+DECLARATION_TYPE = "application/vnd.minilakehouse.derivation+json"
 
 
 def derive_id(prefix):
@@ -201,6 +212,22 @@ CREATE TABLE IF NOT EXISTS accesses (
 );
 DROP INDEX IF EXISTS accesses_session;
 CREATE INDEX IF NOT EXISTS accesses_person ON accesses (person, mode, at);
+-- Declarations (PROVENANCE.md 5.3): one per target per accepted commit to
+-- governance.derivations, with the rows as declared and the record governance signed.
+CREATE TABLE IF NOT EXISTS declarations (
+    id          BIGSERIAL PRIMARY KEY,
+    person      TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    declared_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    envelope    JSONB NOT NULL               -- DSSE envelope over the record
+);
+CREATE TABLE IF NOT EXISTS declared_sources (
+    declaration BIGINT NOT NULL REFERENCES declarations (id),
+    source      TEXT,                        -- empty: the target was declared with no candidates
+    source_type TEXT,                        -- table | files | external
+    used        BOOLEAN NOT NULL
+);
+CREATE INDEX IF NOT EXISTS declarations_person ON declarations (person, target);
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1028,6 +1055,120 @@ def _lineage_rows(subject):
         return cur.fetchall()
 
 
+def _derivation_rows(subject):
+    """Every row the person has declared, oldest declaration first."""
+    with db() as cur:
+        cur.execute("SELECT s.source, s.source_type, d.target, s.used FROM declarations d "
+                    "JOIN declared_sources s ON s.declaration = d.id WHERE d.person = %s "
+                    "ORDER BY d.id, s.source NULLS FIRST", (subject,))
+        return cur.fetchall()
+
+
+def _may_write(subject, target):
+    if TABLE_ID_RE.match(target):
+        return opa("allow_write", {"subject": subject, "id": target}, package="tables") is True
+    return (opa("vend_write", {"subject": subject, "dataset": target}) or {}).get("allow") is True
+
+
+def _check_target(subject, target, rows, lineage):
+    """The declared sources of one target, after the rule of PROVENANCE.md 5.3 for this person:
+    every candidate of theirs gets one `used` value, and nothing else is named but outside
+    inputs by hash. Raises index_table.Refused."""
+    written = [r for r in lineage if r["target"] == target]
+    if not written:
+        raise index_table.Refused(403, "ForbiddenException", f"{target}: you have not written it")
+    if not _may_write(subject, target):
+        raise index_table.Refused(403, "ForbiddenException", f"{target}: not in your write grant")
+    candidates = {r["source"]: r["source_type"] for r in written if r["source"] is not None}
+    declared, types, errors = {}, {}, []
+    for r in rows:
+        source, kind = r.get("source"), r.get("source_type")
+        if source is None:
+            continue
+        if kind == "external":
+            if not EXTERNAL_RE.match(source):
+                errors.append(f"an outside input is named sha256:<64 hex digits>, not {source}")
+        elif source not in candidates:
+            errors.append(f"not a candidate: {source} (an outside input needs source_type 'external')")
+            continue
+        elif kind not in (None, candidates[source]):
+            errors.append(f"{source} is {candidates[source]}, not {kind}")
+        if declared.setdefault(source, r["used"]) != r["used"]:
+            errors.append(f"{source} declared both used and unused")
+        types[source] = kind or candidates.get(source)
+    if missing := sorted(set(candidates) - set(declared)):
+        errors.append("not declared: " + ", ".join(missing))
+    if errors:
+        raise index_table.Refused(400, "BadRequestException", f"{target}: " + "; ".join(errors))
+    return {"candidates": sorted(candidates),
+            "sources": [{"source": s, "source_type": types[s], "used": u} for s, u in sorted(declared.items())]}
+
+
+def _sign(record):
+    """A DSSE envelope over the record, signed with governance's key."""
+    with open(SIGNING_KEY, "rb") as f:
+        key = serialization.load_pem_private_key(f.read(), password=None)
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    pae = b"DSSEv1 %d %s %d %s" % (len(DECLARATION_TYPE), DECLARATION_TYPE.encode(), len(payload), payload)
+    raw_pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return {"payloadType": DECLARATION_TYPE, "payload": base64.b64encode(payload).decode(),
+            "signatures": [{"keyid": hashlib.sha256(raw_pub).hexdigest()[:16],
+                            "sig": base64.b64encode(key.sign(pae)).decode()}]}
+
+
+def _declare(subject, rows):
+    """Check and store the rows of one commit to governance.derivations: one declaration per
+    target named, all stored in one transaction, or the commit is refused."""
+    if not rows or not all(isinstance(r.get("target"), str) and isinstance(r.get("used"), bool)
+                           for r in rows):
+        raise index_table.Refused(400, "BadRequestException", "every row needs a target and used")
+    by_target = {}
+    for r in rows:
+        by_target.setdefault(r["target"], []).append(r)
+    lineage = _lineage_rows(subject)
+    checked = {t: _check_target(subject, t, trs, lineage) for t, trs in sorted(by_target.items())}
+    now = datetime.now(timezone.utc)
+    with db(commit=True) as cur:
+        for target, c in checked.items():
+            record = {"person": subject, "target": target, "declared_at": now.isoformat(), **c}
+            cur.execute("INSERT INTO declarations (person, target, declared_at, envelope) "
+                        "VALUES (%s, %s, %s, %s) RETURNING id",
+                        (subject, target, now, json.dumps(_sign(record))))
+            declaration = cur.fetchone()["id"]
+            for src in c["sources"] or [{"source": None, "source_type": None, "used": True}]:
+                cur.execute("INSERT INTO declared_sources (declaration, source, source_type, used) "
+                            "VALUES (%s, %s, %s, %s)",
+                            (declaration, src["source"], src["source_type"], src["used"]))
+    app.logger.info("DECLARE person=%s %s", subject, " ".join(
+        f"{t}:{sum(s['used'] for s in c['sources'])}/{len(c['sources'])}" for t, c in checked.items()))
+
+
+def _iceberg_error(status, kind, message):
+    return jsonify({"error": {"message": message, "type": kind, "code": status}}), status
+
+
+@app.post("/index/commit")
+def index_commit():
+    # The gate's answer to an engine's commit to one of <catalog>.governance's tables, on the
+    # person's own token. Only derivations accepts one: its rows are a declaration, checked and
+    # stored before the commit is accepted (PROVENANCE.md 5.3, 5.5).
+    claims, err = authed_claims(CATALOG_AUDIENCE)
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    name = body.get("table")
+    if name not in index_table.WRITABLE:
+        return _iceberg_error(403, "ForbiddenException", f"governance.{name} is read-only")
+    subject = subject_of(claims)
+    try:
+        built = index_table.commit(subject, name, body.get("commit") or {},
+                                   lambda rows: _declare(subject, rows))
+    except index_table.Refused as e:
+        app.logger.info("REFUSE declaration person=%s: %s", subject, e.message)
+        return _iceberg_error(e.status, e.kind, e.message)
+    return jsonify(built)
+
+
 @app.post("/index/load")
 def index_load():
     # The gate's answer to a catalog load of one of <catalog>.governance's tables
@@ -1045,6 +1186,8 @@ def index_load():
         rows = _session_rows(subject, sid)
     elif name == "lineage":
         rows = _lineage_rows(subject)
+    elif name == "derivations":
+        rows = _derivation_rows(subject)
     else:
         return jsonify({"error": "no such table"}), 404
     table = index_table.build(subject, name, rows)
@@ -1059,15 +1202,119 @@ def _s3_error(status, code):
                     status=status, content_type="application/xml")
 
 
-# S3 GetObject/HeadObject for the index's files, served on INDEX_PORT to requests addressed to
-# governance-index.storage. The signature names the person; they may read only their own prefix.
+# The S3 calls engines make on the governance tables' files, served on INDEX_PORT to requests
+# addressed to governance-index.storage. The signature names the person; they may read only
+# their own prefix, and write only under their own writable tables (index_table.writable_key).
 index_app = Flask("index")
+MAX_UPLOADS = 64   # multipart uploads in progress, oldest dropped first
+_uploads = {}      # upload id -> (subject, key, {part number: bytes})
+_uploads_lock = threading.Lock()
+
+
+def _signer():
+    raw_path, _, raw_query = (request.environ.get("RAW_URI") or request.path).partition("?")
+    return index_table.verify(request.method, raw_path, raw_query, request.headers)
+
+
+def _xml(tag, inner, status=200):
+    return Response(f'<?xml version="1.0" encoding="UTF-8"?><{tag}>{inner}</{tag}>', status=status,
+                    content_type="application/xml")
+
+
+def _payload():
+    """The request body: decoded from aws-chunked encoding when the engine streams it, else
+    checked against the hash the signature covers. None when the hash does not match. Chunk
+    signatures are not checked: the request's own signature already names the person, and the
+    bytes are that person's own upload."""
+    raw = request.get_data()
+    declared = request.headers.get("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+    if declared.startswith("STREAMING-"):
+        out, i = bytearray(), 0
+        while (j := raw.find(b"\r\n", i)) >= 0:
+            size = int(raw[i:j].split(b";")[0], 16)
+            if size == 0:
+                break
+            out += raw[j + 2:j + 2 + size]
+            i = j + 2 + size + 2
+        return bytes(out)
+    if re.fullmatch(r"[0-9a-f]{64}", declared) and hashlib.sha256(raw).hexdigest() != declared:
+        return None
+    return raw
+
+
+@index_app.post("/")
+def index_delete_objects():
+    # DeleteObjects names its keys in the body; an engine sends it to abandon a write.
+    subject = _signer()
+    if subject is None or "delete" not in request.args:
+        return _s3_error(403, "AccessDenied")
+    keys = [e.text or "" for e in ET.fromstring(request.get_data()).iter() if e.tag.endswith("Key")]
+    for k in keys:
+        if index_table.writable_key(subject, k):
+            index_table.delete(k)
+    return _xml("DeleteResult", "".join(f"<Deleted><Key>{escape(k)}</Key></Deleted>" for k in keys))
+
+
+@index_app.route("/<path:key>", methods=["PUT", "POST", "DELETE"])
+def index_write(key):
+    subject = _signer()
+    if subject is None or not index_table.writable_key(subject, key):
+        return _s3_error(403, "AccessDenied")
+    args = request.args
+    if request.method == "POST" and "uploads" in args:   # CreateMultipartUpload
+        upload = secrets.token_hex(16)
+        with _uploads_lock:
+            _uploads[upload] = (subject, key, {})
+            while len(_uploads) > MAX_UPLOADS:
+                _uploads.pop(next(iter(_uploads)))
+        return _xml("InitiateMultipartUploadResult",
+                    f"<Bucket>{index_table.BUCKET}</Bucket><Key>{escape(key)}</Key><UploadId>{upload}</UploadId>")
+    upload = args.get("uploadId")
+    with _uploads_lock:
+        state = _uploads.get(upload) if upload else None
+    if upload and (state is None or state[:2] != (subject, key)):
+        return _s3_error(404, "NoSuchUpload")
+    if request.method == "DELETE":
+        if upload:                                         # AbortMultipartUpload
+            with _uploads_lock:
+                _uploads.pop(upload, None)
+        else:                                              # DeleteObject
+            index_table.delete(key)
+        return Response(status=204)
+    if request.method == "POST" and upload:                # CompleteMultipartUpload
+        numbers = [int(e.text) for e in ET.fromstring(request.get_data()).iter() if e.tag.endswith("PartNumber")]
+        parts = state[2]
+        if not numbers or any(n not in parts for n in numbers):
+            return _s3_error(400, "InvalidPart")
+        data = b"".join(parts[n] for n in numbers)
+        with _uploads_lock:
+            _uploads.pop(upload, None)
+        if not index_table.put(subject, key, data):
+            return _s3_error(403, "AccessDenied")
+        etag = f'"{hashlib.md5(data).hexdigest()}-{len(numbers)}"'
+        return _xml("CompleteMultipartUploadResult",
+                    f"<Bucket>{index_table.BUCKET}</Bucket><Key>{escape(key)}</Key><ETag>{escape(etag)}</ETag>")
+    if request.method != "PUT":
+        return _s3_error(400, "InvalidRequest")
+    data = _payload()
+    if data is None:
+        return _s3_error(400, "XAmzContentSHA256Mismatch")
+    if upload:                                             # UploadPart
+        with _uploads_lock:
+            state[2][int(args.get("partNumber", "0"))] = data
+            held = sum(len(b) for b in state[2].values())
+        if held > index_table.MAX_UPLOAD:
+            with _uploads_lock:
+                _uploads.pop(upload, None)
+            return _s3_error(400, "EntityTooLarge")
+    elif not index_table.put(subject, key, data):          # PutObject
+        return _s3_error(403, "AccessDenied")
+    return Response(status=200, headers={"ETag": f'"{hashlib.md5(data).hexdigest()}"'})
 
 
 @index_app.route("/<path:key>", methods=["GET", "HEAD"])
 def index_object(key):
-    raw_path, _, raw_query = (request.environ.get("RAW_URI") or request.path).partition("?")
-    subject = index_table.verify(request.method, raw_path, raw_query, request.headers)
+    subject = _signer()
     if subject is None or not key.startswith(subject + "/"):
         return _s3_error(403, "AccessDenied")
     data = index_table.read(f"s3://{index_table.BUCKET}/{key}")

@@ -1,7 +1,7 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-Build step 1 (section 10) is implemented; the rest is design. Section 10 lists what was run
-against the stack on 2026-10-22 and what each run showed. The document extends
+Build step 1 and the first part of step 2 (section 10) are implemented; the rest is design.
+Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The document extends
 `WHITEPAPER.md`, whose derivation rule (section 4.3) consumes each dataset's `inputs`.
 
 ## 1. Purpose
@@ -188,15 +188,26 @@ column.
 | `used` | boolean |
 
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
-whole: for every target it names, the rows must give each of that target's candidates a
-`used` value; every `external` row's source is a hash; the target is `pending` and a caller
-group is in its `write`. A source named twice with the same `used` counts once; named with
+whole: for every target it names, the caller must have written it, a caller group must be in
+its `write`, and the rows must give each of the caller's own candidates of that target a
+`used` value; every `external` row's source is a hash. A source named twice with the same `used` counts once; named with
 both values, the commit is refused. A source that is not a candidate is refused unless its
 `source_type` is `external`, so a mistyped id is never recorded as an outside input. A row
 with an empty source, which a target with no candidates has in `lineage`, names no input. On
-success governance stores the rows, signs the record, and sets the target `live`. Otherwise
-the commit is refused with an Iceberg error and nothing is stored; the person sees the reason
-as the statement's error.
+success governance stores the rows and signs the record: a DSSE envelope, the envelope in-toto
+attestations use, over the person, the target, the time, the person's candidates and the
+declared sources, signed with governance's Ed25519 key (`signing.key`, made by
+`governance/pki.py`). Otherwise the commit is refused with an Iceberg error and nothing is
+stored; the person sees the reason as the statement's error.
+
+Each person who wrote a target declares their own candidates, and the target goes `live` once
+everyone who wrote it has declared. A person's `lineage` holds only their own sessions, and
+only the person who made a read can say whether they used it. This is in-toto's model: each
+functionary signs the link for the step they ran, and a product verifies only with every
+step's link. Rejected: one person declaring for every writer, which would show them the
+other writers' reads (some naming datasets they may not see) and have them vouch for reads
+they did not make; and one writer per output, which stops a group working on a shared output.
+Setting `live` and the grant recomputation below are build step 2's second part, not built.
 
 Governance recomputes the target's grants from the record as `WHITEPAPER.md` 4.3 specifies:
 its `inputs` are the candidates marked used. `external` rows are recorded and shown and take
@@ -267,38 +278,41 @@ WHERE target = 'lakehouse.db.joined';
 An Iceberg write from any client is three catalog steps. The gate sees all three for the
 `governance` namespace:
 
-1. Load the table with a write credential. Governance builds the person's current table in
-   memory, as `index_table.build` does for the index, and returns its metadata and a
-   credential bound to the person's prefix on governance's endpoint.
-2. Put the data file, a manifest and a manifest list under the table's location. Docker DNS
-   sends that bucket's host name, `governance-index.storage.internal`, to governance, whose
-   S3 shim checks the signature and keeps the bytes in memory. The shim serves `GET`
-   and `HEAD` today (`governance/app.py`, `index_object`) and must accept `PUT` and multipart
-   uploads, since the engine decides how to write and a file grows with the list.
-3. Commit: a requirement that the branch still points at the loaded snapshot, an
-   `add-snapshot` naming the manifest list, a `set-snapshot-ref`. Governance follows the
-   manifest list to the data files it holds, reads the rows with pyarrow, checks the
-   requirement so a concurrent commit is refused the standard way, validates the rows as
-   section 5.3 says, and in one Postgres transaction stores the record. The response is the
-   person's table rebuilt from Postgres, so the next `SELECT` shows what was stored.
+1. Load the table with a credential. Governance builds the person's current table in memory,
+   as `index_table.build` does for the index, and returns its metadata and a credential that
+   reads the person's prefix on governance's endpoint and puts new files under their own
+   governance tables.
+2. Put the data file (Parquet), a manifest and a manifest list (Avro), and Trino's statistics
+   file under the table's location. Docker DNS sends that bucket's host name,
+   `governance-index.storage.internal`, to governance, whose S3-style endpoint checks the
+   signature and keeps the bytes in memory (`governance/app.py`, `index_write`). It accepts
+   PutObject, multipart uploads and DeleteObjects; it refuses a put to a key that already
+   holds a file, since engines write every file once under a new name and governance's own
+   files must stay as built, and it caps a person's uploads at 64 MiB.
+3. Commit: requirements, such as the branch still pointing at the loaded snapshot, and
+   updates: `add-snapshot` naming the manifest list, `set-snapshot-ref`, and Trino's
+   `set-statistics`. Governance checks the requirements against the table the person last
+   loaded, so a commit against a changed table is refused the standard way, applies the
+   updates with pyiceberg, follows the new snapshot's manifests to the data files it added,
+   reads their rows with pyarrow, validates them as section 5.3 says, and in one Postgres
+   transaction stores the record. Anything but appended rows is refused, so a `DELETE` or
+   `UPDATE` fails. The response is the committed metadata, the engine's own snapshot
+   included; the next load rebuilds the table from Postgres.
 
 Nothing durable comes from the in-memory table. Postgres is the record; the Iceberg table is
-a view of it that accepts writes.
-
-Unverified: whether Trino's REST commit path accepts a response whose metadata does not
-contain the snapshot it proposed. If it insists, governance appends the validated rows as that
-snapshot instead of rebuilding. Also unverified: that a commit error body from the gate
-surfaces its message through Trino's "Failed to commit" wrapper the way create refusals
-already surface through "Failed to create transaction".
+a view of it that accepts writes. Other tables in the namespace accept the upload and refuse
+the commit, so the person's error names the table rather than a failed file write.
 
 ## 6. Lifecycle of an output
 
 - Registered `pending`, created as today: the gate admits a create for a registered pending
   table whose caller is in its `write`; a file dataset gets a write credential on `write`.
 - Written in one or more sessions. Each write is recorded with its session (4.2).
-- Declared, from any session, by an `INSERT` into `derivations` naming it. Candidates come
-  from its writing sessions, never from the declaring one.
-- `live` on a successful declaration. Listed and readable per its recomputed grants.
+- Declared, from any session, by an `INSERT` into `derivations` naming it, by each person
+  who wrote it. Candidates come from each declarer's writing sessions, never from the
+  declaring one.
+- `live` once everyone who wrote it has declared. Listed and readable per its recomputed
+  grants.
 - An output never declared stays `pending`: readable by its steward, listed for no one else.
 - A later write to a live output by a new session adds that session's reads to the
   candidates; the next declaration must cover them. Whether a live output may be written
@@ -363,10 +377,6 @@ login that outlives Keycloak's session maximum forces a re-login mid-work, which
 pointer absorbs. Setting the maximum to an environment's intended lifetime removes the
 interruption. Whether offline sessions keep a stable `sid` is unverified.
 
-**Outputs written by more than one person.** `lineage` shows a person only their own
-sessions' rows, but an output in two people's `write` can be written by both, and its
-candidates include both people's reads. A declarer cannot see the other writer's candidates,
-and some may name datasets the declarer may not see at all. To decide before step 2.
 
 ## 10. Evidence and build order
 
@@ -410,8 +420,23 @@ attribution (4.2).
    `run2`; a read credential for `projx/public` there. `lineage` showed the read in `run2`
    with no target, and `projx/public` paired with `projz` in `default`, with the earlier
    reads of `default`.
+9. Build step 2, first part, through Trino as alice, whose `lineage` paired `t2` with `t1`.
+   `INSERT INTO governance.derivations SELECT DISTINCT source, source_type, target, true FROM
+   governance.lineage WHERE target = 'lakehouse.db.t2'` was accepted, and a `SELECT` read
+   the row back. Trino accepted the commit response, which holds its own snapshot, and a
+   refusal reached the person as "Failed to commit the transaction during insert: Malformed
+   request: lakehouse.db.t2: not declared: lakehouse.db.t1" (400 is Malformed request, 403
+   Forbidden). Refused as they should be: a missing candidate, a source that is not a
+   candidate, a target alice never wrote, any target for bob, an insert into
+   `governance.lineage`, and a `DELETE` from `derivations`. Accepted: `t1` unused plus an
+   outside input by hash. Every stored envelope verified against `signing.pub`, and an altered
+   payload did not. With boto3 on a credential from a load: a multipart upload read back
+   whole, DeleteObjects removed the object, and puts over an existing file, under bob's
+   prefix, and outside the governance tables were refused.
 
-Gotchas recorded on the way: RGW merges a put of the bucket notification configuration into
+Gotchas recorded on the way: pyiceberg 0.10's `SetStatisticsUpdate` reads its `statistics`
+field as an object before validating it, so one parsed from JSON fails; governance builds that
+update itself (`index_table._update`). RGW merges a put of the bucket notification configuration into
 the existing one rather than replacing it, so removing an entry needs
 `radosgw-admin notification rm`; roles and policies are removed with `role delete` and
 `role-policy delete`.
@@ -420,8 +445,10 @@ Build order, each step usable on its own:
 
 1. Built. The access log and the session pointer in governance; the broker and the gate
    recording fail-closed; `governance.sessions` and `governance.lineage` served read-only.
-2. `governance.derivations`: the S3 shim's `PUT` and multipart; commit parsing and
-   validation; the recomputed grants; `pending` to `live` on declaration.
+2. `governance.derivations`, in two parts. First, built: uploads to governance's endpoint,
+   commit parsing and validation, the signed record. Second: a target `live` once everyone
+   who wrote it has declared, and its grants recomputed by `WHITEPAPER.md` 4.3; waits on
+   "Writes to a live output" (section 9).
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md` and the "inputs are trusted" statements in its sections 4.3,

@@ -20,9 +20,10 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    governance, which marks the entry live or gone. Registering and renaming tables are refused
    (root-only in Polaris too).
 6. The governance namespace. The gate answers for one namespace itself, `governance`, holding
-   read-only tables: `datasets` (the dataset index), `sessions` and `lineage`. A load of one
+   `datasets` (the dataset index), `sessions`, `lineage` and `derivations`. A load of one
    returns governance's per-person table (governance/index_table.py), whose files governance
-   serves. Polaris holds neither.
+   serves; a commit to `derivations` goes to governance, which accepts it only as a valid
+   declaration (PROVENANCE.md 5.3). Polaris holds none of them.
 7. The access log (PROVENANCE.md 4.1). Before it passes on any response that hands out a
    storage credential, the gate has governance log it: a read of the table the path names, or
    on a create a write of the new table; before it forwards a table create or commit, the
@@ -60,7 +61,7 @@ RESERVED = {"root", "provisioner"}  # Polaris's own principals
 DELEGATION = "x-iceberg-access-delegation"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
-INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "lineage")
+INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "lineage", "derivations")
 # Hop-by-hop headers, and ones requests recomputes after decoding the body.
 DROP = {"host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authorization", "proxy-authenticate", "content-length", "content-encoding"}
@@ -154,11 +155,17 @@ def index_answer(named, segments):
             r = _http.post(f"{GOVERNANCE}/index/load", timeout=60, json={"table": name},
                            headers={"Authorization": request.headers["Authorization"]})
             return relay(r)
+        if request.method == "POST" and segments[-1] == name:
+            r = _http.post(f"{GOVERNANCE}/index/commit", timeout=60,
+                           json={"table": name, "commit": request.get_json(silent=True) or {}},
+                           headers={"Authorization": request.headers["Authorization"]})
+            return relay(r)
         if request.method == "POST" and segments[-1] == "metrics":
             return "", 204
     if kind in ("table", "view"):
         return not_found(kind, named[2], name)
-    return forbidden("the governance namespace holds read-only tables")
+    return forbidden("the governance namespace is governance's own; "
+                     "only governance.derivations takes inserted rows")
 
 
 def forbidden(message):
@@ -377,7 +384,7 @@ def proxy(_):
         new_tables, new_namespaces = creates(segments, body) if request.method == "POST" else ([], [])
         for n in new_namespaces:
             if n is not None and n.split(".")[1:2] == [INDEX_NS]:
-                return forbidden("the governance namespace holds read-only tables")
+                return forbidden("the governance namespace is governance's own")
             if n is None or opa("allow_namespace", {"subject": subject, "id": n}) is not True:
                 return forbidden(f"none of your groups owns {n} or a namespace above it")
         for t in new_tables:

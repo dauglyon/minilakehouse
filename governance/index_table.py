@@ -1,8 +1,8 @@
 """
 index_table — the tables of the `governance` namespace, Iceberg tables whose files governance
 builds per person when they are asked for: `datasets` (every live dataset and table the
-person may see, decided by OPA), `sessions` (their sessions) and `lineage` (what each of their
-sessions read and wrote; PROVENANCE.md 5).
+person may see, decided by OPA), `sessions` (their sessions), `lineage` (what each of their
+sessions read and wrote) and `derivations` (what they declared; PROVENANCE.md 5).
 
 The gate answers the catalog's load request for `<catalog>.governance.<table>` by calling
 governance's POST /index/load with the person's own token. Governance works out that person's
@@ -14,6 +14,11 @@ SigV4 signature and serves a person only their own prefix.
 
 Nothing is written to storage. The version is a hash of the rows, so a changed row set gets
 new file paths: a cache keyed by path can never return stale rows or someone else's.
+
+`derivations` also accepts an engine's append (commit): the engine puts its data and manifest
+files through the same endpoint, under the person's own table, and commits through the gate.
+commit() applies the commit to the table the person last loaded, reads the rows it appends,
+and hands them to the caller's check, which stores them or refuses the commit.
 """
 import calendar
 import hashlib
@@ -27,10 +32,22 @@ import time
 from collections import OrderedDict
 from urllib.parse import parse_qsl, quote
 
+import uuid
+
 import pyarrow as pa
+import pyarrow.parquet as pq
+from pydantic import TypeAdapter, ValidationError
 from pyiceberg.catalog.sql import SqlCatalog
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.io import FileIO
+from pyiceberg.manifest import DataFileContent, ManifestContent, ManifestEntryStatus
 from pyiceberg.schema import Schema
+from pyiceberg.table.metadata import TableMetadataUtil
+from pyiceberg.table.snapshots import Operation
+from pyiceberg.table.statistics import StatisticsFile
+from pyiceberg.table.update import (AddSnapshotUpdate, RemoveStatisticsUpdate, SetSnapshotRefUpdate,
+                                    SetStatisticsUpdate, TableRequirement, TableUpdate,
+                                    update_table_metadata)
 from pyiceberg.types import BooleanType, NestedField, StringType, TimestamptzType
 
 BUCKET = "governance-index"
@@ -50,7 +67,25 @@ TABLES = {
     "lineage": _schema(("source", StringType), ("source_type", StringType),     # table | files
                        ("target", StringType), ("target_type", StringType),
                        ("session", StringType), ("event_time", TimestamptzType)),
+    "derivations": _schema(("source", StringType), ("source_type", StringType),  # + external
+                           ("target", StringType), ("used", BooleanType)),
 }
+WRITABLE = {"derivations"}
+# The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine
+# may attach afterwards.
+_APPEND_UPDATES = (AddSnapshotUpdate, SetSnapshotRefUpdate, SetStatisticsUpdate,
+                   RemoveStatisticsUpdate)
+_REQUIREMENT = TypeAdapter(TableRequirement)
+_UPDATE = TypeAdapter(TableUpdate)
+
+
+def _update(u):
+    # pyiceberg 0.10's SetStatisticsUpdate reads `statistics` as an object before validating
+    # it, so one parsed from JSON fails; Trino sends one with every insert.
+    if isinstance(u, dict) and u.get("action") == "set-statistics" and isinstance(u.get("statistics"), dict):
+        return SetStatisticsUpdate(statistics=StatisticsFile.model_validate(u["statistics"]))
+    return _UPDATE.validate_python(u)
+MAX_UPLOAD = 64 * 1024 * 1024   # bytes a person may hold in uploaded files at once
 MAX_TABLES = 256          # built tables kept, least recently loaded evicted first
 CREDENTIAL_TTL = 900      # seconds a storage credential from /index/load stays valid
 CLOCK_SKEW = 900          # seconds a signed request's date may differ from now
@@ -59,6 +94,15 @@ _lock = threading.Lock()
 _files = {}               # s3 path -> bytes, for every built table
 _tables = OrderedDict()   # (subject, table, version) -> {"metadata-location", "metadata"}
 _keys = {}                # access key -> (secret, session token, subject, expires)
+_current = {}             # (subject, table) -> the table the person last loaded or committed
+
+
+class Refused(Exception):
+    """A commit refused with an Iceberg REST error: HTTP status, error type, message."""
+
+    def __init__(self, status, kind, message):
+        super().__init__(message)
+        self.status, self.kind, self.message = status, kind, message
 
 
 class _Out(io.BytesIO):
@@ -115,6 +159,7 @@ def build(subject, name, rows):
     with _lock:
         if key in _tables:
             _tables.move_to_end(key)
+            _current[(subject, name)] = _tables[key]
             return _tables[key]
     schema = TABLES[name]
     catalog = SqlCatalog("index", uri="sqlite:///:memory:", warehouse=f"s3://{BUCKET}",
@@ -128,12 +173,102 @@ def build(subject, name, rows):
              "metadata": json.loads(table.metadata.model_dump_json())}
     with _lock:
         _tables[key] = built
+        _current[(subject, name)] = built
         while len(_tables) > MAX_TABLES:
             (old_subject, old_name, old_version), _ = _tables.popitem(last=False)
             prefix = f"s3://{BUCKET}/{old_subject}/{old_name}/{old_version}/"
             for path in [p for p in _files if p.startswith(prefix)]:
                 del _files[path]
     return built
+
+
+def commit(subject, name, body, check):
+    """Apply an engine's commit (an Iceberg REST UpdateTableRequest) to the person's table
+    `name`, as last loaded or committed. The updates may only append; the requirements must
+    hold, so a commit against a table that has changed since it was loaded is refused the
+    standard way. check(rows) gets the rows the new snapshots add and raises Refused to refuse
+    the commit. Returns the committed table."""
+    with _lock:
+        base_built = _current.get((subject, name))
+    if base_built is None:
+        raise Refused(409, "CommitFailedException", f"governance.{name} changed; load it again")
+    base = TableMetadataUtil.parse_obj(base_built["metadata"])
+    try:
+        requirements = [_REQUIREMENT.validate_python(r) for r in body.get("requirements") or []]
+        updates = tuple(_update(u) for u in body.get("updates") or [])
+    except (ValidationError, AttributeError, KeyError, TypeError) as e:
+        raise Refused(400, "BadRequestException", f"not an Iceberg commit: {e}") from e
+    if not all(isinstance(u, _APPEND_UPDATES) for u in updates):
+        raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+    try:
+        for r in requirements:
+            r.validate(base)
+    except CommitFailedException as e:
+        raise Refused(409, "CommitFailedException", str(e)) from e
+    new = update_table_metadata(base, updates)
+    io, rows = MemIO(), []
+    for snapshot in new.snapshots:
+        if base.snapshot_by_id(snapshot.snapshot_id) is not None:
+            continue
+        if snapshot.summary is None or snapshot.summary.operation != Operation.APPEND:
+            raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+        for manifest in snapshot.manifests(io):
+            if manifest.added_snapshot_id != snapshot.snapshot_id:
+                continue   # carried over from an earlier snapshot
+            if manifest.content != ManifestContent.DATA:
+                raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+            for entry in manifest.fetch_manifest_entry(io):
+                if entry.status != ManifestEntryStatus.ADDED:
+                    continue
+                if entry.data_file.content != DataFileContent.DATA:
+                    raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+                data = read(entry.data_file.file_path)
+                if data is None:
+                    raise Refused(400, "BadRequestException", f"missing data file {entry.data_file.file_path}")
+                rows += pq.read_table(pa.BufferReader(data)).to_pylist()
+    check(rows)
+    location = f"{new.location}/metadata/{uuid.uuid4()}.metadata.json"
+    text = new.model_dump_json()
+    built = {"metadata-location": location, "metadata": json.loads(text)}
+    with _lock:
+        _files[location] = text.encode()
+        _current[(subject, name)] = built
+    return built
+
+
+def writable_key(subject, key):
+    """Whether the person may put an object at this key: under one of their own tables. Only
+    WRITABLE tables accept the commit that would use it; an upload for another is kept so that
+    the commit, not the upload, carries the refusal the person sees."""
+    parts = key.split("/")
+    return len(parts) > 2 and parts[0] == subject and parts[1] in TABLES
+
+
+def put(subject, key, data):
+    """Store an uploaded object. Refused (False) when the key already holds a file, since engines
+    write every file once under a new name and governance's own files must stay as built, or
+    when the person's uploads would exceed MAX_UPLOAD."""
+    path = f"s3://{BUCKET}/{key}"
+    mine = f"s3://{BUCKET}/{subject}/"
+    with _lock:
+        if path in _files:
+            return False
+        held = sum(len(v) for p, v in _files.items()
+                   if p.startswith(mine) and not p.endswith(".metadata.json"))
+        if held + len(data) > MAX_UPLOAD:
+            return False
+        _files[path] = data
+    return True
+
+
+def delete(key):
+    """Remove an uploaded object. Files of a built or committed table are kept: an engine
+    deletes only the files of a write it abandoned."""
+    path = f"s3://{BUCKET}/{key}"
+    with _lock:
+        built = any(path.startswith(t["metadata"]["location"] + "/") for t in _tables.values())
+        if not built:
+            _files.pop(path, None)
 
 
 def mint(subject):

@@ -8,7 +8,8 @@ its certificate from files it mounts; a file, unlike OPA's environment, cannot b
 through OPA's query API.
 
 Each party gets its own volume: /pki/ca (the CA, this job only), /pki/governance (the server
-certificate), /pki/opa, /pki/gate and /pki/broker (client certificates). Existing files are kept and a
+certificate, and the Ed25519 key governance signs declarations with, PROVENANCE.md 5.3),
+/pki/opa, /pki/gate and /pki/broker (client certificates). Existing files are kept and a
 missing certificate is added under the existing CA, so the job is safe to rerun.
 """
 import datetime
@@ -16,7 +17,7 @@ import os
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 CA_DIR, GOV_DIR = "/pki/ca", "/pki/governance"
@@ -103,6 +104,12 @@ def main():
         _write(f"{d}/{stem}.crt", cert.public_bytes(serialization.Encoding.PEM))
         _write(f"{d}/{stem}.key", _pem_key(key), 0o600, owner)
         made.append(name)
+    if not os.path.exists(f"{GOV_DIR}/signing.key"):
+        key = ed25519.Ed25519PrivateKey.generate()
+        _write(f"{GOV_DIR}/signing.key", _pem_key(key), 0o600, 0)
+        _write(f"{GOV_DIR}/signing.pub", key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+        made.append("signing key")
     print(f"pki: created {', '.join(made)}" if made else "pki: certificates exist")
 
 

@@ -398,8 +398,26 @@ q bob --execute "SELECT count(*) FROM iceberg.governance.lineage"
 
 `t2` is paired with `t1` although `CREATE TABLE t2 AS SELECT 2 AS y` read nothing: the session
 had read `t1` before it. Rows are per session, so an output's candidates (`WHERE target =
-'<id>'`) are everything its session read before writing it; declaring which were used, the
-next build step, narrows that.
+'<id>'`) are everything its session read before writing it, and declaring which were used
+narrows that. A declaration is an insert into `governance.derivations` covering every one of
+the person's own candidates of the target; governance checks it at the commit, stores it, and
+signs it. An input from outside the platform is a row with `source_type` `external` and its
+`sha256:` hash as the source.
+
+```bash
+q alice --execute "INSERT INTO iceberg.governance.derivations
+  SELECT DISTINCT source, source_type, target, false
+  FROM iceberg.governance.lineage WHERE target = 'lakehouse.db.t2'"
+#  -> INSERT: 1 row
+q alice --execute "INSERT INTO iceberg.governance.derivations VALUES (NULL, NULL, 'lakehouse.db.t2', true)"
+#  -> Query ... failed: Failed to commit the transaction during insert: Malformed request:
+#     lakehouse.db.t2: not declared: lakehouse.db.t1
+q alice --execute "SELECT * FROM iceberg.governance.derivations"
+#  -> "lakehouse.db.t1","table","lakehouse.db.t2","false"
+```
+
+What a declaration changes, the target going live and its grants following its inputs, is not
+built yet.
 
 ## Security model
 
