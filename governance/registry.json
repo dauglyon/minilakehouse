@@ -19,7 +19,7 @@
       "id": "lakehouse.db.t1",
       "description": "demo table",
       "steward": "alice",
-      "see": [],
+      "describe": [],
       "read": ["jgi-writers"],
       "share": ["jgi-writers"],
       "write": ["jgi-writers"],
@@ -35,7 +35,7 @@
       "prefix": "datasets/projx/public/",
       "description": "projx public data",
       "steward": "alice",
-      "visibility": ["jgi-writers"],
+      "describe": ["jgi-writers"],
       "access": ["jgi-writers"],
       "share": ["jgi-writers"]
     },
@@ -43,7 +43,7 @@
       "prefix": "datasets/projx/private/",
       "description": "projx private data",
       "steward": "alice",
-      "visibility": ["jgi-writers"],
+      "describe": ["jgi-writers"],
       "access": [],
       "share": ["jgi-writers"]
     },
@@ -51,7 +51,7 @@
       "prefix": "datasets/projy/secret/",
       "description": "projy secret data",
       "steward": "bob",
-      "visibility": ["bob-only"],
+      "describe": ["bob-only"],
       "access": ["bob-only"]
     }
   ]

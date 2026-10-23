@@ -76,7 +76,7 @@ allow_register if {
 	namespace_owned(gs, namespace(_parent(input.id)))
 }
 
-# Changing grants (WHITEPAPER 4.4): `see` and `read` by a group holding `share` on the table;
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the table;
 # `share`, `write` and `delete` by a group owning its namespace, the ownership registration
 # checks.
 default allow_change := false
@@ -91,7 +91,7 @@ allow_change if {
 }
 
 _may_change(gs, e, g) if {
-	g in {"see", "read"}
+	g in {"describe", "read"}
 	some x in gs
 	x in e.share
 }
@@ -125,12 +125,12 @@ readable(groups, e) if {
 	g in array.concat(e.read, e.write)
 }
 
-# Governance's dataset index offers OPA only tables whose see, read or write names one of the
+# Governance's dataset index offers OPA only tables whose describe, read or write names one of the
 # person's groups (governance/app.py _index_rows); a change to what makes a table viewable
 # changes that too.
 viewable(groups, e) if {
 	some g in groups
-	g in array.concat(e.see, array.concat(e.read, e.write))
+	g in array.concat(e.describe, array.concat(e.read, e.write))
 }
 
 writable(groups, e) if {

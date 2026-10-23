@@ -106,7 +106,7 @@ service.
 | `kind` | `table` or `blob`. Views are `table`. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `see`, `read`, `share`, `write`, `delete` | Five sets of groups. See 4.2. |
+| `describe`, `read`, `share`, `write`, `delete` | Five sets of groups. See 4.2. |
 | `inputs` | Ids of datasets this one was built from. Set at registration, immutable. Every input must already exist and ids are never reused, so the input graph is acyclic. |
 | `widenings` | Per grant, groups the publisher added past the inputs' intersection, each with the covering groups and inputs that justified it. See 4.3. |
 | `status` | `pending`, `live`, `gone`. See section 9. |
@@ -118,7 +118,7 @@ grants; Keycloak only proves who a person is. Each group has owners, which are g
 section 4.4 says who changes membership. A membership change applies at the person's next
 request, since every rule looks the person's groups up at decision time.
 
-- **see**: the dataset appears in listings for this group. For a table, in Polaris's listing
+- **describe**: the dataset appears in listings for this group. For a table, in Polaris's listing
   through the gate, and its metadata can be loaded: whether it exists, its columns, and its
   storage location; for every dataset, in the catalog's listing.
 - **read**: for a table, obtaining a read credential for its files, which returns its
@@ -133,26 +133,26 @@ request, since every rule looks the person's groups up at decision time.
   not include dropping it. A file dataset has no `delete`: its `write` credential already
   deletes objects.
 
-Two grants imply others, and no more: `read` implies `see`, so a dataset a group may read is
+Two grants imply others, and no more: `read` implies `describe`, so a dataset a group may read is
 listed for it; and for tables, `write` implies `read`, because writing an Iceberg table
 requires reading its metadata and the credential Polaris vends for writing is read-write. A
-dataset whose `see` includes a group and whose `read` does
+dataset whose `describe` includes a group and whose `read` does
 not is visible-not-readable: it appears in a listing with its name and description, a
 table's metadata can be loaded, and its contents cannot be read. Trino requests a credential
 with every table load, and Polaris refuses the whole load when neither credential check
-passes, so the gate repeats a refused load once without the credential request: a see-only
+passes, so the gate repeats a refused load once without the credential request: a describe-only
 table can be described through Trino, and reading it fails at storage.
 
 ### 4.3 Derived datasets
 
-An entry with a non-empty `inputs` list is derived. `read` and `share` are inherited; `see`
+An entry with a non-empty `inputs` list is derived. `read` and `share` are inherited; `describe`
 and `write` are declared only.
 
     base(d, g)       = declared(d, g) ∩ ⋂ { effective(i, g) : i ∈ inputs(d) }    g ∈ {read, share}
     effective(d, g)  = base(d, g) ∪ { x ∈ widenings(d, g) : covered(d, g, x) }
     covered(d, g, x) = ∀ i ∈ inputs(d) with x ∉ effective(i, g):
                            ∃ c ∈ covers(d, g, x, i) : c ∈ effective(i, share)
-    effective(d, g)  = declared(d, g)                                              g ∈ {see, write}
+    effective(d, g)  = declared(d, g)                                              g ∈ {describe, write}
 
 To widen grant `g` on `d` by group `x`, the caller must hold `share` on every input whose
 effective `g` lacks `x`. For each such input the caller's groups holding `share` on it are
@@ -176,7 +176,7 @@ Consequences, stated so they are not surprises:
   is what `share` means.
 - A dataset with many transitive inputs has a small effective `read`. The output's readers
   are allowed to read everything it was built from.
-- `see` does not inherit. A derived dataset can be listed for people who cannot see its
+- `describe` does not inherit. A derived dataset can be listed for people who cannot see its
   inputs. Its `inputs` field is shown only for inputs the viewer may see, and the count of
   hidden inputs is not shown.
 - A `gone` input still constrains its outputs. Grants are independent of status.
@@ -193,7 +193,7 @@ subject and groups, the dataset id, and the change, and on allow recomputes effe
 and writes. OPA fetches the entry from governance like any other rule; every writer of a
 row takes its lock, so the entry OPA reads is the one the write replaces.
 
-- `see` and `read` of dataset d: callers holding effective `share` on d.
+- `describe` and `read` of dataset d: callers holding effective `share` on d.
 - `share`, `write` and `delete` of d: callers in a group owning the folder root (a file
   dataset) or namespace (a table) that d sits under.
 - Adding a widening to d for grant g and group x: callers holding effective `share` on every
@@ -328,7 +328,7 @@ account, which holds no grants.
 1. **Find tables in SQL.** Any SQL tool lists namespaces and tables through the gate and sees
    only what its person may see.
 2. **Find datasets.** Query the table `governance.datasets` from any engine connected to the
-   catalog. It returns every dataset, table or file, whose effective `see` includes one of the person's groups, with name and
+   catalog. It returns every dataset, table or file, whose effective `describe` includes one of the person's groups, with name and
    description and whether the person may read it. The table's files are built by governance
    for the person reading them and served by governance; no copy of the list is stored.
 3. **Read a table in Trino.** Log in. Connect to Trino with the token, attach it as the
@@ -375,7 +375,7 @@ everyone but root.
 
 | Rule | Caller | Input | Decision |
 |---|---|---|---|
-| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in effective `see` or `read` |
+| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in effective `describe` or `read` |
 | `vend` (read) | broker | dataset id | allow, plus the entry's folder for the read session policy |
 | `vend_write` | broker | dataset id | allow, plus the entry's folder for the write session policy |
 | `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
@@ -387,7 +387,7 @@ everyone but root.
 | Polaris: list namespaces, list tables, list views | Polaris | namespace | allowed for any authenticated person; the gate trims the response by `visible` |
 | Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group owns the namespace or one above it, or any table in it is visible to the caller |
 | Polaris: create table, create view, commit a staged create | Polaris | namespace | the caller may view the namespace; the gate has already decided per table with `allow_create`, since Polaris names only the namespace |
-| Polaris: table exists, view exists, load table or view metadata | Polaris | table id | group in effective `see` or `read` |
+| Polaris: table exists, view exists, load table or view metadata | Polaris | table id | group in effective `describe` or `read` |
 | Polaris: load with a read credential | Polaris | table id | group in effective `read`; `write` implies `read` for tables |
 | Polaris: load with a read-write credential | Polaris | table id | group in effective `write`. Trino asks for this on every load; when denied, Polaris checks for a read credential instead |
 | Polaris: update, commit table or view | Polaris | table id | group in effective `write` |
@@ -486,17 +486,17 @@ grants, over the entry governance holds at the time of the decision.
 Decided: governance holds the only copy of every grant and of group membership,
 callers send OPA only who is asking and the ids they name, and every rule fetches the groups
 and entries it needs with `http.send`; table names are
-confidential, so `see` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
+confidential, so `describe` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
 set-location are root-only; `group-admins` assign top-level folder roots and namespaces, and
-their owners delegate below them; `read` implies `see`.
+their owners delegate below them; `read` implies `describe`.
 
 ## 13. Status against the repository
 
-Implemented today: the catalog with `see`, `read` and `share` for file datasets; the file
+Implemented today: the catalog with `describe`, `read` and `share` for file datasets; the file
 listing; the dataset index as a per-person table, `governance.datasets`, listing both kinds;
 the broker, scoping credentials to the folder in OPA's decision; Polaris delegating to OPA
-with per-table credentials, viewing a table gated on `see` or `read` and read-write
+with per-table credentials, viewing a table gated on `describe` or `read` and read-write
 credentials on `write`, drops on `delete`; registration gated by `stewards` and root
 ownership; OPA holding policy and no grants, every rule fetching what it needs from
 governance with `http.send`; Trino authenticating people by their Keycloak token over HTTPS
@@ -504,7 +504,7 @@ and forwarding it to Polaris as the `token` extra credential; the gate as the on
 Polaris, verifying the token, trimming listings (every upstream page, one filter, its own
 page tokens), answering not-found for a refused name the person may not view, and repeating
 a refused credentialed load without the credential request, deciding table and namespace
-creation, and reporting table creates and drops; tables registered as entries with `see`,
+creation, and reporting table creates and drops; tables registered as entries with `describe`,
 `read`, `share`, `write` and `delete` by group; `write` for file datasets, a broker
 credential that puts and deletes in the folder; grant changes through governance, decided by
 OPA under the entry's row lock as in 4.4; group membership and owners, and root ownership,

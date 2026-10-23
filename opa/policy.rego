@@ -10,7 +10,7 @@ package polaris.authz
 #  2. read vend       — LOAD_TABLE_WITH_READ_DELEGATION, a read-only STS credential for a
 #                       table's files: read or write on it.
 #  3. table view      — whether a table or view exists, and its metadata (columns, snapshots,
-#                       storage location): see, read or write on it, so a table can be viewed
+#                       storage location): describe, read or write on it, so a table can be viewed
 #                       without being read.
 #  4. namespace view  — whether a namespace exists, and its properties: its owners, and
 #                       anyone who may view a table under it.

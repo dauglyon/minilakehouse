@@ -12,8 +12,8 @@ meaning/grants. The `datasets` row carries both, written by disjoint paths — m
 ingest+seed, existence (status) by reconcile. Entries served to OPA carry
 meaning/grants only, so storage churn never changes a decision.
 
-Two permission planes per dataset, as separate grant sets: visibility (may you SEE it
-exists) vs access (may you READ the bytes) — so a dataset can be see-but-not-read.
+Two permission planes per dataset, as separate grant sets: describe (may you list it and load
+its metadata) vs read (may you read the bytes) — so a dataset can be described but not read.
 
 Governance builds every list; OPA only says which of the candidates it was given pass.
 """
@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     prefix          TEXT UNIQUE NOT NULL,    -- storage location; one dataset per prefix
     description     TEXT,
     steward         TEXT,
-    visibility      TEXT[] NOT NULL DEFAULT '{}',
+    describe        TEXT[] NOT NULL DEFAULT '{}',
     access          TEXT[] NOT NULL DEFAULT '{}',
     share           TEXT[] NOT NULL DEFAULT '{}',
     write           TEXT[] NOT NULL DEFAULT '{}',
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS table_entries (
     id          TEXT PRIMARY KEY,            -- <catalog>.<namespace...>.<table>
     description TEXT,
     steward     TEXT,
-    see         TEXT[] NOT NULL DEFAULT '{}',
+    describe    TEXT[] NOT NULL DEFAULT '{}',
     read        TEXT[] NOT NULL DEFAULT '{}',
     share       TEXT[] NOT NULL DEFAULT '{}',
     write       TEXT[] NOT NULL DEFAULT '{}',
@@ -178,8 +178,20 @@ ALTER TABLE datasets ADD COLUMN IF NOT EXISTS write TEXT[] NOT NULL DEFAULT '{}'
 -- nothing; status needs only whether a folder is empty.
 ALTER TABLE datasets DROP COLUMN IF EXISTS object_count, DROP COLUMN IF EXISTS total_bytes,
     DROP COLUMN IF EXISTS last_modified;
-CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((visibility || access));
-CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((see || read || write));
+-- The grant that lists a dataset and serves its metadata was called `visibility` on file
+-- datasets and `see` on tables; a volume made before the rename keeps those columns.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'datasets' AND column_name = 'visibility') THEN
+        ALTER TABLE datasets RENAME COLUMN visibility TO describe;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'table_entries' AND column_name = 'see') THEN
+        ALTER TABLE table_entries RENAME COLUMN see TO describe;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((describe || access));
+CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((describe || read || write));
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
 -- Provenance (PROVENANCE.md 3, 4.1). A session is a unit of work a person names; each login
 -- points at one of the person's sessions, and every access is stamped with the session its
@@ -292,10 +304,10 @@ def init_db():
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
                 raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share, write) "
+                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
-                 d.get("visibility", []), d.get("access", []), d.get("share", []), d.get("write", [])),
+                 d.get("describe", []), d.get("access", []), d.get("share", []), d.get("write", [])),
             )
         for grp, members in reg.get("groups", {}).items():
             for m in members:
@@ -309,9 +321,9 @@ def init_db():
             if not TABLE_ID_RE.match(t["id"]):
                 raise ValueError(f"registry.json: bad table id {t['id']!r}")
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, see, read, share, write, "delete") '
+                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete") '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
-                (t["id"], t.get("description"), t.get("steward"), t.get("see", []),
+                (t["id"], t.get("description"), t.get("steward"), t.get("describe", []),
                  t.get("read", []), t.get("share", []), t.get("write", []), t.get("delete", [])),
             )
         for grp, namespaces in reg.get("namespace_owners", {}).items():
@@ -331,7 +343,7 @@ def init_db():
 def _entry(row):
     """The meaning/grants half of a datasets row — what OPA decides over."""
     return {"id": row["id"], "prefix": row["prefix"],
-            "visibility": row["visibility"], "access": row["access"], "share": row["share"],
+            "describe": row["describe"], "access": row["access"], "share": row["share"],
             "write": row["write"]}
 
 
@@ -468,7 +480,7 @@ def internal_datasets():
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
-        cur.execute("SELECT id, prefix, visibility, access, share, write FROM datasets WHERE id = ANY(%s)",
+        cur.execute("SELECT id, prefix, describe, access, share, write FROM datasets WHERE id = ANY(%s)",
                     (ids,))
         rows = cur.fetchall()
     return jsonify({"entries": {r["id"]: _entry(r) for r in rows}})
@@ -496,7 +508,7 @@ def internal_group_owners(grp):
         return jsonify({"owners": [r["owner"] for r in cur.fetchall()]})
 
 
-_TABLE_COLS = 'id, see, read, share, write, "delete", status'
+_TABLE_COLS = 'id, describe, read, share, write, "delete", status'
 
 
 def _ids_from_body():
@@ -527,7 +539,7 @@ def internal_tables():
 @internal_app.post("/internal/namespaces")
 def internal_namespaces():
     # {id: {id, owners: [group], viewers: [group]}}. Owners own the namespace or one above it;
-    # viewers hold see, read or write on some table at any depth under it (`lakehouse.db`
+    # viewers hold describe, read or write on some table at any depth under it (`lakehouse.db`
     # covers `lakehouse.db.t1` and `lakehouse.db.x.t2`). Ids are compared with starts_with,
     # not LIKE, so "_" and "%" in a name are plain characters.
     if (ids := _ids_from_body()) is None:
@@ -538,7 +550,7 @@ def internal_namespaces():
             cur.execute("SELECT DISTINCT grp FROM namespace_owners "
                         "WHERE namespace = %s OR starts_with(%s, namespace || '.')", (i, i))
             owners = sorted(r["grp"] for r in cur.fetchall())
-            cur.execute("SELECT DISTINCT unnest(see || read || write) AS grp FROM table_entries "
+            cur.execute("SELECT DISTINCT unnest(describe || read || write) AS grp FROM table_entries "
                         "WHERE starts_with(id, %s || '.')", (i,))
             viewers = sorted(r["grp"] for r in cur.fetchall())
             entries[i] = {"id": i, "owners": owners, "viewers": viewers}
@@ -675,9 +687,9 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
-    grants = {g: body.get(g, []) for g in ("visibility", "access", "share", "write")}
+    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write")}
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "visibility, access, share and write must be lists of groups"}), 400
+        return jsonify({"error": "describe, access, share and write must be lists of groups"}), 400
 
     if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
@@ -693,10 +705,10 @@ def register_dataset():
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
                 return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, visibility, access, share, write, status) "
+                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, status) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
                 (ds_id, prefix, body.get("description"), subject,
-                 grants["visibility"], grants["access"], grants["share"], grants["write"]),
+                 grants["describe"], grants["access"], grants["share"], grants["write"]),
             )
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset unavailable"}), 409
@@ -748,20 +760,20 @@ def register_table():
         return err
     body = request.get_json(silent=True) or {}
     table_id = body.get("id")
-    grants = {g: body.get(g, []) for g in ("see", "read", "share", "write", "delete")}
+    grants = {g: body.get(g, []) for g in ("describe", "read", "share", "write", "delete")}
     if not isinstance(table_id, str) or not TABLE_ID_RE.match(table_id):
         return jsonify({"error": "id must be <catalog>.<namespace...>.<table>"}), 400
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "see, read, share, write and delete must be lists of groups"}), 400
+        return jsonify({"error": "describe, read, share, write and delete must be lists of groups"}), 400
     if opa("allow_register", {"subject": subject, "id": table_id}, package="tables") is not True:
         app.logger.info("DENY register-table subject=%s id=%s", subject, table_id)
         return jsonify({"error": "forbidden"}), 403
     try:
         with db(commit=True) as cur:
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, see, read, share, write, "delete") '
+                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete") '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (table_id, body.get("description"), subject, grants["see"], grants["read"],
+                (table_id, body.get("description"), subject, grants["describe"], grants["read"],
                  grants["share"], grants["write"], grants["delete"]))
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "table unavailable"}), 409
@@ -771,8 +783,8 @@ def register_table():
 
 # The grants a change may name, per kind, and the column each is stored in. A file dataset has
 # no delete: its write credential deletes objects (WHITEPAPER 4.2).
-_GRANT_COLS = {"dataset": {"see": "visibility", "read": "access", "share": "share", "write": "write"},
-               "table": {g: g for g in ("see", "read", "share", "write", "delete")}}
+_GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "share": "share", "write": "write"},
+               "table": {g: g for g in ("describe", "read", "share", "write", "delete")}}
 
 
 @app.patch("/permissions/<kind>/<path:entry_id>")
@@ -839,8 +851,8 @@ def _names(v, pattern):
 _NAME_IN_USE_SQL = """
 SELECT EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM group_owners WHERE grp = %(g)s OR owner = %(g)s)
-    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(visibility || access || share || write))
-    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(see || read || share || write || "delete"))
+    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write))
+    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || share || write || "delete"))
     OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) AS used
 """
@@ -973,22 +985,22 @@ def change_root_owners(kind, root_id):
 
 def _index_rows(subject):
     """Every live dataset and table the subject may see, with whether they may read it. Only
-    live entries: existence is storage's truth (reconcile, the gate's reports), visibility
-    OPA's; governance builds the list, OPA says which candidates pass.
+    live entries: existence is storage's truth (reconcile, the gate's reports), who may view
+    them OPA's; governance builds the list, OPA says which candidates pass.
 
     The candidates are only entries whose viewing grants name one of the subject's groups:
-    see or read for a file dataset, see, read or write for a table. Those are exactly the
-    grants OPA's visibility rules test (blob.rego `visible`, tables.rego `viewable`), so the
+    describe or read for a file dataset, describe, read or write for a table. Those are exactly
+    the grants OPA's viewing rules test (blob.rego `visible`, tables.rego `viewable`), so the
     narrowing drops only entries OPA would refuse, and OPA's cost follows what the person may
     see rather than the catalog's size. seed/check-index-narrowing.py checks the two agree."""
     with db() as cur:
         cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
         groups = [r["grp"] for r in cur.fetchall()]
         cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' "
-                    "AND (visibility || access) && %s::text[]", (groups,))
+                    "AND (describe || access) && %s::text[]", (groups,))
         files = cur.fetchall()
         cur.execute("SELECT id, description, steward FROM table_entries WHERE status = 'live' "
-                    "AND (see || read || write) && %s::text[]", (groups,))
+                    "AND (describe || read || write) && %s::text[]", (groups,))
         tables = cur.fetchall()
     f = (opa("discover", {"subject": subject, "datasets": [r["id"] for r in files]})
          if files else {"visible": [], "readable": []})

@@ -42,7 +42,7 @@ files/blobs over S3) under the *same* governance model as tables.
    with each decision. Nothing re-decides or mirrors policy into a backend.
 2. **Two permission planes** (the AWS Lake Formation model): **metadata-visibility** (may you
    *see a thing exists*?) drives discovery; **data-access** (may you *read the bytes*?) drives
-   vending. A dataset can be visible-but-not-readable (*see-but-not-read*).
+   vending. A dataset can be visible-but-not-readable (*describe-but-not-read*).
 3. **Discovery and access are separate.** Discovery returns *names*; access returns *scoped
    credentials*. Neither enumerates the whole bucket.
 4. **OPA is a predicate, never an enumerator.** It answers yes/no about one named resource;
@@ -186,7 +186,7 @@ Table catalogs have a registry by construction; raw blobs do not. Discovery spli
   the core of this project.**
 
 The registry (`governance`) holds, per dataset: `prefix, description, steward`, and the two
-grant sets `visibility` / `access`.
+grant sets `describe` / `access`.
 
 ### Freshness
 
@@ -229,7 +229,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across
   both planes. Tables (`policy.rego`), all by group: `root` / read-credential vend (`read` or
-  `write`) / viewing a table (`see`, `read` or `write`) / viewing a namespace (its owners, or
+  `write`) / viewing a table (`describe`, `read` or `write`) / viewing a namespace (its owners, or
   any grant on a table under it) / catalog listings (anyone; the gate trims them to what the
   two view lanes allow) / creating (the gate decides the name: a registered, pending table
   with the person in its `write`, or a namespace under one their group owns) / writes and
@@ -237,12 +237,12 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   namespace (its owners) — anything unnamed, including rename, register and set-location, is
   root-only. Polaris is on a
   network only the gate and its setup jobs share, so every client call passes the gate. Blobs (`blob.rego`): `vend` (read) / `vend_write`
-  (write) / `visible` (see or read) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
+  (write) / `visible` (describe or read) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
   carry no groups.
 - **Grant changes are decided like access.** `PATCH /permissions/<dataset|table>/<id>` adds
   or removes groups from an entry's grants. OPA's `allow_change` decides it while
   governance holds the entry's row lock, so the entry OPA fetches is the one the write
-  replaces: `see` and `read` change only for a group holding the entry's `share`; `share`,
+  replaces: `describe` and `read` change only for a group holding the entry's `share`; `share`,
   and a table's `write` and `delete`, only for a group owning the root (the prefix root or
   namespace registration checks). An unknown id is refused exactly as a denied change.
 - **Groups are administered by their owners.** A group's owners are groups (`group_owners`);
@@ -273,8 +273,8 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   bucket name.
 - **The index's work follows what a person may see.** Governance offers OPA only the live
   entries whose viewing grants name one of the person's groups (GIN indexes on
-  `visibility || access` and `see || read || write`), which are exactly the grants OPA's
-  visibility rules test, so the narrowing drops only entries OPA would refuse and OPA still
+  `describe || access` and `describe || read || write`), which are exactly the grants OPA's
+  viewing rules test, so the narrowing drops only entries OPA would refuse and OPA still
   decides each candidate. Measured at 50,000 live datasets with 5,003 visible to alice: a load
   took 2.39 s offering OPA every entry and 0.25 s narrowed. `seed/check-index-narrowing.py`
   compares the narrowed rows with OPA's decision over every entry for every person in a group;
@@ -450,7 +450,7 @@ reference (the sections above are current-state).
   helper, or `--access-token`) is cut off when that token expires after 5 minutes; Trino's own
   Iceberg-client token exchange only extends the engine's catalog session, not the client's
   connection. The proxy keeps its sessions in memory, so a proxy restart logs everyone out.
-- A person with `see` and no `read` who tries to write a table gets Trino's "Failed to
+- A person with `describe` and no `read` who tries to write a table gets Trino's "Failed to
   initialize the vended credentials" rather than access denied: the gate's retry returns the
   table without a credential and Trino stops there. A refused create's first line is Trino's
   own ("Failed to create transaction", "Failed to create namespace"); the gate's reason is
@@ -482,6 +482,6 @@ reference (the sections above are current-state).
   each decision.
 - **PEP** — Policy Enforcement Point (Polaris, the broker): asks the PDP, then enforces.
 - **Vending** — minting a short-lived, scoped storage credential (STS).
-- **Metadata-visibility plane** — permission to *see a thing exists*.
+- **Metadata-visibility plane** — permission to list a thing and load its metadata: the `describe` grant.
 - **Data-access plane** — permission to *read the bytes*.
-- **see-but-not-read** — visible in discovery yet not readable (visibility granted, access not).
+- **describe-but-not-read** — listed and describable, not readable (`describe` granted, `read` not).

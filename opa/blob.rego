@@ -12,7 +12,7 @@ package lakehouse.blob
 #                                                      governance: may change these grants
 #   allow_change_root  input {subject, prefix}         governance: may change who owns this root
 #
-# An entry is {id, prefix, visibility: [group], access: [group], share: [group], write: [group]}. A dataset can be
+# An entry is {id, prefix, describe: [group], access: [group], share: [group], write: [group]}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
 # so it is denied exactly as a dataset the caller has no grant on.
 
@@ -33,7 +33,7 @@ vend := {"allow": true, "prefix": e.prefix} if {
 }
 
 # Writing (WHITEPAPER 4.2): put and delete in the dataset's folder, granted by `write` alone; it
-# implies neither `see` nor `read`.
+# implies neither `describe` nor `read`.
 default vend_write := {"allow": false}
 
 vend_write := {"allow": true, "prefix": e.prefix} if {
@@ -44,13 +44,13 @@ vend_write := {"allow": true, "prefix": e.prefix} if {
 
 discover := {"visible": visible, "readable": readable}
 
-# `read` implies `see`: a dataset a group may read is listed for it. Governance's dataset index
-# offers OPA only entries whose visibility or access names one of the person's groups
+# `read` implies `describe`: a dataset a group may read is listed for it. Governance's dataset index
+# offers OPA only entries whose describe or access names one of the person's groups
 # (governance/app.py _index_rows); a change to what makes a dataset visible changes that too.
 visible contains id if {
 	some id, e in _entries
 	some g in _groups
-	g in array.concat(e.visibility, e.access)
+	g in array.concat(e.describe, e.access)
 }
 
 readable contains id if {
@@ -68,7 +68,7 @@ allow_register if {
 	_owns_root(input.prefix)
 }
 
-# Changing grants (WHITEPAPER 4.4): `see` and `read` by a group holding `share` on the dataset;
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset;
 # `share` and `write` by a group owning a root above its prefix, the ownership registration
 # checks.
 default allow_change := false
@@ -82,7 +82,7 @@ allow_change if {
 }
 
 _may_change(e, g) if {
-	g in {"see", "read"}
+	g in {"describe", "read"}
 	some x in _groups
 	x in e.share
 }

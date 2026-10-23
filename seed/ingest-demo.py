@@ -36,7 +36,7 @@ def main():
     r = requests.post(f"{GOV}/datasets", headers={"Authorization": f"Bearer {token('alice', 'governance')}"}, json={
         "prefix": PREFIX,
         "description": "projz ingested dataset",
-        "visibility": ["jgi-writers"],
+        "describe": ["jgi-writers"],
         "access": ["jgi-writers"],
         "write": ["jgi-writers"],
     })

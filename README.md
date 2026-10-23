@@ -8,7 +8,7 @@ never the byte path**.
 It collapses what is usually four drifting authorization layers (object-store IAM, catalog
 RBAC, an engine plugin, per-service interceptors) into a single source of truth — across both
 **Iceberg tables** (Trino → Polaris → Ceph RGW STS) and **non-tabular blob datasets** (a
-vending broker) — with a real **metadata-visibility plane** (see-but-not-read) and a
+vending broker) — with a real **metadata-visibility plane** (describe-but-not-read) and a
 **governed registry** kept honest against storage.
 
 > A working `docker-compose` prototype. Dev-environment only: plaintext/no-TLS and dev
@@ -19,7 +19,7 @@ vending broker) — with a real **metadata-visibility plane** (see-but-not-read)
 - [The idea](#the-idea)
 - [Components](#components)
 - [Run it](#run-it)
-- [Flow A — discovery (see-but-not-read)](#flow-a--discovery-see-but-not-read)
+- [Flow A — discovery (describe-but-not-read)](#flow-a--discovery-describe-but-not-read)
 - [Flow B — Iceberg tables](#flow-b--iceberg-tables)
 - [Flow C — blob datasets](#flow-c--blob-datasets)
 - [Registry freshness & governed ingest](#registry-freshness--governed-ingest)
@@ -45,10 +45,10 @@ Three roles, in XACML terms:
 
 Two independent permission **planes** per dataset:
 
-- **visibility** — may you *see it exists*? (discovery, Flow A)
+- **describe** — may you list it and load its metadata? (discovery, Flow A)
 - **access** — may you *read the bytes*? (vending, Flows B/C)
 
-So a dataset can be **see-but-not-read** (the Lake Formation model): `alice` can discover
+So a dataset can be **describe-but-not-read** (the Lake Formation model): `alice` can discover
 `projx/private` exists but cannot read it.
 
 **How the user's identity reaches Polaris (tables):** the user connects to Trino with their
@@ -123,7 +123,7 @@ has a different issuer and would be rejected.) Each service accepts only tokens 
 so each demo asks Keycloak for that service's audience: `scope=openid aud-broker`,
 `aud-governance`, or `aud-polaris` for Trino and the catalog (`keycloak/setup.py`).
 
-## Flow A — discovery (see-but-not-read)
+## Flow A — discovery (describe-but-not-read)
 
 *"What exists that I could request?"* — separate from "what can I read." Every engine
 connected to the catalog can query the answer as an Iceberg table, `governance.datasets`: one
@@ -136,7 +136,7 @@ q alice --execute "SELECT * FROM iceberg.governance.datasets"
 #  -> "projx/private","files","projx private data","alice","false"
 #     "projx/public","files","projx public data","alice","true"
 #     "lakehouse.db.t1","table","demo table","alice","true"
-#         ^ projx/private is visible but can_read is false: see-but-not-read
+#         ^ projx/private is visible but can_read is false: describe-but-not-read
 q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
 #  -> "0"     bob is in no group with a grant, so he sees nothing
 ```
@@ -279,7 +279,7 @@ tenants, and neither can see the other's.
 
 `PATCH /permissions/<dataset|table>/<id>` adds and removes groups from an entry's grants, in
 the shape of Unity Catalog's permissions API. OPA decides each change (`allow_change`):
-`see` and `read` change only for someone in a group holding the entry's `share`; `share`, and
+`describe` and `read` change only for someone in a group holding the entry's `share`; `share`, and
 a table's `write` and `delete`, only for someone whose group owns the root the entry sits
 under (the prefix root or namespace that registration checks). A change applies at the next
 decision.
@@ -423,13 +423,13 @@ built yet.
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across both
   planes, all by group. Tables (`opa/policy.rego`): `root` / read credential (`read` or
-  `write`) / viewing a table's columns and location (`see`, `read` or `write`) / viewing a
+  `write`) / viewing a table's columns and location (`describe`, `read` or `write`) / viewing a
   schema (its owners, or any grant on a table in it) / listings (anyone; the gate trims them
   to what may be viewed) / creating (a registered table with the person in its `write`, or a
   schema under one their group owns) / writes and read-write credentials (`write`) /
   dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `vend`
-  (read) / `vend_write` (write) / `visible` (see or read) / `allow_register` (ingest). Grant changes (`allow_change` in
-  both): `see` and `read` by `share` holders; `share`, `write` and `delete` by root owners.
+  (read) / `vend_write` (write) / `visible` (describe or read) / `allow_register` (ingest). Grant changes (`allow_change` in
+  both): `describe` and `read` by `share` holders; `share`, `write` and `delete` by root owners.
   Group changes (`opa/groups.rego`): a group's owners change its members and owners;
   `group-admins` create groups. Root ownership (`allow_change_root` in `blob.rego` and
   `tables.rego`): `group-admins` for top-level roots, owners of a root or one above it below. Group membership and every grant
@@ -466,7 +466,7 @@ built yet.
   Keycloak login lasts (the proxy refreshes for it). A client pointed straight at Trino with
   one token (the `q` helper) is cut off after 5 minutes. The proxy holds sessions in memory,
   so restarting it logs everyone out.
-- With `see` only, DESCRIBE works through Trino (via the `gate`) and SELECT fails; an INSERT
+- With `describe` only, DESCRIBE works through Trino (via the `gate`) and SELECT fails; an INSERT
   fails with "Failed to initialize the vended credentials" rather than access denied.
 - A refused create's first line is Trino's own ("Failed to create transaction"); the gate's
   reason is the error's cause, which the CLI prints with `--debug`.
