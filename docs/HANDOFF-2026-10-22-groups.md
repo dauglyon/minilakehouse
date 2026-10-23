@@ -140,6 +140,10 @@ enumeration is added.
   namespace's (`lakehouse.db.t1` gets `lakehouse.db` and `lakehouse`). Add `own` (the table's
   own sets) and `inherited_from` ({group: namespace} per set) beside them, for the read API
   and UI only; rules use the effective sets.
+- `_own_grants` (`governance/app.py`), which supplies each carried source's `read` and `share`
+  for provenance narrowing (`_with_sources`, `PROVENANCE.md` 6, rule 3), returns the same
+  effective sets. Otherwise a source granted only through its namespace admits nobody to
+  anything derived from it, though people can read the source itself.
 - `_index_rows`: the candidate filter for `governance.datasets` must include namespace grants,
   or a table granted only through its namespace never reaches OPA and vanishes from the index.
   `seed/check-index-narrowing.py` must still pass; extend its seed with an inherited-only table.
