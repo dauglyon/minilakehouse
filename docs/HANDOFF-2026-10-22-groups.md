@@ -188,6 +188,10 @@ enumeration is added.
 
 # Section 3 — storage-first registration
 
+Vocabulary follows the whitepaper: a **publisher** writes and then **registers** an entry;
+**declaring** is the separate provenance act that names which candidate sources were used.
+`describe` stays a grant name and is not used for anything else.
+
 ## Why
 
 The design's rule is "storage owns existence, the registry owns meaning", and the registry
@@ -195,19 +199,19 @@ already reconciles against RGW events. But registration today is form-first: a d
 registered (`POST /datasets`, `allow_register`) before its bytes exist, and a table must be
 registered `pending` before `CREATE TABLE` is allowed. Writing is gated on a registry entry
 that describes nothing yet. Invert it: writing under a root you own is allowed by ownership
-alone; describing what was written is registration.
+alone; registering what was written comes after.
 
 ## Model
 
 - A **tenant admin** (section 1) may write anywhere under a root their group owns: a blob
   folder under `datasets/<root>/`, a table under `<catalog>.<ns>`.
-- Whatever appears there is an entry at once, **undescribed**: no description, grants = those
+- Whatever appears there is an entry at once, **unregistered**: no description, grants = those
   inherited from the root or namespace (section 2), nothing of its own. Readable by whoever
   the root's grants name — by default only the owning group.
-- **Describing** it (description, own grants, declared sources) is registration. The entry's
-  `described` flag replaces `pending`; `live`/`gone` stay as the storage truth.
+- **Registering** it (description, own grants) is the publisher's act; declaring sources is
+  the separate act it already is. The entry's `registered` flag replaces `pending`; `live`/`gone` stay as the storage truth.
 - The cross-tenant guard moves, it does not go: writing needs an owned root; overlapping blob
-  folders are refused when described, not when registered.
+  folders are refused at registration, which now follows the write.
 
 ## Changes
 
@@ -218,42 +222,43 @@ alone; describing what was written is registration.
 - `broker/app.py`: `POST /vend` with `mode: write` takes `prefix` instead of `dataset`.
 - `governance/app.py` `/events`: a key under an owned root with no entry creates one. Its id
   is derived as now; its folder is the key's first path segment below the root (deeper
-  structure stays inside the dataset). Log `EVENT ... created undescribed <id>` instead of
+  structure stays inside the dataset). Log `EVENT ... created unregistered <id>` instead of
   "ungoverned". A key under no owned root stays ungoverned and logged.
-- `POST /datasets` becomes `PATCH /datasets/<id>` on an undescribed entry: description,
-  own grants, `sources`. Allowed for an admin of a group owning a root above it. Keep the
-  overlap check here (refuse describing a folder that overlaps a described one).
-- Schema: `datasets.described BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
+- `POST /datasets` becomes `PATCH /datasets/<id>` on an unregistered entry: description and
+  own grants. Sources are declared as today (`governance.derivations`). Allowed for an admin of a group owning a root above it. Keep the
+  overlap check here (refuse registering a folder that overlaps a registered one).
+- Schema: `datasets.registered BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
   Drop `register_grants`.
 
 ### Tables
 - `opa/tables.rego`: `allow_create` allows an admin of a group owning the namespace or one
   above (drop the `pending` entry requirement). Drop `allow_register`.
-- `gate/app.py`: reports created tables as now; governance inserts the entry undescribed with
-  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` describes.
-- `table_entries.described` as for datasets; `pending` goes away.
+- `gate/app.py`: reports created tables as now; governance inserts the entry unregistered with
+  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` registers.
+- `table_entries.registered` as for datasets; `pending` goes away.
 
 ### Read API (sections 1–2) additions
-- `GET /groups/<name>` gains `undescribed`: entries under its roots with `described = false`,
+- `GET /groups/<name>` gains `unregistered`: entries under its roots with `registered = false`,
   each with writer (from the access log), first-seen time, object or row count, and, for a
   blob folder, the tables whose sessions read it (so an ingest pair shows side by side).
-- `GET /datasets/<id>` / `GET /tables/<id>`: `described`, and `writer`.
+- `GET /datasets/<id>` / `GET /tables/<id>`: `registered`, and `writer`.
 
 ### Index
-- `governance.datasets` lists undescribed entries only to groups that may read them (the
-  owning group by default). A described-but-not-read entry is visible by `describe` as now.
+- `governance.datasets` lists unregistered entries only to groups that may read them (the
+  owning group by default). A registered entry a group may describe but not read is visible by `describe` as now.
 
 ### Docs and seed
 - README "Registry freshness & governed ingest", "Flow B" (the `t2` demo) and the whitepaper's
-  register-at-ingest section change to: write, then describe. `seed/ingest-demo.py` uploads
-  with a root-scoped write credential, then describes.
+  register-at-ingest section change to: write, then register. `seed/ingest-demo.py` uploads
+  with a root-scoped write credential, then registers.
 
 ## UI consequence
 "Register" is not a form. It is an inbox on the group page: things in your roots nobody has
-described yet. Describing is the same grants panel as everywhere else, plus a description
-and a sources picker prefilled from lineage.
+registered yet. Registering is the same grants panel as everywhere else plus a description;
+declaring sources sits beside it, prefilled from the lineage candidates.
 
 ## Decided
 - Writing under an owned root needs no prior registry entry.
-- Undescribed data is readable only through root/namespace grants, never wider.
-- `pending` is removed; `described` is a flag on a live entry.
+- Unregistered data is readable only through root/namespace grants, never wider.
+- `pending` is removed; `registered` is a flag on a live entry.
+- No new vocabulary: register, declare, publisher, entry, as in `WHITEPAPER.md` and `PROVENANCE.md`.
