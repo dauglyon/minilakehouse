@@ -241,7 +241,9 @@ def current_only(r):
     file counts, the writer's name and query id). The current snapshot stays: without it the
     metadata would describe an empty table. The ETag goes too: Polaris issues one
     per metadata file, and a client revalidating a cut response with it would be answered 304
-    after gaining read."""
+    after gaining read. The metadata is rebuilt from the fields named here, so one they do not
+    name is dropped, such as format v3's `next-row-id`, a running row count; a client that
+    requires it fails to load the table."""
     body = r.json()
     m = body["metadata"]
     current = m.get("current-snapshot-id")
@@ -251,7 +253,12 @@ def current_only(r):
              for s in m.get("snapshots") or [] if s.get("snapshot-id") == current]
     schema_ids = {m.get("current-schema-id"), *(s.get("schema-id") for s in snaps)}
     body["metadata"] = {
-        **m, "snapshots": snaps,
+        **{k: m[k] for k in ("format-version", "table-uuid", "location", "last-updated-ms",
+                             "last-column-id", "current-schema-id", "default-spec-id",
+                             "last-partition-id", "default-sort-order-id", "properties") if k in m},
+        **({"current-snapshot-id": current} if snaps else {}),
+        "last-sequence-number": snaps[0].get("sequence-number", 0) if snaps else 0,
+        "snapshots": snaps,
         "snapshot-log": [e for e in m.get("snapshot-log") or [] if e.get("snapshot-id") == current][-1:],
         "metadata-log": [],
         "refs": {"main": {"snapshot-id": current, "type": "branch"}} if snaps else {},
