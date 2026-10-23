@@ -431,8 +431,12 @@ def proxy(_):
             else:
                 held, mode = None, "read"
             if not (mode == "write" and held in written):
+                # A credential handed to someone who may write the table can write it, so its
+                # time is a time they could have written files (PROVENANCE.md 6.2).
+                can_write = (mode == "read" and held is not None
+                             and opa("allow_write", {"subject": subject, "id": held}) is True)
                 log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
-                                     "expires": expires}])
+                                     "expires": expires, "can_write": can_write}])
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.

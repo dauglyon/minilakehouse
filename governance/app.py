@@ -224,6 +224,23 @@ CREATE TABLE IF NOT EXISTS accesses (
 );
 DROP INDEX IF EXISTS accesses_session;
 CREATE INDEX IF NOT EXISTS accesses_person ON accesses (person, mode, at);
+-- Sources travel with stored files (PROVENANCE.md 6). A read keeps what it brought in: the
+-- dataset read and every source its files carried then. A table credential handed to someone
+-- in the table's write grant can write, so its time counts as a time they could have written.
+ALTER TABLE accesses ADD COLUMN IF NOT EXISTS sources TEXT[];
+ALTER TABLE accesses ADD COLUMN IF NOT EXISTS can_write BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS accesses_dataset ON accesses (dataset, mode);
+-- The files in each dataset's folder, as the last listing of it found them (6.2).
+CREATE TABLE IF NOT EXISTS files (
+    dataset       TEXT NOT NULL,             -- a file dataset's or a table's id
+    key           TEXT NOT NULL,
+    last_modified TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (dataset, key)
+);
+CREATE TABLE IF NOT EXISTS folder_listings (
+    dataset   TEXT PRIMARY KEY,
+    listed_at TIMESTAMPTZ NOT NULL
+);
 -- Declarations (PROVENANCE.md 5.3): one per target per accepted commit to
 -- governance.derivations, with the rows as declared and the record governance signed.
 CREATE TABLE IF NOT EXISTS declarations (
@@ -439,14 +456,146 @@ RETURNING prev.old AS old, d.status AS new
 """
 
 
-def _nonempty(prefix):
-    """Whether any object exists under the prefix: a listing capped at one object."""
-    return _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1).get("KeyCount", 0) > 0
+def _table_folder(location):
+    """A table's folder as a key prefix: s3://<bucket>/warehouse/db/t1-<uuid> -> warehouse/db/t1-<uuid>/."""
+    head = f"s3://{S3_BUCKET}/"
+    return location[len(head):].rstrip("/") + "/" if location and location.startswith(head) else None
+
+
+def _folders():
+    """(id, key prefix) for every dataset and table with a folder."""
+    with db() as cur:
+        cur.execute("SELECT id, prefix FROM datasets")
+        folders = [(r["id"], r["prefix"]) for r in cur.fetchall()]
+        cur.execute("SELECT id, location FROM table_entries WHERE location IS NOT NULL")
+        folders += [(r["id"], f) for r in cur.fetchall() if (f := _table_folder(r["location"]))]
+    return folders
+
+
+def _folder(ds_id):
+    with db() as cur:
+        cur.execute("SELECT prefix FROM datasets WHERE id = %s", (ds_id,))
+        if row := cur.fetchone():
+            return row["prefix"]
+        cur.execute("SELECT location FROM table_entries WHERE id = %s", (ds_id,))
+        row = cur.fetchone()
+    return _table_folder(row["location"]) if row else None
+
+
+def list_folder(ds_id):
+    """Record every file in the dataset's folder with its last-modified time, replacing what
+    the previous listing found; returns whether the folder holds anything. Storage decides
+    (PROVENANCE.md 6.2): a file stops counting only when a listing no longer shows it."""
+    prefix = _folder(ds_id)
+    if prefix is None:
+        return False
+    found = []
+    for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        found += [(o["Key"], o["LastModified"]) for o in page.get("Contents", [])]
+    with db(commit=True) as cur:
+        cur.execute("DELETE FROM files WHERE dataset = %s", (ds_id,))
+        for key, modified in found:
+            cur.execute("INSERT INTO files (dataset, key, last_modified) VALUES (%s, %s, %s)",
+                        (ds_id, key, modified))
+        cur.execute("INSERT INTO folder_listings (dataset, listed_at) VALUES (%s, now()) "
+                    "ON CONFLICT (dataset) DO UPDATE SET listed_at = now()", (ds_id,))
+    return bool(found)
+
+
+# Seconds a file's last-modified time may differ from the access log's clock.
+CLOCK_TOLERANCE = 5
+
+# The sources a dataset's files carry (PROVENANCE.md 6, rule 2). A file belongs to every write
+# credential and commit for the dataset that was valid when the file was last modified; it
+# carries what each such writer had brought in before that time, through their session's reads
+# and, from the credential's issue on, their login's reads, minus what that writer's latest
+# declaration of the dataset made after the file marked unused. A dataset is not its own source.
+# A write still under way after the last listing (a write credential still valid, or a commit
+# or staged create since) may have produced files that listing could not see, so it counts as
+# having written one now, and carried() lists again once its credential expires. A table
+# credential handed to a writer for a load is not a write until a listing finds a file from its
+# time: counting it earlier would make a table absorb everything its writer reads for as long
+# as Polaris's credential lasts, up to an hour, while every write notifies governance, which
+# lists the folder within seconds. Anyone holding a credential already reads new files in the
+# folder until it expires, whatever governance knows.
+_CARRIED_SQL = """
+WITH f AS (
+    SELECT key, last_modified AS lm FROM files WHERE dataset = %(t)s
+), w AS (
+    SELECT person, session, sid, at, mode, COALESCE(expires, at) AS until
+    FROM accesses WHERE dataset = %(t)s AND (mode = 'write' OR can_write)
+), fw AS (
+    SELECT f.lm, w.person, w.session, w.sid, w.at FROM f JOIN w
+      ON f.lm BETWEEN w.at - %(tol)s * interval '1 second' AND w.until + %(tol)s * interval '1 second'
+    UNION ALL
+    SELECT LEAST(now(), w.until), w.person, w.session, w.sid, w.at FROM w
+    JOIN folder_listings l ON l.dataset = %(t)s
+    WHERE w.mode = 'write' AND w.until + %(tol)s * interval '1 second' > l.listed_at
+), brought AS (
+    SELECT DISTINCT fw.person, fw.lm, s.source
+    FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read' AND r.at < fw.lm
+         AND (r.session = fw.session OR (r.sid = fw.sid AND r.at >= fw.at))
+    CROSS JOIN LATERAL unnest(COALESCE(r.sources, ARRAY[r.dataset])) AS s(source)
+)
+SELECT DISTINCT b.source FROM brought b
+WHERE b.source <> %(t)s AND NOT EXISTS (
+    SELECT 1 FROM declared_sources ds
+    WHERE ds.source = b.source AND NOT ds.used AND ds.declaration = (
+        SELECT max(d.id) FROM declarations d
+        WHERE d.person = b.person AND d.target = %(t)s AND d.declared_at >= b.lm))
+ORDER BY 1
+"""
+
+
+def carried(ds_id):
+    """The sources the files in a dataset's folder carry. The folder is listed first if it never
+    has been, or if a write credential has expired since the last listing, so that what it
+    wrote, or did not, is settled by storage."""
+    with db() as cur:
+        cur.execute("SELECT listed_at FROM folder_listings WHERE dataset = %s", (ds_id,))
+        row = cur.fetchone()
+        stale = row is None
+        if row:
+            cur.execute("SELECT 1 FROM accesses WHERE dataset = %s AND mode = 'write' "
+                        "AND COALESCE(expires, at) + %s * interval '1 second' > %s "
+                        "AND COALESCE(expires, at) < now() LIMIT 1",
+                        (ds_id, CLOCK_TOLERANCE, row["listed_at"]))
+            stale = cur.fetchone() is not None
+    if stale:
+        list_folder(ds_id)
+    with db() as cur:
+        cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE})
+        return [r["source"] for r in cur.fetchall()]
+
+
+def _own_grants(ids):
+    """{id: (groups that may read it, groups holding share)} by each dataset's own grants: a
+    table's write implies read."""
+    with db() as cur:
+        cur.execute("SELECT id, access AS readers, share FROM datasets WHERE id = ANY(%s)", (ids,))
+        own = {r["id"]: (set(r["readers"]), set(r["share"])) for r in cur.fetchall()}
+        cur.execute("SELECT id, read || write AS readers, share FROM table_entries WHERE id = ANY(%s)", (ids,))
+        own.update({r["id"]: (set(r["readers"]), set(r["share"])) for r in cur.fetchall()})
+    return own
+
+
+def _effective(ds_id, entry, grants):
+    """The entry with the grants rule 3 cuts down: each named grant keeps only groups that may
+    read, or for share hold share on, every source its files carry. describe is not inherited,
+    and neither is delete, which reads nothing. A source with no entry admits no one."""
+    sources = carried(ds_id)
+    if not sources:
+        return entry
+    own = _own_grants(sources)
+    readers = set.intersection(*(own.get(s, (set(), set()))[0] for s in sources))
+    sharers = set.intersection(*(own.get(s, (set(), set()))[1] for s in sources))
+    cut = {g: sorted(set(entry[g]) & (sharers if g == "share" else readers)) for g in grants}
+    return {**entry, **cut, "sources": sources}
 
 
 def reconcile(ds_id):
     """The ONLY writer of `status`: set one dataset live or gone from whether its folder holds
-    anything. Storage is the truth here; grants are untouched, so reconcile never moves OPA.
+    anything, from a listing that also records its files (list_folder). Storage is the truth here; grants are untouched, so reconcile never moves OPA.
     There is no periodic sweep: each bucket notification triggers this for the dataset it
     names, and the notification topic is persistent (rgw_setup.py), so a check that fails here
     raises and the event is delivered again."""
@@ -455,7 +604,7 @@ def reconcile(ds_id):
         row = cur.fetchone()
     if row is None:
         return
-    nonempty = _nonempty(row["prefix"])
+    nonempty = list_folder(ds_id)
     with db(commit=True) as cur:
         cur.execute(_RECONCILE_SQL, {"n": ds_id, "nonempty": nonempty})
         r = cur.fetchone()
@@ -483,7 +632,9 @@ def internal_datasets():
         cur.execute("SELECT id, prefix, describe, access, share, write FROM datasets WHERE id = ANY(%s)",
                     (ids,))
         rows = cur.fetchall()
-    return jsonify({"entries": {r["id"]: _entry(r) for r in rows}})
+    # Who may read follows rule 3 (PROVENANCE.md 6): write on a file dataset reads nothing.
+    return jsonify({"entries": {r["id"]: _effective(r["id"], _entry(r), ("access", "share"))
+                                for r in rows}})
 
 
 @internal_app.get("/internal/register-grants")
@@ -509,6 +660,9 @@ def internal_group_owners(grp):
 
 
 _TABLE_COLS = 'id, describe, read, share, write, "delete", status'
+# Rule 3 cuts a table's write as well as its read: writing a table reads it, and the credential
+# Polaris vends for writing can read the files.
+_TABLE_CUT = ("read", "write", "share")
 
 
 def _ids_from_body():
@@ -524,7 +678,9 @@ def internal_table(table_id):
     with db() as cur:
         cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = %s", (table_id,))
         row = cur.fetchone()
-    return (jsonify(row), 200) if row else (jsonify({"error": "not found"}), 404)
+    if row is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(_effective(table_id, row, _TABLE_CUT)), 200
 
 
 @internal_app.post("/internal/tables")
@@ -533,7 +689,8 @@ def internal_tables():
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
         cur.execute(f"SELECT {_TABLE_COLS} FROM table_entries WHERE id = ANY(%s)", (ids,))
-        return jsonify({"entries": {r["id"]: r for r in cur.fetchall()}})
+        rows = cur.fetchall()
+    return jsonify({"entries": {r["id"]: _effective(r["id"], r, _TABLE_CUT) for r in rows}})
 
 
 @internal_app.post("/internal/namespaces")
@@ -608,6 +765,7 @@ def _accesses_valid(body):
             and all(isinstance(e, dict) and isinstance(e.get("dataset"), str) and e["dataset"]
                     and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write")
                     and (e.get("expires") is None or isinstance(e["expires"], int))
+                    and isinstance(e.get("can_write", False), bool)
                     for e in entries))
 
 
@@ -622,13 +780,17 @@ def record_accesses():
     body = request.get_json(silent=True) or {}
     if not _accesses_valid(body):
         return jsonify({"error": "person, sub, sid and entries [{dataset, kind, mode, expires}] required"}), 400
+    # A read keeps the sources it brought in: the dataset and what its files carry now (rule 1).
+    brought = {i: [e["dataset"], *carried(e["dataset"])] if e["mode"] == "read" else None
+               for i, e in enumerate(body["entries"])}
     with db(commit=True) as cur:
         session = _pointer(cur, body["person"], body["sid"], create=True)
-        for e in body["entries"]:
-            cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0))",
+        for i, e in enumerate(body["entries"]):
+            cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires, "
+                        "sources, can_write) VALUES (%s, %s, %s, %s, %s, %s, %s, "
+                        "to_timestamp(%s / 1000.0), %s, %s)",
                         (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
-                         e["mode"], e.get("expires")))
+                         e["mode"], e.get("expires"), brought[i], e.get("can_write", False)))
         cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
         name = cur.fetchone()["name"]
     app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,
@@ -652,9 +814,10 @@ def events():
                               for r in records):
         app.logger.warning("/events: delivery without the topic's secret refused")
         return jsonify({"error": "unauthorized"}), 401
-    with db() as cur:  # the registry once, not once per record
-        cur.execute("SELECT id, prefix FROM datasets")
-        registry = [(r["id"], r["prefix"]) for r in cur.fetchall()]
+    registry = _folders()   # once, not once per record
+    with db() as cur:
+        cur.execute("SELECT id FROM datasets")
+        file_datasets = {r["id"] for r in cur.fetchall()}
     touched = set()
     for rec in records:
         key = rec.get("s3", {}).get("object", {}).get("key", "")
@@ -667,7 +830,8 @@ def events():
             app.logger.info("EVENT key=%s is ungoverned (no registered dataset)", key)
     try:
         for ds in touched:
-            reconcile(ds)
+            # A file dataset's status follows its folder; a table's comes from the gate.
+            reconcile(ds) if ds in file_datasets else list_folder(ds)
     except Exception as e:  # noqa: BLE001 — RGW redelivers on a non-2xx answer
         app.logger.warning("/events: check failed, asking RGW to redeliver: %s", e)
         return jsonify({"error": "check failed"}), 503
