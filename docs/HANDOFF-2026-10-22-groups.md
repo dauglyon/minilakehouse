@@ -108,3 +108,74 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
   top-level roots not named after a group.
 - The governance API takes a person's token only. No service lane.
 - One role (admin), not owner + steward. Split later if a need appears.
+
+---
+
+# Section 2 — namespace grants (inheritance)
+
+## Why
+
+In the platform's ingest (`kbase/data-lakehouse-ingest`) one dataset is a namespace with many
+tables, created in one run. Today access there is per tenant (whole catalog). minilakehouse
+grants per table, so a tenant with hundreds of tables would be registered and permissioned one
+table at a time. Every comparable system (Unity Catalog, Polaris, Snowflake, Lake Formation,
+Gravitino, Ranger) grants at a level of the hierarchy and inherits downward; the table is the
+exception. Match that.
+
+The rego stays almost untouched: every rule in `tables.rego` reads `e.read`, `e.describe`,
+etc. off the entry governance hands it, so governance returns *effective* grants (the table's
+own ∪ each ancestor namespace's) and `readable`, `viewable`, `writable`, `shares` and the
+provenance narrowing work as they are. OPA still decides on one named resource; no
+enumeration is added.
+
+## Changes
+
+### Schema (`governance/app.py`)
+- `namespace_grants (namespace TEXT PRIMARY KEY, describe, read, share, write, delete TEXT[])`,
+  the same five sets as `table_entries`. `namespace` is `<catalog>` or
+  `<catalog>.<namespace...>`.
+
+### Internal lookups
+- `/internal/tables` and `/internal/tables/<id>`: each set is the table's own ∪ every ancestor
+  namespace's (`lakehouse.db.t1` gets `lakehouse.db` and `lakehouse`). Add `own` (the table's
+  own sets) and `inherited_from` ({group: namespace} per set) beside them, for the read API
+  and UI only; rules use the effective sets.
+- `_index_rows`: the candidate filter for `governance.datasets` must include namespace grants,
+  or a table granted only through its namespace never reaches OPA and vanishes from the index.
+  `seed/check-index-narrowing.py` must still pass; extend its seed with an inherited-only table.
+- `/internal/namespaces` viewers: union in `namespace_grants` at and below the namespace.
+
+### API
+- `PATCH /permissions/namespace/<id>`: new kind. `describe`/`read` change for a group holding
+  the namespace's `share`; `share`/`write`/`delete` for an admin of a group owning the
+  namespace or one above (section 1's role model).
+- `POST /tables`: accept a list of entries in one request, all under one namespace, in one
+  transaction. Grants on each are optional and default to empty (inherit only). Registering
+  from an ingest config's table list is the intended use.
+
+### OPA (`opa/tables.rego`)
+- `allow_change` gains a clause for kind `namespace`, deciding on the `namespace_grants` row
+  with the same `_may_change` split. Governance passes `kind` in the input.
+- No other rule changes.
+
+### Read API (section 1) additions
+- `GET /namespaces/<id>`: its own grants, owners, tables under it with status and whether each
+  has grants of its own. This is the steward's day-to-day page.
+- `GET /tables/<id>`: returns `grants` (effective), `own`, `inherited_from`.
+
+### Semantics to document
+- Removing a group from a table's own grant does nothing while an ancestor namespace still
+  grants it (as in Unity Catalog). The UI shows inherited grants as not editable on the table,
+  with a link to the namespace that grants them.
+- Tables created later under a namespace inherit at once (Snowflake's "future grants" for free).
+- Provenance narrowing applies to effective `read`: a namespace grant does not let a group read
+  a table derived from sources it may not read.
+
+### Later, same shape
+- Blobs: `root_grants` on `datasets/<root>/`, unioned into `/internal/datasets` the same way.
+  Not needed for the first UI.
+
+## Decided
+- Inheritance is computed by governance when serving the entry, not by rego fetching parents
+  and not by copying grants onto tables at registration. The registry's per-table rows stay
+  the only place a table-specific grant lives.
