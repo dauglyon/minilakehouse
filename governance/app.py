@@ -457,9 +457,13 @@ RETURNING prev.old AS old, d.status AS new
 
 
 def _table_folder(location):
-    """A table's folder as a key prefix: s3://<bucket>/warehouse/db/t1-<uuid> -> warehouse/db/t1-<uuid>/."""
-    head = f"s3://{S3_BUCKET}/"
-    return location[len(head):].rstrip("/") + "/" if location and location.startswith(head) else None
+    """A table's folder as a key prefix: s3://<bucket>/warehouse/db/t1-<uuid> -> warehouse/db/t1-<uuid>/.
+    None for a location outside warehouse/, where Polaris's catalog confines tables
+    (polaris/bootstrap.sh allowedLocations), so no table folder overlaps a file dataset's."""
+    head = f"s3://{S3_BUCKET}/warehouse/"
+    if not location or not location.startswith(head) or ".." in location:
+        return None
+    return "warehouse/" + location[len(head):].rstrip("/") + "/"
 
 
 def _folders():
@@ -517,7 +521,8 @@ CLOCK_TOLERANCE = 5
 # time: counting it earlier would make a table absorb everything its writer reads for as long
 # as Polaris's credential lasts, up to an hour, while every write notifies governance, which
 # lists the folder within seconds. Anyone holding a credential already reads new files in the
-# folder until it expires, whatever governance knows.
+# folder until it expires, whatever governance knows. A dataset whose folder cannot be listed
+# counts every write ever logged for it as having written a file.
 _CARRIED_SQL = """
 WITH f AS (
     SELECT key, last_modified AS lm FROM files WHERE dataset = %(t)s
@@ -529,8 +534,8 @@ WITH f AS (
       ON f.lm BETWEEN w.at - %(tol)s * interval '1 second' AND w.until + %(tol)s * interval '1 second'
     UNION ALL
     SELECT LEAST(now(), w.until), w.person, w.session, w.sid, w.at FROM w
-    JOIN folder_listings l ON l.dataset = %(t)s
-    WHERE w.mode = 'write' AND w.until + %(tol)s * interval '1 second' > l.listed_at
+    LEFT JOIN folder_listings l ON l.dataset = %(t)s
+    WHERE %(unlisted)s OR (w.mode = 'write' AND w.until + %(tol)s * interval '1 second' > l.listed_at)
 ), brought AS (
     SELECT DISTINCT fw.person, fw.lm, s.source
     FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read' AND r.at < fw.lm
@@ -549,14 +554,15 @@ ORDER BY 1
 
 def carried(ds_id):
     """The sources the files in a dataset's folder carry. The folder is listed first if it never
-    has been, or if a write credential has expired since the last listing, so that what it
-    wrote, or did not, is settled by storage."""
+    has been, or if a credential that could write it has expired since the last listing, so
+    that what it wrote, or did not, is settled by storage even if a notification was lost."""
+    unlisted = _folder(ds_id) is None
     with db() as cur:
         cur.execute("SELECT listed_at FROM folder_listings WHERE dataset = %s", (ds_id,))
         row = cur.fetchone()
-        stale = row is None
+        stale = row is None and not unlisted
         if row:
-            cur.execute("SELECT 1 FROM accesses WHERE dataset = %s AND mode = 'write' "
+            cur.execute("SELECT 1 FROM accesses WHERE dataset = %s AND (mode = 'write' OR can_write) "
                         "AND COALESCE(expires, at) + %s * interval '1 second' > %s "
                         "AND COALESCE(expires, at) < now() LIMIT 1",
                         (ds_id, CLOCK_TOLERANCE, row["listed_at"]))
@@ -564,7 +570,7 @@ def carried(ds_id):
     if stale:
         list_folder(ds_id)
     with db() as cur:
-        cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE})
+        cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "unlisted": unlisted})
         return [r["source"] for r in cur.fetchall()]
 
 
@@ -822,10 +828,10 @@ def events():
     for rec in records:
         key = rec.get("s3", {}).get("object", {}).get("key", "")
         app.logger.info("EVENT %s key=%s", rec.get("eventName", "?"), key)
-        # longest registered prefix the key falls under (disambiguates nested prefixes)
-        match = max((p for p in registry if key.startswith(p[1])), key=lambda p: len(p[1]), default=None)
-        if match:
-            touched.add(match[0])
+        # Every folder the key falls under: a nested or overlapping folder must be listed too.
+        matches = {i for i, prefix in registry if key.startswith(prefix)}
+        if matches:
+            touched |= matches
         else:
             app.logger.info("EVENT key=%s is ungoverned (no registered dataset)", key)
     try:
