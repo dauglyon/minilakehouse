@@ -1,7 +1,6 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-Build step 1, the first part of step 2, and section 6's three rules (section 10) are
-implemented; the rest is design.
+Build steps 1 and 2 (section 10) are implemented; step 3 is design.
 Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
 document extends `WHITEPAPER.md` and replaces its derivation rule (section 4.3), which limits a
 dataset by a list of `inputs`, with sources that travel with the stored data (section 6).
@@ -14,9 +13,10 @@ the only control is who may register. Section 10 rejects verifying inputs becaus
 require engine lineage, which requires trusting the engine.
 
 This design is the third option. The server records every dataset a person's work obtained a
-credential for, and before an output is listed for others the publisher declares, per
-candidate, whether it was used. The publisher can subtract from a list the server built and can add
-things the platform never saw; the publisher cannot shorten the list silently. Every read in
+credential for, and until the publisher declares, per candidate, whether it was used, everything
+that could be in an output limits who may read it. The publisher can subtract from a list the
+server built and can add things the platform never saw; the publisher cannot shorten the list
+silently. A write needs no declaration: declaring is how a publisher widens who may read. Every read in
 this stack is a credential issued after a policy decision, and nothing on the byte path is
 readable without one, so the server's list is complete for everything that came through the
 platform.
@@ -219,14 +219,13 @@ declared sources, signed with governance's Ed25519 key (`signing.key`, made by
 `governance/pki.py`). Otherwise the commit is refused with an Iceberg error and nothing is
 stored; the person sees the reason as the statement's error.
 
-Each person who wrote a target declares their own candidates, and the target goes `live` once
-everyone who wrote it has declared. A person's `lineage` holds only their own sessions, and
-only the person who made a read can say whether they used it. This is in-toto's model: each
+Each person who wrote a target declares their own candidates; until they do, their files carry
+everything they brought in. A person's `lineage` holds only their own sessions, and only the
+person who made a read can say whether they used it. This is in-toto's model: each
 functionary signs the link for the step they ran, and a product verifies only with every
 step's link. Rejected: one person declaring for every writer, which would show them the
 other writers' reads (some naming datasets they may not see) and have them vouch for reads
 they did not make; and one writer per output, which stops a group working on a shared output.
-Setting `live` and the grant recomputation below are build step 2's second part, not built.
 
 Who may then read the target follows section 6: a source marked unused is not carried by
 the files the declaration covers. `external` rows are recorded and shown and limit no one,
@@ -337,10 +336,9 @@ the commit, so the person's error names the table rather than a failed file writ
 
 ## 6. Sources travel with the data
 
-Agreed 2026-10-22. Built (section 10, items 11 to 13): rules 1 to 3, declarations naming an
+Agreed 2026-10-22 and built (section 10, items 11 to 13): rules 1 to 3, declarations naming an
 arrived-through source, the `detach` grant and OPA's rules (`opa/derivations.rego`), detaches
-shown to the source's `share` holders, and putting a source back. Not built: the lifecycle in
-6.6. A *source* of some data is a dataset whose own `read` grant
+shown to the source's `share` holders, and putting a source back. A *source* of some data is a dataset whose own `read` grant
 limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
 propagates a classification to everything derived from a dataset and Palantir Foundry's
 markings follow data along lineage. Three rules:
@@ -470,22 +468,28 @@ authority is delegated for classified documents.
 
 ### 6.6 Lifecycle of an output
 
+Decided 2026-10-22: a write needs no declaration, and status does not wait for one.
+
 - Registered `pending`, created as today: the gate admits a create for a registered pending
   table whose caller is in its `write`; a file dataset gets a write credential on `write`.
-- Written in one or more sessions, by one or more people.
-- Declared by each person who wrote it, from any session.
-- `live` once every writer's files are covered by a declaration of theirs: listed, and
-  readable under rule 3.
-- An output never declared stays `pending`: listed for no one, readable under rule 3.
-- Later writes keep it `live`; their files carry their sources until declared (6.1).
+- `live` when it exists, as before: a table once the gate reports its creation, a file
+  dataset once its folder holds a file. Listed under its `describe` grant, which no source
+  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot see
+  its inputs.
+- Readable under rule 3 from its first write: until each writer declares, everything that
+  writer brought in limits who may read it, so declaring is how a writer widens its readers.
+- Rejected: holding an output `pending` until every writer has declared. Status decides only
+  listing, so it would have hidden the dataset from the index and nothing more; making it
+  decide reads too would add a step to every write, where rule 3 already limits who may read
+  everything that could be in it.
 
 ## 7. What this enforces, decides, declares
 
 Extending `WHITEPAPER.md` section 11:
 
 **Enforced.** The candidate list is a superset of every input that came through the
-platform: no credential without a record. An output is not `live` until declared. A
-declaration covers the list exactly.
+platform: no credential without a record. Until declared, everything on that list limits who
+may read the output. A declaration covers the list exactly.
 
 **Decided by OPA.** Registration, grants and vends as before, with who may read a dataset
 given by section 6's rule 3.
@@ -657,13 +661,11 @@ Build order, each step usable on its own:
    listing; who may read from rule 3 in governance's lookups for OPA; declarations covering
    only undeclared files and naming arrived-through sources; the `detach` grant, OPA's rule for
    sources marked unused, detaches shown to the source's `share` holders and their putting a
-   source back (6.5); `lineage`'s `direct` rows; a target `live` once every writer has
-   declared. Built of these: the sources each read brings in, writer credentials flagged by
+   source back (6.5); `lineage`'s `direct` rows. All built: the sources each read brings in, writer credentials flagged by
    the gate, files attributed by listing, rule 3 in governance's lookups, notifications and
    listing extended to table folders, the `detach` grant and OPA's rule, declarations naming
    arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
    columns with detaches shown to the source's `share` holders, and putting a source back.
-   Left: a target `live` once every writer has declared.
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10

@@ -423,8 +423,9 @@ each file carries the datasets its writer had read before writing it, minus thos
 unused, and a dataset's `read` is cut down to groups that may also read every one of them. A
 source that arrived through a read, such as `t1` in a copy of a table made from it, can be
 detached by naming it unused once its data is gone; its `detach` grant says who may, and
-holders of its `share` see every detach and can put the source back. A target going live
-only once everyone who wrote it has declared is not built yet.
+holders of its `share` see every detach and can put the source back. A write needs no
+declaration: until the writer declares, everything that could be in the data limits who may
+read it, and declaring widens that.
 
 ## Security model
 
