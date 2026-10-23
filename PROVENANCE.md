@@ -382,16 +382,15 @@ Storage decides. Governance stops counting a source for a dataset only after a l
 no file carrying it; Ceph's notifications, for `datasets/` and `warehouse/`, tell it when to
 list again.
 
-A write still under way when the folder was last listed may have produced files that listing
-could not see. A commit or staged create the gate logged, and a write credential from the
-broker or Polaris, therefore count as having written a file at once, carrying what their
-writer had brought in up to now, until a listing made after the credential expires settles
-what they wrote. A table credential handed to a writer for a load counts only for files a
-listing finds from its time: counting it earlier would make a table absorb everything its
-writer reads for as long as Polaris's credential lasts, up to an hour, while every write
-notifies governance and the listing follows within seconds. Anyone holding a credential reads
-new files in the folder until it expires whatever governance knows, as with any grant
-change.
+A commit or create the gate logged since the last listing counts as having written a file at
+its time, since the gate logs it before Polaris sees it. A credential that can write, from the
+broker or from Polaris, counts only for files a listing finds from its time, and governance
+lists the folder again when it expires, in case a notification was lost. Counting a valid
+credential as writing now was built first and dropped: it held a dataset to everything its
+writer read for as long as the credential lasted, up to an hour for Polaris's, cleaning
+included, and it protected only the seconds before the listing a write's notification
+triggers. Anyone holding a credential reads new files in the folder until it expires whatever
+governance knows, as with any grant change.
 
 ### 6.3 What a declaration covers
 
@@ -417,9 +416,8 @@ To remove a source from a dataset:
 
 Trino refuses to expire versions younger than its catalog's minimum, seven days by default;
 `trino/etc/catalog/iceberg.properties` sets `iceberg.expire-snapshots.min-retention` and
-`iceberg.remove-orphan-files.min-retention` to `0s`. The restriction lifts once the cleaner's
-write credentials for the dataset have expired, since until then they could still write data
-from the source (6.2).
+`iceberg.remove-orphan-files.min-retention` to `0s`. The restriction lifts as soon as the
+declaration is stored, the old files being gone.
 
 Once the declaration is accepted, the files it covers no longer carry the source and rule 3
 stops counting it. Planned and dropped: refusing the declaration while files from the source
@@ -502,9 +500,9 @@ dataset.
 - **Rule 3 needs each file's time.** Governance lists a dataset's folder on every storage
   notification for it and when a write credential for it expires; a large table is a long
   listing, and a bulk upload lists the folder once per object.
-- **A dataset stays cut down while a writer's credential is valid.** A person who read a
-  source and holds a write credential for a dataset keeps it carrying that source until the
-  credential expires, up to an hour for Polaris's, even after declaring it unused.
+- **A file written with a credential counts once listed.** In the seconds between the write
+  and the listing its notification triggers, a newly decided reader can be handed a
+  credential to it, as anyone already holding one can read it until expiry.
 - **A table file belongs to everyone who could write the table when it was written**,
   including a writer who only read the table then.
 - **A credential carried to another login is not followed.** The reads of the login it was
@@ -599,9 +597,11 @@ attribution (4.2).
     lookup OPA gets showed `read` and `write` cut to `jgi-writers`. Cleaning: `DELETE` of the
     `t1` rows, `optimize`, `expire_snapshots` and `remove_orphan_files` left one data file
     and one version; alice declared `t1` unused. `r1` still carried `t1` through the write
-    credential Polaris had handed alice at the create, valid for another 57 minutes; with
-    that credential marked expired in the access log (a test shortcut), carol read the one
-    remaining row. A first version of the timing rule that also counted a writer's load
+    credential Polaris had handed alice at the create, valid for another 57 minutes, under a
+    timing rule since dropped (6.2); with that credential marked expired in the access log
+    (a test shortcut), carol read the one remaining row. Under the current rule, a table
+    `z1` written after alice read `t1` was hidden from carol, and she read it right after
+    alice declared `t1` unused, with alice's create credential still valid. A first version of the timing rule that also counted a writer's load
     credential before any listing made `t1` carry what alice read after loading it.
 12. Detaching, run on the stack. alice appended `t1` rows to `r1` again, then in a new session
     copied it: `CREATE TABLE c1 AS SELECT * FROM r1`. `c1`'s lineage showed `r1` read

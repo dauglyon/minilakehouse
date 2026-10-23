@@ -526,20 +526,20 @@ CLOCK_TOLERANCE = 5
 # carries what each such writer had brought in before that time, through their session's reads
 # and, from the credential's issue on, their login's reads, minus what that writer's latest
 # declaration of the dataset made after the file marked unused. A dataset is not its own source.
-# A write still under way after the last listing (a write credential still valid, or a commit
-# or staged create since) may have produced files that listing could not see, so it counts as
-# having written one now, and carried() lists again once its credential expires. A table
-# credential handed to a writer for a load is not a write until a listing finds a file from its
-# time: counting it earlier would make a table absorb everything its writer reads for as long
-# as Polaris's credential lasts, up to an hour, while every write notifies governance, which
-# lists the folder within seconds. Anyone holding a credential already reads new files in the
-# folder until it expires, whatever governance knows. A dataset whose folder cannot be listed
-# counts every write ever logged for it as having written a file.
+# A commit or create the gate logged since the last listing counts as having written a file at
+# its time, since the gate logs it before Polaris sees it. A credential that can write counts
+# only for files a listing finds from its time, and carried() lists again once it expires, in
+# case a notification was lost. Counting a valid credential as writing now would hold a dataset
+# to everything its writer reads for as long as the credential lasts, up to an hour for
+# Polaris's, cleaning included; it would protect only the seconds before the listing a write's
+# notification triggers, and anyone holding a credential reads new files in the folder until it
+# expires whatever governance knows. A dataset whose folder cannot be listed counts every write
+# ever logged for it as having written a file.
 _CARRIED_SQL = """
 WITH f AS (
     SELECT key, last_modified AS lm FROM files WHERE dataset = %(t)s
 ), w AS (
-    SELECT person, session, sid, at, mode, COALESCE(expires, at) AS until
+    SELECT person, session, sid, at, expires IS NULL AS instant, COALESCE(expires, at) AS until
     FROM accesses WHERE dataset = %(t)s AND (mode = 'write' OR can_write)
 ), fw AS (
     SELECT f.lm, w.person, w.session, w.sid, w.at FROM f JOIN w
@@ -547,7 +547,7 @@ WITH f AS (
     UNION ALL
     SELECT LEAST(now(), w.until), w.person, w.session, w.sid, w.at FROM w
     LEFT JOIN folder_listings l ON l.dataset = %(t)s
-    WHERE %(unlisted)s OR (w.mode = 'write' AND w.until + %(tol)s * interval '1 second' > l.listed_at)
+    WHERE %(unlisted)s OR (w.instant AND w.until + %(tol)s * interval '1 second' > l.listed_at)
 ), brought AS (
     SELECT DISTINCT fw.person, fw.lm, s.source
     FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read' AND r.at < fw.lm
