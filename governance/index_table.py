@@ -69,7 +69,8 @@ TABLES = {
                        ("session", StringType), ("event_time", TimestamptzType),
                        ("direct", BooleanType)),   # false: arrived through a read
     "derivations": _schema(("source", StringType), ("source_type", StringType),  # + external
-                           ("target", StringType), ("used", BooleanType)),
+                           ("target", StringType), ("used", BooleanType),
+                           ("declared_by", StringType), ("declared_at", TimestamptzType)),
 }
 WRITABLE = {"derivations"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine

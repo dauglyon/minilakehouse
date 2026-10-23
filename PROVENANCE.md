@@ -188,7 +188,7 @@ session's reads are `WHERE session = '<name>' AND target IS NULL`.
 ### 5.3 `governance.derivations`
 
 Insert only, with `lineage`'s column names, so a declaration copies candidates column for
-column.
+column. An insert names the four columns it fills; governance fills in the other two.
 
 | column | meaning |
 |---|---|
@@ -196,6 +196,12 @@ column.
 | `source_type` | `table`, `files`, or `external`; may be left out for a candidate |
 | `target` | id of a pending dataset the caller may write |
 | `used` | boolean |
+| `declared_by` | the person who declared, filled in by governance |
+| `declared_at` | when, filled in by governance |
+
+A person sees their own declarations, every detach and every putting back of a source whose
+own `share` names one of their groups, and every putting back on a target they declared
+(6.5).
 
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
 whole: for every target it names, the caller must have written it, a caller group must be in
@@ -248,7 +254,7 @@ WHERE target = 'lakehouse.db.joined';
 Everything was used:
 
 ```sql
-INSERT INTO governance.derivations
+INSERT INTO governance.derivations (source, source_type, target, used)
 SELECT DISTINCT source, source_type, target, true
 FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 ```
@@ -256,7 +262,7 @@ FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 One dataset was not used:
 
 ```sql
-INSERT INTO governance.derivations
+INSERT INTO governance.derivations (source, source_type, target, used)
 SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
 FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 ```
@@ -264,7 +270,7 @@ FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 The same, plus a file from a collaborator:
 
 ```sql
-INSERT INTO governance.derivations
+INSERT INTO governance.derivations (source, source_type, target, used)
 SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
 FROM governance.lineage WHERE target = 'lakehouse.db.joined'
 UNION ALL
@@ -290,7 +296,7 @@ and its rows from `weather` have been deleted, the files rewritten, and old vers
 The rewrite read `joined`, which brought in `joined` and, through it, `weather`:
 
 ```sql
-INSERT INTO governance.derivations VALUES
+INSERT INTO governance.derivations (source, source_type, target, used) VALUES
   ('lakehouse.db.joined',  'table', 'lakehouse.db.joined', true),   -- read directly
   ('lakehouse.db.weather', 'table', 'lakehouse.db.joined', false);  -- arrived through it; dropped
 ```
@@ -331,10 +337,10 @@ the commit, so the person's error names the table rather than a failed file writ
 
 ## 6. Sources travel with the data
 
-Agreed 2026-10-22. Built (section 10, items 11 and 12): rules 1 to 3, declarations naming an
-arrived-through source, the `detach` grant and OPA's rule for sources marked unused
-(`opa/derivations.rego`). Not built: detaches shown to the source's `share` holders, putting a
-source back (6.5), and the lifecycle in 6.6. A *source* of some data is a dataset whose own `read` grant
+Agreed 2026-10-22. Built (section 10, items 11 to 13): rules 1 to 3, declarations naming an
+arrived-through source, the `detach` grant and OPA's rules (`opa/derivations.rego`), detaches
+shown to the source's `share` holders, and putting a source back. Not built: the lifecycle in
+6.6. A *source* of some data is a dataset whose own `read` grant
 limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
 propagates a classification to everything derived from a dataset and Palantir Foundry's
 markings follow data along lineage. Three rules:
@@ -449,7 +455,10 @@ a record, not by approval each time.
   target's id.
 - **Reversible.** A `share` holder of the source can put it back by inserting a row that marks
   it used for that target; governance accepts that from them for a target the source was
-  detached from, and from then on the target's files carry it again. Data read in between has
+  detached from, OPA deciding who holds `share` (`may_reattach`), and from then on the
+  target's files carry it again. A putting back overrides every detach of that source from
+  that target made before it; a detach made after it overrides it in turn, so a source's
+  owners who want it to stay attached fill its `detach` grant. Data read in between has
   gone out, and the record names who said the data was clean.
 
 Rejected: holding each detach until someone with `share` on the source approves it. The
@@ -503,6 +512,10 @@ dataset.
 - **A file written with a credential counts once listed.** In the seconds between the write
   and the listing its notification triggers, a newly decided reader can be handed a
   credential to it, as anyone already holding one can read it until expiry.
+- **A declaration covers a file from two seconds after it was written.** A listing gives
+  last-modified times in whole seconds, rounded down, so governance leans the safe way: a
+  read up to two seconds after a file's listed time counts toward it, and a declaration made
+  sooner than two seconds after it covers it only at the person's next declaration.
 - **A table file belongs to everyone who could write the table when it was written**,
   including a writer who only read the table then.
 - **A credential carried to another login is not followed.** The reads of the login it was
@@ -612,6 +625,15 @@ attribution (4.2).
     that while it was empty. With alice's write credentials for `c1` marked expired (the test
     shortcut), `c1` carried only `r1` and carol read it, while `r1` still carried `t1` and
     stayed hidden from her. `detach` is changed by root owners, as `share` is.
+13. Showing and putting back detaches, run on the stack. alice copied `t1` into `x2`, then in
+    another session `x2` into `y2`, and declared `y2` with `x2` used and `t1` detached.
+    carol, given `share` on `t1`, saw that row in `governance.derivations` with
+    `declared_by` alice; bob's putting back was refused ("you have not written it"), carol's
+    was accepted, alice then saw carol's row on `y2`, and `y2` carried `t1` again. An insert
+    naming `declared_by` was refused. The run found that listings round last-modified times
+    down to the second: `y2`'s files, written a third of a second after alice's read of
+    `x2`, looked older than the read, so `y2` carried nothing once the commit's own window
+    passed. Comparisons now lean two seconds the safe way (section 8).
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
@@ -639,7 +661,9 @@ Build order, each step usable on its own:
    declared. Built of these: the sources each read brings in, writer credentials flagged by
    the gate, files attributed by listing, rule 3 in governance's lookups, notifications and
    listing extended to table folders, the `detach` grant and OPA's rule, declarations naming
-   arrived-through sources, and `lineage`'s `direct` column.
+   arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
+   columns with detaches shown to the source's `share` holders, and putting a source back.
+   Left: a target `live` once every writer has declared.
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10

@@ -260,6 +260,10 @@ CREATE TABLE IF NOT EXISTS declared_sources (
     used        BOOLEAN NOT NULL
 );
 CREATE INDEX IF NOT EXISTS declarations_person ON declarations (person, target);
+-- A detach is a source that arrived through a read, marked unused; a declaration that puts
+-- detached sources back is made by a holder of their `share` (PROVENANCE.md 6.5).
+ALTER TABLE declared_sources ADD COLUMN IF NOT EXISTS detached BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE declarations ADD COLUMN IF NOT EXISTS reattach BOOLEAN NOT NULL DEFAULT false;
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -520,12 +524,18 @@ def list_folder(ds_id):
 
 # Seconds a file's last-modified time may differ from the access log's clock.
 CLOCK_TOLERANCE = 5
+# A listing gives a file's last-modified time in whole seconds, rounded down, so a file can
+# look older than a read made just before it was written. Every comparison of a listed time
+# with the access log leans the safe way by this much: a read counts toward a file it may have
+# come up to this long after, and a declaration covers a file only from this long after it.
+FILE_TIME_SLACK = 2
 
 # The sources a dataset's files carry (PROVENANCE.md 6, rule 2). A file belongs to every write
 # credential and commit for the dataset that was valid when the file was last modified; it
 # carries what each such writer had brought in before that time, through their session's reads
 # and, from the credential's issue on, their login's reads, minus what that writer's latest
-# declaration of the dataset made after the file marked unused. A dataset is not its own source.
+# declaration of the dataset made after the file marked unused, unless a `share` holder of the
+# source has put it back since (6.5). A dataset is not its own source.
 # A commit or create the gate logged since the last listing counts as having written a file at
 # its time, since the gate logs it before Polaris sees it. A credential that can write counts
 # only for files a listing finds from its time, and carried() lists again once it expires, in
@@ -550,16 +560,22 @@ WITH f AS (
     WHERE %(unlisted)s OR (w.instant AND w.until + %(tol)s * interval '1 second' > l.listed_at)
 ), brought AS (
     SELECT DISTINCT fw.person, fw.lm, s.source
-    FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read' AND r.at < fw.lm
+    FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read'
+         AND r.at < fw.lm + %(slack)s * interval '1 second'
          AND (r.session = fw.session OR (r.sid = fw.sid AND r.at >= fw.at))
     CROSS JOIN LATERAL unnest(COALESCE(r.sources, ARRAY[r.dataset])) AS s(source)
 )
 SELECT DISTINCT b.source FROM brought b
 WHERE b.source <> %(t)s AND NOT EXISTS (
-    SELECT 1 FROM declared_sources ds
+    SELECT 1 FROM declared_sources ds JOIN declarations dd ON dd.id = ds.declaration
     WHERE ds.source = b.source AND NOT ds.used AND ds.declaration = (
         SELECT max(d.id) FROM declarations d
-        WHERE d.person = b.person AND d.target = %(t)s AND d.declared_at >= b.lm))
+        WHERE d.person = b.person AND d.target = %(t)s AND NOT d.reattach
+          AND d.declared_at >= b.lm + %(slack)s * interval '1 second')
+      AND NOT EXISTS (
+        SELECT 1 FROM declarations r JOIN declared_sources rs ON rs.declaration = r.id
+        WHERE r.reattach AND r.target = %(t)s AND rs.source = b.source
+          AND r.declared_at > dd.declared_at))
 ORDER BY 1
 """
 
@@ -582,7 +598,8 @@ def carried(ds_id):
     if stale:
         list_folder(ds_id)
     with db() as cur:
-        cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "unlisted": unlisted})
+        cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "slack": FILE_TIME_SLACK,
+                                   "unlisted": unlisted})
         return [r["source"] for r in cur.fetchall()]
 
 
@@ -1258,12 +1275,28 @@ def _lineage_rows(subject):
         return cur.fetchall()
 
 
+# What governance.derivations shows a person (PROVENANCE.md 5.3, 6.5): their own declarations;
+# every detach, and every putting back, of a source whose own `share` names one of their
+# groups; and every putting back on a target they have declared.
+_DERIVATIONS_SQL = """
+WITH owned AS (
+    SELECT id FROM datasets WHERE share && %(groups)s::text[]
+    UNION SELECT id FROM table_entries WHERE share && %(groups)s::text[]
+)
+SELECT s.source, s.source_type, d.target, s.used, d.person AS declared_by, d.declared_at
+FROM declarations d JOIN declared_sources s ON s.declaration = d.id
+WHERE d.person = %(p)s
+   OR ((s.detached OR d.reattach) AND s.source IN (SELECT id FROM owned))
+   OR (d.reattach AND d.target IN (SELECT target FROM declarations WHERE person = %(p)s))
+ORDER BY d.id, s.source NULLS FIRST
+"""
+
+
 def _derivation_rows(subject):
-    """Every row the person has declared, oldest declaration first."""
     with db() as cur:
-        cur.execute("SELECT s.source, s.source_type, d.target, s.used FROM declarations d "
-                    "JOIN declared_sources s ON s.declaration = d.id WHERE d.person = %s "
-                    "ORDER BY d.id, s.source NULLS FIRST", (subject,))
+        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
+        groups = [r["grp"] for r in cur.fetchall()]
+        cur.execute(_DERIVATIONS_SQL, {"p": subject, "groups": groups})
         return cur.fetchall()
 
 
@@ -1317,7 +1350,34 @@ def _check_target(subject, target, rows, lineage):
     if errors:
         raise index_table.Refused(400, "BadRequestException", f"{target}: " + "; ".join(errors))
     return {"candidates": sorted(candidates), "arrived": sorted(arrived),
-            "sources": [{"source": s, "source_type": types[s], "used": u} for s, u in sorted(declared.items())]}
+            "sources": [{"source": s, "source_type": types[s], "used": u,
+                         "detached": not u and s in arrived and types[s] != "external"}
+                        for s, u in sorted(declared.items())]}
+
+
+def _check_reattach(subject, target, rows):
+    """A declaration by someone who did not write the target: allowed only to put back sources
+    detached from it, by a holder of each one's `share` (PROVENANCE.md 6.5)."""
+    named = [r for r in rows if r.get("source") is not None]
+    sources = sorted({r["source"] for r in named})
+    refused = index_table.Refused(403, "ForbiddenException", f"{target}: you have not written it")
+    if not named or any(not r["used"] or r.get("source_type") == "external" for r in named):
+        raise refused
+    holders = set(opa("may_reattach", {"subject": subject, "target": target,
+                                       "sources": [{"id": src, "direct": False} for src in sources]},
+                      package="derivations") or [])
+    if set(sources) - holders:
+        raise refused
+    with db() as cur:
+        cur.execute("SELECT DISTINCT s.source, s.source_type FROM declarations d "
+                    "JOIN declared_sources s ON s.declaration = d.id "
+                    "WHERE d.target = %s AND s.detached AND s.source = ANY(%s)", (target, sources))
+        detached = {r["source"]: r["source_type"] for r in cur.fetchall()}
+    if never := sorted(set(sources) - set(detached)):
+        raise index_table.Refused(400, "BadRequestException",
+                                  f"{target}: you have not written it, and nobody detached {', '.join(never)} from it")
+    return {"reattach": True, "sources": [{"source": src, "source_type": detached[src], "used": True,
+                                           "detached": False} for src in sources]}
 
 
 def _sign(record):
@@ -1338,25 +1398,33 @@ def _declare(subject, rows):
     if not rows or not all(isinstance(r.get("target"), str) and isinstance(r.get("used"), bool)
                            for r in rows):
         raise index_table.Refused(400, "BadRequestException", "every row needs a target and used")
+    if any(r.get("declared_by") is not None or r.get("declared_at") is not None for r in rows):
+        raise index_table.Refused(400, "BadRequestException",
+                                  "declared_by and declared_at are filled in by governance; "
+                                  "insert into (source, source_type, target, used)")
     by_target = {}
     for r in rows:
         by_target.setdefault(r["target"], []).append(r)
     lineage = _lineage_rows(subject)
-    checked = {t: _check_target(subject, t, trs, lineage) for t, trs in sorted(by_target.items())}
+    written = {r["target"] for r in lineage if r["target"] is not None}
+    checked = {t: (_check_target(subject, t, trs, lineage) if t in written
+                   else _check_reattach(subject, t, trs))
+               for t, trs in sorted(by_target.items())}
     now = datetime.now(timezone.utc)
     with db(commit=True) as cur:
         for target, c in checked.items():
             record = {"person": subject, "target": target, "declared_at": now.isoformat(), **c}
-            cur.execute("INSERT INTO declarations (person, target, declared_at, envelope) "
-                        "VALUES (%s, %s, %s, %s) RETURNING id",
-                        (subject, target, now, json.dumps(_sign(record))))
+            cur.execute("INSERT INTO declarations (person, target, declared_at, envelope, reattach) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                        (subject, target, now, json.dumps(_sign(record)), c.get("reattach", False)))
             declaration = cur.fetchone()["id"]
-            for src in c["sources"] or [{"source": None, "source_type": None, "used": True}]:
-                cur.execute("INSERT INTO declared_sources (declaration, source, source_type, used) "
-                            "VALUES (%s, %s, %s, %s)",
-                            (declaration, src["source"], src["source_type"], src["used"]))
+            for src in c["sources"] or [{"source": None, "source_type": None, "used": True, "detached": False}]:
+                cur.execute("INSERT INTO declared_sources (declaration, source, source_type, used, detached) "
+                            "VALUES (%s, %s, %s, %s, %s)",
+                            (declaration, src["source"], src["source_type"], src["used"], src["detached"]))
     app.logger.info("DECLARE person=%s %s", subject, " ".join(
-        f"{t}:{sum(s['used'] for s in c['sources'])}/{len(c['sources'])}" for t, c in checked.items()))
+        f"{t}:{'put back ' if c.get('reattach') else ''}{sum(s['used'] for s in c['sources'])}/{len(c['sources'])}"
+        for t, c in checked.items()))
 
 
 def _iceberg_error(status, kind, message):

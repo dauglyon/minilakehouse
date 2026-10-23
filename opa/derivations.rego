@@ -34,6 +34,15 @@ allowed contains s.id if {
 	g in _entry(s.id).detach
 }
 
+# Putting back a detached source (6.5): a holder of the source's `share`.
+#
+#   may_reattach   input {subject, target, sources: [{id}]}   the ids the subject may put back
+may_reattach contains s.id if {
+	some s in input.sources
+	some g in governance.groups(input.subject)
+	g in _entry(s.id).share
+}
+
 _ids := [s.id | some s in input.sources]
 
 _tables := governance.post("/internal/tables", {"ids": _ids}).entries

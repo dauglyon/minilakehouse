@@ -405,19 +405,26 @@ signs it. An input from outside the platform is a row with `source_type` `extern
 `sha256:` hash as the source.
 
 ```bash
-q alice --execute "INSERT INTO iceberg.governance.derivations
+q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used)
   SELECT DISTINCT source, source_type, target, false
   FROM iceberg.governance.lineage WHERE target = 'lakehouse.db.t2'"
 #  -> INSERT: 1 row
-q alice --execute "INSERT INTO iceberg.governance.derivations VALUES (NULL, NULL, 'lakehouse.db.t2', true)"
+q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used) VALUES (NULL, NULL, 'lakehouse.db.t2', true)"
 #  -> Query ... failed: Failed to commit the transaction during insert: Malformed request:
 #     lakehouse.db.t2: not declared: lakehouse.db.t1
-q alice --execute "SELECT * FROM iceberg.governance.derivations"
-#  -> "lakehouse.db.t1","table","lakehouse.db.t2","false"
+q alice --execute "SELECT source, source_type, target, used, declared_by FROM iceberg.governance.derivations"
+#  -> "lakehouse.db.t1","table","lakehouse.db.t2","false","alice"
 ```
 
-What a declaration changes, the target going live and its grants following its inputs, is not
-built yet.
+An insert names its four columns; governance fills in `declared_by` and `declared_at`.
+
+Who may read a dataset follows what its files were made from (`PROVENANCE.md` section 6):
+each file carries the datasets its writer had read before writing it, minus those declared
+unused, and a dataset's `read` is cut down to groups that may also read every one of them. A
+source that arrived through a read, such as `t1` in a copy of a table made from it, can be
+detached by naming it unused once its data is gone; its `detach` grant says who may, and
+holders of its `share` see every detach and can put the source back. A target going live
+only once everyone who wrote it has declared is not built yet.
 
 ## Security model
 
