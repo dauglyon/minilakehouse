@@ -1,8 +1,9 @@
 # Provenance transactions: server-bounded inputs, attested use
 
 Build step 1 and the first part of step 2 (section 10) are implemented; the rest is design.
-Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The document extends
-`WHITEPAPER.md`, whose derivation rule (section 4.3) consumes each dataset's `inputs`.
+Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
+document extends `WHITEPAPER.md` and replaces its derivation rule (section 4.3), which limits a
+dataset by a list of `inputs`, with sources that travel with the stored data (section 6).
 
 ## 1. Purpose
 
@@ -12,8 +13,8 @@ the only control is who may register. Section 10 rejects verifying inputs becaus
 require engine lineage, which requires trusting the engine.
 
 This design is the third option. The server records every dataset a person's work obtained a
-credential for, and before an output is published the publisher declares, per candidate,
-whether it was used. The publisher can subtract from a list the server built and can add
+credential for, and before an output is listed for others the publisher declares, per
+candidate, whether it was used. The publisher can subtract from a list the server built and can add
 things the platform never saw; the publisher cannot shorten the list silently. Every read in
 this stack is a credential issued after a policy decision, and nothing on the byte path is
 readable without one, so the server's list is complete for everything that came through the
@@ -31,6 +32,7 @@ lie rather than a gap.
 | Trusted research environments (OpenSAFELY and similar airlocks) | Nothing leaves until the researcher accounts for what an output derives from; the check happens at the exit, where the researcher's attention is. | Those environments also prevent the researcher from holding the data at all. This design does not; see section 8. |
 | W3C PROV | The record's terms: a declared derivation (`wasDerivedFrom`) and whether a source was `used`. | A vocabulary, not a mechanism. |
 | Unity Catalog's `system.access.table_lineage` | The shape of `governance.lineage` (5.2): a row per source and target, an empty target for a read that wrote nothing, an empty source for a write that read nothing. | Unity's rows come from the engine, one statement at a time. These come from credentials and commits, one session at a time, so a target is paired with everything its session read before writing it, which the declaration narrows. |
+| Apache Atlas classification propagation; Palantir Foundry markings | A restriction travels from a dataset to everything derived from it (section 6); in Foundry, removing a marking takes a permission. | Here the restriction is the source dataset's own `read` grant, it is tracked per stored file, and it is enforced by computing who may read. |
 | SLSA provenance, OpenLineage | Inputs recorded per output. | Emitted by a trusted builder or engine. Rejected by the whitepaper and here. |
 | Database triggers | A write to a table runs server logic. Section 5 moves this to the catalog so it works from any Iceberg client. | |
 
@@ -114,6 +116,9 @@ used to write still makes its session a writer, and reads made after the last re
 but before expiry are candidates. With 15-minute credentials the second is at most 15
 minutes of reads.
 
+This bounds the candidates a person declares. Which sources each stored file carries is
+worked out per file, from the time it was written (6.2).
+
 A credential outlives a session switch: issued in session A, it still writes after the login
 points at B. So a file write credential may also have used every read its own login made
 while the credential was valid, whatever session that read was stamped with. Reads by
@@ -122,16 +127,13 @@ out-of-band carry-over (section 8), as a download is. Including every read by th
 would cover that too, but it would pair each agent's writes with every other agent's reads
 when an orchestrator runs many agents as one person in separate sessions.
 
-Rejected: attributing each object from its storage event. Ceph notifies governance of every
-object written, with the time to the microsecond, and governance could match the event to the
-person's write credentials whose validity covers that time. The session comes from the
-matched credential, so the event adds only the exact time of the write, which is never later
-than the credential's expiry: it could only remove candidates, never add one. Getting the person into the event at all would
-need the broker to vend write credentials with `AssumeRoleWithWebIdentity` (with `AssumeRole`
-the event names the broker), a role and an OIDC provider that belong to no RGW account, and a
-trust condition naming a token audience only the broker could obtain, since RGW's STS endpoint
-is open to every client (section 10, items 1 and 2). The match can be added later for
-precision without changing any table.
+Rejected: naming the writer in Ceph's storage event. The event could name the person only if
+the broker vended write credentials with `AssumeRoleWithWebIdentity` (with `AssumeRole` the
+event names the broker), with a role and an OIDC provider that belong to no RGW account and a
+trust condition naming a token audience only the broker could obtain, since RGW's STS
+endpoint is open to every client (section 10, items 1 and 2). It is not needed: the session
+comes from the write credentials valid when the object was written, so the object's time is
+all that matters, and a listing of the folder gives it (6.2).
 
 ## 5. The tables
 
@@ -174,6 +176,8 @@ Two rules make the rows:
   table read in order to append to it is not its own candidate.
 
 Repeated events of one shape are one row. The person sees only their own sessions' rows.
+Design, not built: a column `direct`, false on rows for a source that arrived through a read
+(section 6) rather than being read, so a person sees what a declaration may drop.
 
 An output's candidates are the sources of the rows whose target is the output, across every
 session that wrote it: `WHERE target = '<id>'`. That is how a later session declares
@@ -195,7 +199,10 @@ column.
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
 whole: for every target it names, the caller must have written it, a caller group must be in
 its `write`, and the rows must give each of the caller's own candidates of that target a
-`used` value; every `external` row's source is a hash. A source named twice with the same `used` counts once; named with
+`used` value; every `external` row's source is a hash. Under section 6 (not built), a
+declaration covers only the caller's files in the target that no earlier declaration of
+theirs covered, and may also name a source that arrived through one of their reads, to mark
+it unused (6.3). A source named twice with the same `used` counts once; named with
 both values, the commit is refused. A source that is not a candidate is refused unless its
 `source_type` is `external`, so a mistyped id is never recorded as an outside input. A row
 with an empty source, which a target with no candidates has in `lineage`, names no input. On
@@ -214,11 +221,10 @@ other writers' reads (some naming datasets they may not see) and have them vouch
 they did not make; and one writer per output, which stops a group working on a shared output.
 Setting `live` and the grant recomputation below are build step 2's second part, not built.
 
-Governance recomputes the target's grants from the record as `WHITEPAPER.md` 4.3 specifies:
-its `inputs` are the candidates marked used. `external` rows are recorded and shown and take
-no part in the grant rule, since they have no entry. Until an output is declared it is
-governed as if every candidate were an input, so its effective read is the intersection over
-all of them; declaring can only widen.
+Who may then read the target follows section 6: a source marked unused is not carried by
+the files the declaration covers. `external` rows are recorded and shown and limit no one,
+since they have no grants. Until a person declares, their files carry every source they
+brought in, so declaring can only widen who may read.
 
 ### 5.4 Examples
 
@@ -278,6 +284,16 @@ SELECT source, source_type, used FROM governance.derivations
 WHERE target = 'lakehouse.db.joined';
 ```
 
+Cleaning (section 6.4; not built). `lakehouse.db.joined`'s files carry `lakehouse.db.weather`,
+and its rows from `weather` have been deleted, the files rewritten, and old versions removed.
+The rewrite read `joined`, which brought in `joined` and, through it, `weather`:
+
+```sql
+INSERT INTO governance.derivations VALUES
+  ('lakehouse.db.joined',  'table', 'lakehouse.db.joined', true),   -- read directly
+  ('lakehouse.db.weather', 'table', 'lakehouse.db.joined', false);  -- arrived through it; dropped
+```
+
 ### 5.5 How an INSERT becomes the call
 
 An Iceberg write from any client is three catalog steps. The gate sees all three for the
@@ -312,20 +328,91 @@ Nothing durable comes from the in-memory table. Postgres is the record; the Iceb
 a view of it that accepts writes. Other tables in the namespace accept the upload and refuse
 the commit, so the person's error names the table rather than a failed file write.
 
-## 6. Lifecycle of an output
+## 6. Sources travel with the data
+
+Agreed 2026-10-22; not built. A *source* of some data is a dataset whose own `read` grant
+limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
+propagates a classification to everything derived from a dataset and Palantir Foundry's
+markings follow data along lineage. Three rules:
+
+1. **Reading brings sources in.** A read credential for dataset X brings in X and every source
+   carried by a file in X's folder at that moment. The access log keeps that set with the
+   read, so cleaning X later does not change what an earlier read of it brought in.
+2. **A file carries what its writers brought in.** A stored file belongs to everyone who held
+   a write credential for its folder when it was last modified (6.2). It carries every source
+   they brought in before that time, through their session's reads and their login's reads
+   while the credential was valid (4.2), minus the sources a declaration of theirs covering
+   the file marked unused (6.3).
+3. **Who may read a dataset** is its own `read` grant, cut down by the own `read` grant of
+   every source carried by any file in its folder. `share` follows the same rule, as
+   `WHITEPAPER.md` 4.3 has both inherit.
+
+This replaces `WHITEPAPER.md` 4.3's per-dataset `inputs`. A file's sources already include
+everything upstream of it, so rule 3 needs no chain of inputs-of-inputs: it looks up each
+source's own grant at decision time, and a grant change takes effect at the next decision
+with nothing to recompute.
+
+### 6.1 What follows
+
+- **A write to a live dataset** carries everything its writer brought in until they declare.
+  The dataset stays listed, and who may read it is cut down at once; a declaration marking a
+  source unused gives the access back.
+- **A copy** reads the original, so its files carry the original and every source the
+  original's files carry, each separately. Either the copy or the original can be cleaned
+  later.
+- **A rewrite of a table**, a delete or a compaction, reads the table, so the new files carry
+  the same sources. Compaction cannot quietly drop one.
+- **A dataset written from itself** carries itself as a source, which changes nothing: its own
+  grant applies anyway.
+
+### 6.2 Which files a write produced
+
+Governance lists the dataset's folder. Each object has a last-modified time, which governance
+matches to the write credentials valid for that folder at that time, with a tolerance for
+clock skew: the broker's write credentials for a file dataset, and for a table the credential
+Polaris hands someone in its `write`, which can write (the gate logs those as writes too). A
+file matching several credentials carries all of their sources. An object no write
+credential matches, such as data seeded by an administrator, carries none.
+
+Storage decides. Governance stops counting a source for a dataset only after a listing shows
+no file carrying it; Ceph's notifications tell it when to list again.
+
+### 6.3 What a declaration covers
+
+A person's declaration of a target covers their files in it that no earlier declaration of
+theirs covered. It gives a `used` value to each dataset they read directly before those
+files, as `lineage` lists them, and may name a source that arrived through one of those reads
+to mark it unused. The files it covers do not carry a source it marks unused. Who may mark an
+arrived-through source unused is open (section 9).
+
+### 6.4 Cleaning a dataset
+
+To remove a source from a dataset:
+
+1. To keep the data as it is, copy it first: `CREATE TABLE … AS SELECT * FROM …`. The copy
+   carries the same sources (6.1), and the person chooses which of the two to clean.
+2. Delete the data that came from the source: `DELETE FROM … WHERE …`.
+3. Get the old files out of storage. Iceberg keeps deleted rows in their files, marking them
+   deleted, and keeps every earlier version (section 10, item 10), and a read credential
+   reaches every file in the folder. `ALTER TABLE … EXECUTE optimize` rewrites the files
+   without the deleted rows; `expire_snapshots` and `remove_orphan_files` remove old versions
+   and files nothing uses. A file dataset's objects are deleted or replaced directly.
+4. Declare the rewrite, marking the source unused (6.3; example in 5.4).
+
+A declaration that marks an arrived-through source unused is refused while files carrying it,
+other than the ones the declaration covers, remain in the folder; the refusal names step 3's
+statements. Once it is accepted, no file carries the source and rule 3 stops counting it.
+
+### 6.5 Lifecycle of an output
 
 - Registered `pending`, created as today: the gate admits a create for a registered pending
   table whose caller is in its `write`; a file dataset gets a write credential on `write`.
-- Written in one or more sessions. Each write is recorded with its session (4.2).
-- Declared, from any session, by an `INSERT` into `derivations` naming it, by each person
-  who wrote it. Candidates come from each declarer's writing sessions, never from the
-  declaring one.
-- `live` once everyone who wrote it has declared. Listed and readable per its recomputed
-  grants.
-- An output never declared stays `pending`: readable by its steward, listed for no one else.
-- A later write to a live output by a new session adds that session's reads to the
-  candidates; the next declaration must cover them. Whether a live output may be written
-  without a fresh declaration is open (section 9).
+- Written in one or more sessions, by one or more people.
+- Declared by each person who wrote it, from any session.
+- `live` once every writer's files are covered by a declaration of theirs: listed, and
+  readable under rule 3.
+- An output never declared stays `pending`: listed for no one, readable under rule 3.
+- Later writes keep it `live`; their files carry their sources until declared (6.1).
 
 ## 7. What this enforces, decides, declares
 
@@ -335,8 +422,8 @@ Extending `WHITEPAPER.md` section 11:
 platform: no credential without a record. An output is not `live` until declared. A
 declaration covers the list exactly.
 
-**Decided by OPA.** Nothing new. Registration, grants and vends are decided as before; the
-recomputed grants of a declared output follow the whitepaper's rule.
+**Decided by OPA.** Registration, grants and vends as before, with who may read a dataset
+given by section 6's rule 3.
 
 **Declared and trusted.** Which candidates were used. External inputs. The content of any
 dataset.
@@ -351,6 +438,11 @@ dataset.
 - **File writes are counted by credential.** A session that got a file write credential
   counts as writing its dataset until the credential expires, whether or not it wrote, and
   its reads up to that expiry are candidates (4.2). Extra candidates, never a missing one.
+- **A file belongs to every writer whose credential was valid when it was written** (6.2).
+  When several people could write a folder at once, each of their files carries all of
+  their sources.
+- **Rule 3 needs each file's time.** Governance lists a dataset's folder when a source might
+  stop counting; a large table is a long listing.
 - **A credential carried to another login is not followed.** The reads of the login it was
   issued to are paired with it; another login's are out-of-band carry-over.
 - **Lineage grows with a person's history.** Each load of `governance.lineage` computes it
@@ -367,20 +459,21 @@ dataset.
 ## 9. Open
 
 **Project folders.** Decided 2026-10-22: a project folder is scratch, not a dataset, and a file
-written into it is not a registered output. Open: whether reading scratch is an input, since
-data a session read can reach another session, or another project member, through a scratch
-file. Conclusions offered earlier, now in question: writing into it is not a share and reading
-it is not an input, since the project group is the trust boundary; a scratch object's provenance is
-its writing session's; publishing moves the objects into a new dataset's own folder, done by
-governance, so no dataset is ever nested in another. Nesting was analysed and rejected: a
-child's audience must stay a superset of its parent's forever, which the derivation rule can
-break by narrowing; parent write credentials reach the child's bytes; reading one's own project
-folder makes the project an input and caps the child's audience at the project's. Costs of
-the move: governance needs a credential that copies within `datasets/*` and deletes under
-scratch, and a publish of many objects can half-fail, which `pending` already expresses.
+written into it is not a registered output. Section 6 applies to scratch files like any
+other: a scratch file carries what its writer had read, and reading it brings that in, which
+closes the path from one session to another through scratch. Work in scratch becomes a
+dataset by being written into a registered dataset's own folder, and those files carry what
+the scratch files carried. No dataset sits inside another or inside a project folder:
+nesting was rejected because a parent's write credential reaches the child's files, and
+reading one's own project folder would make the whole project a source of the child.
 
-**Writes to a live output.** Whether a declared output may be written again without
-returning to `pending`, and if so how the new session's reads reach a future declaration.
+Open: whether a scratch folder's own read grant is cut down by what its files carry (rule 3).
+That keeps a project member from reading data derived from something they may not read, but
+locks them out of the shared folder; the alternative is a scratch folder per person.
+
+**Who may drop a source that arrived through a read** (6.3): anyone who wrote the data, as
+with any declaration, or only someone holding `share` on that source, as Foundry requires a
+permission to remove a marking.
 
 
 ## 10. Evidence and build order
@@ -438,6 +531,11 @@ attribution (4.2).
    payload did not. With boto3 on a credential from a load: a multipart upload read back
    whole, DeleteObjects removed the object, and puts over an existing file, under bob's
    prefix, and outside the governance tables were refused.
+10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
+    `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
+    (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
+    were kept (`$snapshots`: append, delete), and `FOR VERSION AS OF` the first one returned
+    the `secret` row. alice's read credential for `t1` listed every file in its folder.
 
 Gotchas recorded on the way: pyiceberg 0.10's `SetStatisticsUpdate` reads its `statistics`
 field as an object before validating it, so one parsed from JSON fails; governance builds that
@@ -451,9 +549,12 @@ Build order, each step usable on its own:
 1. Built. The access log and the session pointer in governance; the broker and the gate
    recording fail-closed; `governance.sessions` and `governance.lineage` served read-only.
 2. `governance.derivations`, in two parts. First, built: uploads to governance's endpoint,
-   commit parsing and validation, the signed record. Second: a target `live` once everyone
-   who wrote it has declared, and its grants recomputed by `WHITEPAPER.md` 4.3; waits on
-   "Writes to a live output" (section 9).
+   commit parsing and validation, the signed record. Second, section 6: the sources each read
+   brings in kept with it; writer table credentials logged as writes; files attributed by a
+   listing; who may read from rule 3 in governance's lookups for OPA; declarations covering
+   only undeclared files and naming arrived-through sources; `lineage`'s `direct` rows; a
+   target `live` once every writer has declared. Waits on who may drop an arrived-through
+   source (section 9).
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md` and the "inputs are trusted" statements in its sections 4.3,
