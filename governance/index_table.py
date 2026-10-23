@@ -1,8 +1,8 @@
 """
 index_table — the tables of the `governance` namespace, Iceberg tables whose files governance
 builds per person when they are asked for: `datasets` (every live dataset and table the
-person may see, decided by OPA), `sessions` (their sessions) and `accessed` (what their
-current session has read; PROVENANCE.md 5).
+person may see, decided by OPA), `sessions` (their sessions) and `lineage` (what each of their
+sessions read and wrote; PROVENANCE.md 5).
 
 The gate answers the catalog's load request for `<catalog>.governance.<table>` by calling
 governance's POST /index/load with the person's own token. Governance works out that person's
@@ -47,8 +47,9 @@ TABLES = {
                         ("can_read", BooleanType)),
     "sessions": _schema(("name", StringType), ("started", TimestamptzType),
                         ("last_used", TimestamptzType), ("current", BooleanType)),
-    "accessed": _schema(("dataset", StringType), ("kind", StringType), ("session", StringType),
-                        ("first_access", TimestamptzType), ("last_access", TimestamptzType)),
+    "lineage": _schema(("source", StringType), ("source_type", StringType),     # table | files
+                       ("target", StringType), ("target_type", StringType),
+                       ("session", StringType), ("event_time", TimestamptzType)),
 }
 MAX_TABLES = 256          # built tables kept, least recently loaded evicted first
 CREDENTIAL_TTL = 900      # seconds a storage credential from /index/load stays valid

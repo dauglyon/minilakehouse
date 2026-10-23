@@ -199,7 +199,8 @@ CREATE TABLE IF NOT EXISTS accesses (
     at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires TIMESTAMPTZ                      -- the credential's expiry; none for a table commit
 );
-CREATE INDEX IF NOT EXISTS accesses_session ON accesses (session, mode, dataset);
+DROP INDEX IF EXISTS accesses_session;
+CREATE INDEX IF NOT EXISTS accesses_person ON accesses (person, mode, at);
 """
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -986,15 +987,44 @@ def _session_rows(subject, sid):
                  "current": r["id"] == current} for r in cur.fetchall()]
 
 
-def _accessed_rows(subject, sid):
-    """One row per dataset read in this login's current session: what an output made in it
-    may derive from."""
+# The person's lineage (PROVENANCE.md 5.2), in the shape of Unity Catalog's
+# system.access.table_lineage: a read is a row with no target; a write is a row for each read
+# it may have used, or one row with no source when there is none. A write may have used the
+# reads of its session before it and, for a file write credential, the reads its login made
+# while the credential was valid, which covers a credential carried across a session switch.
+# A table write happens at its commit; a file write credential counts as a write until it
+# expires, since governance never sees the file writes themselves. A dataset is never paired
+# with itself. Repeated events of one shape are one row, at the latest event's time.
+_LINEAGE_SQL = """
+WITH a AS (
+    SELECT id, session, sid, dataset, kind, mode, at,
+           CASE WHEN kind = 'files' THEN COALESCE(expires, 'infinity') ELSE at END AS until
+    FROM accesses WHERE person = %(p)s
+), pairs AS (
+    SELECT w.id AS write_id, w.session, r.dataset AS source, r.kind AS source_type,
+           w.dataset AS target, w.kind AS target_type, w.at AS event_time
+    FROM a w JOIN a r ON r.mode = 'read' AND r.at < w.until AND r.dataset <> w.dataset
+         AND (r.session = w.session OR (w.kind = 'files' AND r.sid = w.sid AND r.at >= w.at))
+    WHERE w.mode = 'write'
+), events AS (
+    SELECT session, source, source_type, target, target_type, event_time FROM pairs
+    UNION ALL
+    SELECT session, NULL, NULL, dataset, kind, at FROM a w
+    WHERE mode = 'write' AND NOT EXISTS (SELECT 1 FROM pairs p WHERE p.write_id = w.id)
+    UNION ALL
+    SELECT session, dataset, kind, NULL, NULL, at FROM a WHERE mode = 'read'
+)
+SELECT e.source, e.source_type, e.target, e.target_type, s.name AS session,
+       max(e.event_time) AS event_time
+FROM events e JOIN sessions s ON s.id = e.session
+GROUP BY e.source, e.source_type, e.target, e.target_type, s.name
+ORDER BY s.name, e.target NULLS FIRST, e.source NULLS FIRST
+"""
+
+
+def _lineage_rows(subject):
     with db() as cur:
-        current = _pointer(cur, subject, sid)
-        cur.execute("SELECT a.dataset, a.kind, s.name AS session, min(a.at) AS first_access, "
-                    "max(a.at) AS last_access FROM accesses a JOIN sessions s ON s.id = a.session "
-                    "WHERE a.session = %s AND a.mode = 'read' "
-                    "GROUP BY a.dataset, a.kind, s.name ORDER BY a.dataset", (current,))
+        cur.execute(_LINEAGE_SQL, {"p": subject})
         return cur.fetchall()
 
 
@@ -1013,8 +1043,8 @@ def index_load():
         rows = _index_rows(subject)
     elif name == "sessions":
         rows = _session_rows(subject, sid)
-    elif name == "accessed":
-        rows = _accessed_rows(subject, sid)
+    elif name == "lineage":
+        rows = _lineage_rows(subject)
     else:
         return jsonify({"error": "no such table"}), 404
     table = index_table.build(subject, name, rows)

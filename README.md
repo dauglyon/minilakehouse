@@ -380,20 +380,26 @@ access starts a session named `default`, and a new login continues the most rece
 session. Naming and switching sessions, and declaring what an output was derived from, are
 not built yet.
 
-After alice's reads in Flow B and Flow C:
+`governance.lineage` has the shape of Unity Catalog's `system.access.table_lineage`: a read
+is a row with an empty target, and a write is a row for each read of its session before it.
+A table write happens at its commit; a file write credential counts as a write until it
+expires. After Flow B and Flow C:
 
 ```bash
 q alice --execute "SELECT * FROM iceberg.governance.sessions"
 #  -> "default","2026-10-22 23:21:58.824845 UTC","2026-10-22 23:21:59.143470 UTC","true"
-q alice --execute "SELECT dataset, kind, session FROM iceberg.governance.accessed"
-#  -> "lakehouse.db.t1","table","default"
-#     "projx/public","files","default"
-q bob --execute "SELECT count(*) FROM iceberg.governance.accessed"
+q alice --execute "SELECT source, target, session FROM iceberg.governance.lineage"
+#  -> "lakehouse.db.t1","","default"
+#     "projx/public","","default"
+#     "lakehouse.db.t1","lakehouse.db.t2","default"
+q bob --execute "SELECT count(*) FROM iceberg.governance.lineage"
 #  -> "0"     bob's refused read handed him no credential, so nothing is logged
 ```
 
-`accessed` holds the current session's reads. A table someone writes to is also read: loading
-it to append hands out a credential that can read it.
+`t2` is paired with `t1` although `CREATE TABLE t2 AS SELECT 2 AS y` read nothing: the session
+had read `t1` before it. Rows are per session, so an output's candidates (`WHERE target =
+'<id>'`) are everything its session read before writing it; declaring which were used, the
+next build step, narrows that.
 
 ## Security model
 

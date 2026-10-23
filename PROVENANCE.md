@@ -29,8 +29,9 @@ lie rather than a gap.
 |---|---|---|
 | in-toto link metadata | A step has materials and products, signed by whoever ran it. The record here has the same shape. | in-toto trusts the signer to list materials. Here the server lists them. |
 | Trusted research environments (OpenSAFELY and similar airlocks) | Nothing leaves until the researcher accounts for what an output derives from; the check happens at the exit, where the researcher's attention is. | Those environments also prevent the researcher from holding the data at all. This design does not; see section 8. |
-| W3C PROV | `used`, `wasGeneratedBy`, `wasDerivedFrom` are the record's vocabulary. The table names in section 5 follow it. | A vocabulary, not a mechanism. |
-| SLSA provenance, OpenLineage, Unity Catalog lineage | Inputs recorded per output. | Emitted by a trusted builder or engine. Rejected by the whitepaper and here. |
+| W3C PROV | The record's terms: a declared derivation (`wasDerivedFrom`) and whether a source was `used`. | A vocabulary, not a mechanism. |
+| Unity Catalog's `system.access.table_lineage` | The shape of `governance.lineage` (5.2): a row per source and target, an empty target for a read that wrote nothing, an empty source for a write that read nothing. | Unity's rows come from the engine, one statement at a time. These come from credentials and commits, one session at a time, so a target is paired with everything its session read before writing it, which the declaration narrows. |
+| SLSA provenance, OpenLineage | Inputs recorded per output. | Emitted by a trusted builder or engine. Rejected by the whitepaper and here. |
 | Database triggers | A write to a table runs server logic. Section 5 moves this to the catalog so it works from any Iceberg client. | |
 
 ## 3. Sessions
@@ -64,7 +65,7 @@ boundary is out-of-band carry-over, section 8, the same as a download.
 
 ## 4. Capture
 
-### 4.1 The vend log
+### 4.1 The access log
 
 Governance holds one row per credential issued and per table write (`accesses` in
 `governance/app.py`): person, Keycloak subject, `sid`, session, dataset id, kind, `read` or
@@ -90,47 +91,42 @@ rejected: a rule may evaluate more than once per decision.
 Each read decision already calls governance (`WHITEPAPER.md` section 8), so this adds one
 more call on a path that is already coupled to governance's availability.
 
-### 4.2 Which session wrote an object
+### 4.2 Which session wrote an output
 
-An output's candidates come from the sessions that wrote it, so every write must be
-attributed to a session.
+An output's candidates are the reads of the sessions that wrote it, so every write must be
+attributed to a session, and to a time that bounds which of its reads it may have used.
 
 **Tables.** Exact. Every create and commit passes through the gate with the person's token,
-and the gate records it with the token's `sid`.
+and the gate logs it with the token's `sid` before forwarding it. The write happens at the
+commit.
 
-**Files.** A file write credential covers a folder, and governance never sees the bytes. It
-learns that an object exists from the bucket notification, which carries the key, the time
-to the microsecond, and a user identity. Two findings from the stack decide how that
-identity is used (section 10):
+**Files.** Governance never sees a file write: the person puts objects straight into Ceph
+with a credential from the broker. It does see the credential, which the broker logs with its
+session, dataset and expiry (4.1). Any write made with it falls between its issue and its
+expiry, so a file write credential counts as a write by its session that lasts until the
+credential expires. The cost is extra candidates, never a missing one: a credential never
+used to write still makes its session a writer, and reads made after the last real write
+but before expiry are candidates. With 15-minute credentials the second is at most 15
+minutes of reads.
 
-- With the broker's current `AssumeRole`, the event names the broker. Ceph sets the event's
-  user to the request owner, and for an assumed-role session the owner is the user that
-  called `AssumeRole`. The role session name is kept only for policy conditions. This is
-  Ceph's design, not configuration, and AWS differs.
-- With `AssumeRoleWithWebIdentity`, the event names the person: `$oidc$<subject>`, the
-  Keycloak subject. This holds only when the vending role and the registered OIDC provider
-  belong to no RGW account; under an account the event names the account instead. RGW looks
-  the provider up under the role's account, so an account-less role needs a provider created
-  by an account-less user.
+A credential outlives a session switch: issued in session A, it still writes after the login
+points at B. So a file write credential may also have used every read its own login made
+while the credential was valid, whatever session that read was stamped with. Reads by
+another login of the same person are not included; a credential carried to another login is
+out-of-band carry-over (section 8), as a download is. Including every read by the person
+would cover that too, but it would pair each agent's writes with every other agent's reads
+when an orchestrator runs many agents as one person in separate sessions.
 
-So the broker vends write credentials with `AssumeRoleWithWebIdentity`, passing a token for
-the person, and governance attributes an object by joining the event's subject and time
-against that person's write vends whose folder covers the key and whose issued-to-expires
-window contains the event time, with a few seconds' tolerance for clock skew. One session
-almost always. When two of a person's sessions held write credentials on the same folder at
-that moment, both are attributed, which is a superset and still sound.
-
-**The trust condition must name something only the broker can present.** RGW's STS endpoint
-is the S3 endpoint, reachable by every client. If `blob-writer` trusted any token with the
-broker's audience, a person could assume it directly with their own session policy, which
-narrows only from the role's folder-wide rights, and write anywhere under `datasets/` with no
-OPA decision. The broker therefore exchanges the person's token at Keycloak for one with an
-audience only the broker's client may request, and the role's trust condition names that
-audience. The subject is unchanged by the exchange, so the event still names the person.
-Unverified: that Keycloak's standard token exchange, already enabled for the `trino` client
-(`WHITEPAPER.md` section 6), can be restricted to the broker's client for that audience.
-
-Read vends need no attribution and can stay on `AssumeRole`.
+Rejected: attributing each object from its storage event. Ceph notifies governance of every
+object written, with the time to the microsecond, and governance could match the event to the
+person's write credentials whose validity covers that time. The session comes from the
+matched credential, so the event adds only the exact time of the write, which is never later
+than the credential's expiry: it could only remove candidates, never add one. Getting the person into the event at all would
+need the broker to vend write credentials with `AssumeRoleWithWebIdentity` (with `AssumeRole`
+the event names the broker), a role and an OIDC provider that belong to no RGW account, and a
+trust condition naming a token audience only the broker could obtain, since RGW's STS endpoint
+is open to every client (section 10, items 1 and 2). The match can be added later for
+precision without changing any table.
 
 ## 5. The tables
 
@@ -139,7 +135,9 @@ itself (`gate/app.py`, `index_answer`; `governance/index_table.py`). A load retu
 governance builds in memory for the person, with a credential for governance's own S3-style
 endpoint, which serves the files. Nothing is written to storage. Every client that speaks
 the Iceberg REST catalog, Trino, Spark, pyiceberg, sees the same tables, so the catalog is
-the whole interface and there is no governance API for the person.
+the whole interface and there is no governance API for the person. A table's rows cannot
+depend on a query's `WHERE`: no filter reaches the catalog (section 10, item 6), so each
+table holds all of the person's rows and a filter is an ordinary one.
 
 ### 5.1 `governance.sessions`
 
@@ -151,60 +149,64 @@ the whole interface and there is no governance API for the person.
 
 `SELECT` lists the person's sessions. `INSERT` of a name is the lever of section 3.
 
-### 5.2 `governance.accessed`
+### 5.2 `governance.lineage`
 
-Read only. One row per dataset per session.
+Read only. The shape of Unity Catalog's `system.access.table_lineage`, computed from the
+person's access log at each load.
 
 | column | meaning |
 |---|---|
-| `dataset` | the governed id, `lakehouse.db.t1` or `projx/public` |
-| `kind` | `table` or `files` |
-| `session` | the session the credential was stamped with |
-| `first_access`, `last_access` | when credentials were issued |
+| `source`, `source_type` | a dataset read; `table` or `files` |
+| `target`, `target_type` | a dataset written after that read; `table` or `files` |
+| `session` | the session the read, or the write, was stamped with |
+| `event_time` | when the latest event of the row happened |
 
-The rows of the current session's reads. A table the session appended to is among them,
-since loading a table to write it hands out a credential that can read it.
+Two rules make the rows:
 
-The candidates for an output are the rows of every session that wrote it, each cut at that
-session's last write to it. That is how a later session declares something built earlier,
-and how an output touched in two sessions gets both. An output is not its own candidate; a
-sibling output of the same session is. Serving them as `WHERE output = <id>` on this table
-cannot work: no filter reaches the catalog (section 10, item 6), so a table's rows cannot
-depend on the query's `WHERE`. How the candidates are served is open (section 9).
+- Every read is a row with an empty target, in the read's session.
+- Every write is a row for each read it may have used (4.2), in the write's session, or one
+  row with an empty source when there is none. A dataset is never paired with itself, so a
+  table read in order to append to it is not its own candidate.
+
+Repeated events of one shape are one row. The person sees only their own sessions' rows.
+
+An output's candidates are the sources of the rows whose target is the output, across every
+session that wrote it: `WHERE target = '<id>'`. That is how a later session declares
+something built earlier, and how an output written in two sessions gets the reads of both. A
+session's reads are `WHERE session = '<name>' AND target IS NULL`.
 
 ### 5.3 `governance.derivations`
 
-Insert only. One row per output per candidate.
+Insert only, with `lineage`'s column names, so a declaration copies candidates column for
+column.
 
 | column | meaning |
 |---|---|
-| `output` | id of a pending dataset the caller may write |
-| `dataset` | a candidate's id, `*` for every candidate, or a hash for an external input |
-| `kind` | `session` or `external`; optional, see below |
+| `source` | a candidate's id, or a hash of an input from outside the platform |
+| `source_type` | `table`, `files`, or `external`; may be left out for a candidate |
+| `target` | id of a pending dataset the caller may write |
 | `used` | boolean |
 
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
-whole: for every output it names, the `session` rows must cover that output's candidates
-exactly once, each marked used or unused; every `external` row carries a hash; the output is
-`pending` and a caller group is in its `write`. On success governance stores the rows, signs
-the record, and sets the output `live`. Otherwise the commit is refused with an Iceberg error
-and nothing is stored; the person sees the reason as the statement's error.
+whole: for every target it names, the rows must give each of that target's candidates a
+`used` value; every `external` row's source is a hash; the target is `pending` and a caller
+group is in its `write`. A source named twice with the same `used` counts once; named with
+both values, the commit is refused. A source that is not a candidate is refused unless its
+`source_type` is `external`, so a mistyped id is never recorded as an outside input. A row
+with an empty source, which a target with no candidates has in `lineage`, names no input. On
+success governance stores the rows, signs the record, and sets the target `live`. Otherwise
+the commit is refused with an Iceberg error and nothing is stored; the person sees the reason
+as the statement's error.
 
-`kind` left out means `session` for an id among the candidates and an error for anything
-else, so a mistyped id is refused rather than recorded as an external input. A `*` row is
-expanded to every candidate not named by another row, and the expansion is what is stored,
-so the record is always explicit.
-
-Governance recomputes the output's grants from the record as `WHITEPAPER.md` 4.3 specifies:
-its `inputs` are the `session` rows marked used. `external` rows are recorded and shown and
-take no part in the grant rule, since they have no entry. Until an output is declared it is
+Governance recomputes the target's grants from the record as `WHITEPAPER.md` 4.3 specifies:
+its `inputs` are the candidates marked used. `external` rows are recorded and shown and take
+no part in the grant rule, since they have no entry. Until an output is declared it is
 governed as if every candidate were an input, so its effective read is the intersection over
 all of them; declaring can only widen.
 
 ### 5.4 Examples
 
-The examples that read candidates with `WHERE output =` wait on section 9's choice of how
-candidates are served. All examples assume the current session's `accessed` holds `lakehouse.db.t1` (table),
+All examples assume `lineage` pairs `lakehouse.db.joined` with `lakehouse.db.t1` (table),
 `projx/public` (files) and `lakehouse.db.weather` (table).
 
 Start or resume a session:
@@ -213,37 +215,37 @@ Start or resume a session:
 INSERT INTO governance.sessions (name) VALUES ('run7');
 ```
 
+The candidates:
+
+```sql
+SELECT source, source_type, session FROM governance.lineage
+WHERE target = 'lakehouse.db.joined';
+```
+
 Everything was used:
 
 ```sql
-INSERT INTO governance.derivations (output, dataset, used)
-VALUES ('lakehouse.db.joined', '*', true);
+INSERT INTO governance.derivations
+SELECT DISTINCT source, source_type, target, true
+FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 ```
 
-One dataset was not used, written from the list:
+One dataset was not used:
 
 ```sql
-INSERT INTO governance.derivations (output, dataset, used)
-SELECT 'lakehouse.db.joined', dataset, dataset <> 'lakehouse.db.weather'
-FROM governance.accessed;
+INSERT INTO governance.derivations
+SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
+FROM governance.lineage WHERE target = 'lakehouse.db.joined';
 ```
 
 The same, plus a file from a collaborator:
 
 ```sql
-INSERT INTO governance.derivations (output, dataset, kind, used) VALUES
-  ('lakehouse.db.joined', '*',                    'session',  true),
-  ('lakehouse.db.joined', 'lakehouse.db.weather', 'session',  false),
-  ('lakehouse.db.joined', 'sha256:9f3c…',         'external', true);
-```
-
-An output made in an earlier session, declared from this one:
-
-```sql
-SELECT dataset, kind, session FROM governance.accessed WHERE output = 'lakehouse.db.joined';
-INSERT INTO governance.derivations (output, dataset, used)
-SELECT 'lakehouse.db.joined', dataset, true
-FROM governance.accessed WHERE output = 'lakehouse.db.joined';
+INSERT INTO governance.derivations
+SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
+FROM governance.lineage WHERE target = 'lakehouse.db.joined'
+UNION ALL
+VALUES ('sha256:9f3c…', 'external', 'lakehouse.db.joined', true);
 ```
 
 Refused:
@@ -256,7 +258,8 @@ Query failed: Failed to commit: lakehouse.db.other: not a pending dataset in you
 Looking back:
 
 ```sql
-SELECT output, dataset, used FROM governance.derivations WHERE output = 'lakehouse.db.joined';
+SELECT source, source_type, used FROM governance.derivations
+WHERE target = 'lakehouse.db.joined';
 ```
 
 ### 5.5 How an INSERT becomes the call
@@ -267,9 +270,9 @@ An Iceberg write from any client is three catalog steps. The gate sees all three
 1. Load the table with a write credential. Governance builds the person's current table in
    memory, as `index_table.build` does for the index, and returns its metadata and a
    credential bound to the person's prefix on governance's endpoint.
-2. Put the data file, a manifest and a manifest list under the table's location. Trino's
-   security mapping routes that bucket to governance (`trino/etc/s3-security-mapping.json`),
-   whose S3 shim checks the signature and keeps the bytes in memory. The shim serves `GET`
+2. Put the data file, a manifest and a manifest list under the table's location. Docker DNS
+   sends that bucket's host name, `governance-index.storage.internal`, to governance, whose
+   S3 shim checks the signature and keeps the bytes in memory. The shim serves `GET`
    and `HEAD` today (`governance/app.py`, `index_object`) and must accept `PUT` and multipart
    uploads, since the engine decides how to write and a file grows with the list.
 3. Commit: a requirement that the branch still points at the loaded snapshot, an
@@ -322,8 +325,13 @@ dataset.
   the only cover, and omitting it is a false declaration by an identified person. Research
   environments that hold the data server-side close this; the platforms this design is
   meant for mostly will, not all.
-- **Attribution of file writes is to a person, not a session.** The session comes from the
-  time join. Two of a person's sessions writing one folder at once are both attributed.
+- **File writes are counted by credential.** A session that got a file write credential
+  counts as writing its dataset until the credential expires, whether or not it wrote, and
+  its reads up to that expiry are candidates (4.2). Extra candidates, never a missing one.
+- **A credential carried to another login is not followed.** The reads of the login it was
+  issued to are paired with it; another login's are out-of-band carry-over.
+- **Lineage grows with a person's history.** Each load of `governance.lineage` computes it
+  from every event the person has logged.
 - **A silent re-login after a timeout continues the last session.** Right when the
   environment is the same, wrong when a person starts unrelated work without inserting a
   session name. The cost is a longer list, never a shorter one.
@@ -355,21 +363,16 @@ login that outlives Keycloak's session maximum forces a re-login mid-work, which
 pointer absorbs. Setting the maximum to an environment's intended lifetime removes the
 interruption. Whether offline sessions keep a stable `sid` is unverified.
 
-**How candidates are served.** Section 5.2's `WHERE output = <id>` cannot reach governance.
-Options: a separate table with one row per candidate of every output the person may declare,
-`output` a column, filtered by an ordinary `WHERE`, the way Unity Catalog's
-`system.access.table_lineage` and Snowflake's `ACCESS_HISTORY` serve lineage; or an `output`
-column on `accessed`, empty on the current session's rows, so an unfiltered read needs
-`WHERE output IS NULL`. Either way, the declaration examples in 5.4 read the candidates, not
-`accessed`, since a session that appended to its output has read it.
-
-**The broker's exchange audience.** Section 4.2's trust condition depends on Keycloak
-restricting one audience to the broker's client.
+**Outputs written by more than one person.** `lineage` shows a person only their own
+sessions' rows, but an output in two people's `write` can be written by both, and its
+candidates include both people's reads. A declarer cannot see the other writer's candidates,
+and some may name datasets the declarer may not see at all. To decide before step 2.
 
 ## 10. Evidence and build order
 
-Run on the stack on 2026-10-22, with a throwaway notification topic pointed at a sink
-container, all artefacts removed afterwards:
+Run on the stack on 2026-10-22. Items 1 and 2 used a throwaway notification topic pointed at
+a sink container, all artefacts removed afterwards; they bear on the rejected event
+attribution (4.2).
 
 1. An object put with a credential from `AssumeRole` on `blob-writer`, session name
    `probe-session-42`: the event's `userIdentity.principalId` was `blob-broker`. Confirmed in
@@ -394,14 +397,19 @@ container, all artefacts removed afterwards:
    operations, which plans on the client. Read from the bytecode of the jars in the running
    Trino image.
 7. Build step 1, run on the stack. As alice: a Trino read of `db.t1` and a broker read
-   credential for `projx/public` appear in `governance.accessed`, both in session `default`,
-   and `governance.sessions` shows `default` as current, though each command used a new
-   login. A CTAS into a registered pending table logged two writes: Polaris hands out a
+   credential for `projx/public` were logged in session `default`, and `governance.sessions`
+   showed `default` as current, though each command used a new login. A CTAS into a registered pending table logged two writes: Polaris hands out a
    credential on Trino's staged create, and the completing commit is the second. bob's refused read logged nothing. With the
    log's address made unreachable, a gate given a credentialed load answered 503, a gate
    given a commit answered 503 and Polaris logged no request for the table, a load without a
    credential still answered 200, and the broker answered 503. On the internal listener, the
    `opa` certificate is refused on the log, and `broker` is refused everywhere else.
+8. `governance.lineage`, run on the stack. A CTAS of `db.p3` from `db.t1` gave rows for the
+   reads of `t1` and `p3` with no target and one row pairing `t1` with `p3`. Then, on one
+   login, a write credential for `projz` in `default`; the login pointed at a new session
+   `run2`; a read credential for `projx/public` there. `lineage` showed the read in `run2`
+   with no target, and `projx/public` paired with `projz` in `default`, with the earlier
+   reads of `default`.
 
 Gotchas recorded on the way: RGW merges a put of the bucket notification configuration into
 the existing one rather than replacing it, so removing an entry needs
@@ -410,14 +418,11 @@ the existing one rather than replacing it, so removing an entry needs
 
 Build order, each step usable on its own:
 
-1. Built. The vend log and the session pointer in governance; the broker and the gate
-   recording fail-closed; `governance.sessions` and `governance.accessed` served read-only.
-2. Write attribution: the OIDC provider registered in `ceph/sts-bootstrap.sh` by an
-   account-less setup user; the broker's exchanged audience; `blob-writer` trusting it; the
-   broker's write vend on `AssumeRoleWithWebIdentity`; the event join in governance.
-3. `governance.derivations`: the S3 shim's `PUT` and multipart; commit parsing and
+1. Built. The access log and the session pointer in governance; the broker and the gate
+   recording fail-closed; `governance.sessions` and `governance.lineage` served read-only.
+2. `governance.derivations`: the S3 shim's `PUT` and multipart; commit parsing and
    validation; the recomputed grants; `pending` to `live` on declaration.
-4. The `sessions` lever as an insert.
+3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md` and the "inputs are trusted" statements in its sections 4.3,
-10 and 11 change when step 3 lands.
+10 and 11 change when step 2 lands.

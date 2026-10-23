@@ -20,7 +20,7 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    governance, which marks the entry live or gone. Registering and renaming tables are refused
    (root-only in Polaris too).
 6. The governance namespace. The gate answers for one namespace itself, `governance`, holding
-   read-only tables: `datasets` (the dataset index), `sessions` and `accessed`. A load of one
+   read-only tables: `datasets` (the dataset index), `sessions` and `lineage`. A load of one
    returns governance's per-person table (governance/index_table.py), whose files governance
    serves. Polaris holds neither.
 7. The access log (PROVENANCE.md 4.1). Before it passes on any response that hands out a
@@ -60,7 +60,7 @@ RESERVED = {"root", "provisioner"}  # Polaris's own principals
 DELEGATION = "x-iceberg-access-delegation"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
-INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "accessed")
+INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "lineage")
 # Hop-by-hop headers, and ones requests recomputes after decoding the body.
 DROP = {"host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authorization", "proxy-authenticate", "content-length", "content-encoding"}
