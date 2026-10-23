@@ -262,3 +262,104 @@ declaring sources sits beside it, prefilled from the lineage candidates.
 - Unregistered data is readable only through root/namespace grants, never wider.
 - `pending` is removed; `registered` is a flag on a live entry.
 - No new vocabulary: register, declare, publisher, entry, as in `WHITEPAPER.md` and `PROVENANCE.md`.
+
+---
+
+# Section 4 — engine-drafted declarations
+
+Vocabulary as above: a **declaration** is the publisher's signed insert into
+`governance.derivations` (`PROVENANCE.md` 5.3). A **draft** is new: an engine's proposal for
+one, which the publisher confirms. A draft is never a declaration.
+
+## Why
+
+Declaring today means reading `governance.lineage` for a target and giving every candidate a
+`used` value (`PROVENANCE.md` 5.4). Candidates are every read of the session (4.2), so a
+person who explored for a morning and then ran one `CREATE TABLE … AS SELECT` declares a
+dozen sources by hand. The engine knows which tables that one statement read: Trino reports
+inputs and output per query through its event listener, Spark through OpenLineage. Use that
+to draft the declaration.
+
+The trust model does not move. `PROVENANCE.md` 2 rejects engine-emitted provenance as truth
+because the engine is not trusted, and that stands: a draft changes nothing about who may read
+until the publisher inserts it, and that insert passes every existing check (OPA on each
+source marked unused, the `detach` rules, the candidate check). The engine saves the
+publisher the lookup; the publisher still signs.
+
+## Model
+
+- A draft is per target and per statement, written by the engine's service account. For each
+  candidate of the target it says one of three things:
+  - `used`: the engine read it in the writing statement;
+  - `unused`: the engine read it in that session, but not in the writing statement;
+  - nothing: the engine never saw it. A broker read, a read in another engine, or data
+    carried out of band (`PROVENANCE.md` 8). Left blank for the publisher.
+- An engine may speak only about reads it made. A draft naming a source the access log does
+  not show that engine reading for that person is refused.
+- Over-attribution is the safe direction. Where a statement cannot be tied exactly to log
+  rows (concurrent statements by one person), the draft marks more `used`, never more
+  `unused`. Extra `used` costs the publisher an edit; a wrong `unused` they confirm without
+  looking is a false declaration they signed.
+- Confirming is one statement, the same insert as today with the draft as its source:
+
+      INSERT INTO governance.derivations (source, source_type, target, used)
+      SELECT source, source_type, target, used FROM governance.drafts
+      WHERE target = 'lakehouse.db.joined';
+
+  A blank candidate left out is refused as now (`not declared: projx/public`), which is the
+  right prompt: the engine could not see it, so a person must say.
+
+## Changes
+
+### Trino
+- Enable Trino's HTTP event listener (`event-listener.name=http`,
+  `http-event-listener.connect-ingest-uri`, `log-completed=true`) pointed at governance.
+  `QueryCompletedEvent` carries the user (`principal_name`), query id, start and end time,
+  `ioMetadata.inputs` (catalog, schema, table per table read) and `ioMetadata.output` (the
+  table written). No Java to write. Verify: whether the listener can present a client
+  certificate to the internal listener (port 8443); if not, a header secret as `/events`
+  uses, since the listener supports custom headers.
+- Ignore inputs in the `governance` namespace.
+
+### Governance
+- Table `drafts (target, engine, statement_id, person, source, source_type, used, at)`.
+- `POST /internal/drafts`, from a certificate (or secret) named `trino`, confined to that
+  route. Per event: the person is the event's user; the target is the output table; the
+  statement's reads are its inputs. Validate against the access log: the person wrote the
+  target in `[start, end]` (the gate logged the commit); every input is a table the person
+  read, through the gate, in that session. Candidates per `lineage` that are table reads but
+  not inputs of this statement get `unused`; `files` candidates and sources that arrived
+  through a read (`direct` false) get no row. An event whose output is not a registered
+  entry the person wrote is dropped and logged.
+- `governance.drafts`, read-only, served like `lineage`: the person's own drafts, columns of
+  `derivations` plus `engine` and `statement_id`. Built from Postgres on each load as the
+  other governance tables are.
+- Spark: OpenLineage `RunEvent` has inputs and outputs in the same shape; a second parser on
+  the same route, later.
+
+### UI (section 3)
+- The declare panel prefills from `drafts` instead of raw candidates. Blank candidates are
+  the ones that need the person's attention; show them first.
+
+## Decided
+- A draft never changes who may read. Only the publisher's insert into `derivations` does.
+- An engine drafts only for reads it made; it never prefills a candidate it did not see.
+- Over-attribute, never under-attribute, when a statement and the log cannot be matched
+  exactly.
+- The engine does not sign declarations for its own reads. A deployment that wants that
+  grants the engine's service account `detach` on the sources in question and widens the
+  rule in `opa/derivations.rego`; it is a trust decision made in policy, not a code path.
+
+## Out of scope
+- Spark / OpenLineage parser (same endpoint; later).
+- Out-of-band carry: a person who reads `t1`, looks at the result, and types the numbers
+  into `INSERT VALUES`. The engine reports that statement as reading nothing, the draft marks
+  `t1` `unused`, and only the publisher can know better. Same limit as today
+  (`PROVENANCE.md` 8), now with a prefilled wrong answer in front of them: say so in the UI.
+
+## To verify
+- Trino's HTTP event listener: TLS client certificate support; that `ioMetadata.inputs` lists
+  base tables behind views and CTEs; that `ioMetadata.output` is set for `CREATE TABLE AS`
+  and `INSERT`.
+- Matching a statement to access-log rows by person and time window when the person runs
+  statements concurrently.
