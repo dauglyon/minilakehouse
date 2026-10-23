@@ -14,7 +14,10 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    without the credential request. A person who may view a table but not read it can then
    DESCRIBE it; reading it fails at storage. A load that hands out no credential keeps only
    the current version, with no counts in it, and the properties OPA's lakehouse.tables.load
-   keeps, unless that decision allows the whole metadata (current_only).
+   keeps, unless that decision allows the whole metadata (current_only). A view never comes
+   with a credential, so every view load or commit response is cut the same way unless the
+   decision allows it (current_view_only), and a view that would run with its owner's rights
+   is refused (runs_as_owner).
 5. Creation. Polaris's own check for creating a table, committing a staged create, or creating
    a namespace names only the parent, so the gate decides the name: a table or view must be
    registered in governance, still pending, with the person in its write grant; a namespace
@@ -62,6 +65,7 @@ KEYCLOAK_ISS = os.environ["KEYCLOAK_ISS"]
 AUDIENCE = os.environ["POLARIS_AUDIENCE"]
 RESERVED = {"root", "provisioner"}  # Polaris's own principals
 DELEGATION = "x-iceberg-access-delegation"
+OWNER_RIGHTS = "trino.run-as-owner"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
 INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "lineage", "derivations")
@@ -272,9 +276,51 @@ def current_only(r, keep):
         "sort-orders": [s for s in m.get("sort-orders") or []
                         if s.get("order-id") == m.get("default-sort-order-id")],
     }
+    return _cut(r, body)
+
+
+def current_view_only(r, keep):
+    """A view load or commit response cut to the current version: earlier versions and the
+    version log removed, schemas other than the current version's removed, the version's
+    summary cut to the engine's name and version, and the properties whose keys are not in
+    `keep` removed. The query text stays, since the querier's engine runs it. Rebuilt from the
+    fields named here, as current_only is, and without the ETag."""
+    body = r.json()
+    m = body["metadata"]
+    current = m.get("current-version-id")
+    versions = [{**{k: v[k] for k in ("version-id", "timestamp-ms", "schema-id", "default-catalog",
+                                      "default-namespace", "representations") if k in v},
+                 "summary": {k: x for k, x in (v.get("summary") or {}).items()
+                             if k in ("engine-name", "engine-version")}}
+                for v in m.get("versions") or [] if v.get("version-id") == current]
+    schema_ids = {v.get("schema-id") for v in versions}
+    body["metadata"] = {
+        **{k: m[k] for k in ("view-uuid", "format-version", "location", "current-version-id") if k in m},
+        "properties": {k: v for k, v in (m.get("properties") or {}).items() if k in keep},
+        "versions": versions,
+        "version-log": [e for e in m.get("version-log") or [] if e.get("version-id") == current][-1:],
+        "schemas": [s for s in m.get("schemas") or [] if s.get("schema-id") in schema_ids],
+    }
+    return _cut(r, body)
+
+
+def _cut(r, body):
     return Response(json.dumps(body), status=r.status_code, content_type="application/json",
                     headers=[(k, v) for k, v in r.headers.items()
                              if k.lower() not in DROP | {"etag", "content-type"}])
+
+
+def runs_as_owner(named, body):
+    """Whether a POST creates a view, or changes one, so that it runs with its owner's rights.
+    Trino marks such a view with the property OWNER_RIGHTS. Its query would read the view's
+    tables as the owner without the owner's token, which the catalog cannot accept, so a view
+    runs with the rights of whoever queries it."""
+    if named and named[0] == "views":
+        return OWNER_RIGHTS in (body.get("properties") or {})
+    if named and named[0] == "view":
+        return any(u.get("action") == "set-properties" and OWNER_RIGHTS in (u.get("updates") or {})
+                   for u in body.get("updates") or [])
+    return False
 
 
 def log_access(claims, entries):
@@ -427,6 +473,9 @@ def proxy(_):
             return listing(raw, headers, *named[:3], subject)
 
         body = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
+        if request.method == "POST" and runs_as_owner(named, body):
+            return forbidden("a view runs with the rights of whoever queries it here: "
+                             "create it with SECURITY INVOKER")
         new_tables, new_namespaces = creates(segments, body) if request.method == "POST" else ([], [])
         for n in new_namespaces:
             if n is not None and n.split(".")[1:2] == [INDEX_NS]:
@@ -471,13 +520,17 @@ def proxy(_):
         issued, expires = vended(r)
         credentialed = issued or (request.method == "GET" and r.status_code == 304 and delegated)
         table = ident([named[1], *named[2], named[3]]) if named and named[0] == "table" else None
-        loaded = (r.json() if table and request.method == "GET" and r.status_code == 200
-                  and not issued and r.content else {})
-        # The gate's one decision on a table request (opa/tables.rego load), asked once Polaris
-        # has answered: only then are the credential and the table's properties known.
-        load = (opa("load", {"subject": subject, "id": table, "credential": credentialed,
+        view = ident([named[1], *named[2], named[3]]) if named and named[0] == "view" else None
+        # A view's load and commit responses both carry its versions; neither hands out a
+        # credential.
+        loaded = (r.json() if r.status_code == 200 and r.content
+                  and ((table and request.method == "GET" and not issued)
+                       or (view and request.method in ("GET", "POST"))) else {})
+        # The gate's one decision on a table or view request (opa/tables.rego load), asked once
+        # Polaris has answered: only then are the credential and the properties known.
+        load = (opa("load", {"subject": subject, "id": table or view, "credential": credentialed,
                              "properties": (loaded.get("metadata") or {}).get("properties") or {}})
-                or {}) if table and (credentialed or "metadata" in loaded) else {}
+                or {}) if (table or view) and (credentialed or "metadata" in loaded) else {}
         if credentialed:
             if table:
                 held, mode = table, "read"
@@ -492,7 +545,8 @@ def proxy(_):
                 log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
                                      "expires": expires, "can_write": can_write}])
         if "metadata" in loaded and load.get("history") is not True:
-            return current_only(r, set(load.get("properties") or []))
+            keep = set(load.get("properties") or [])
+            return current_only(r, keep) if table else current_view_only(r, keep)
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.

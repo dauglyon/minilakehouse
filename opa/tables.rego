@@ -16,7 +16,8 @@ package lakehouse.tables
 #                                          from (PROVENANCE.md 5.3)
 #   load             input {subject, id, credential, properties: {key: value}}
 #                    gate, once per table request that hands out a credential or loads the
-#                    metadata without one: {write, history, properties: [key]}
+#                    metadata without one, and per view load or commit:
+#                    {write, history, properties: [key]}
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
 #   allow_change     input {subject, id, grants: [grant]}
@@ -65,14 +66,16 @@ default allow_write := false
 
 allow_write if writable(governance.groups(input.subject), table(input.id))
 
-# The gate's one decision on a table request, asked once Polaris has answered:
+# The gate's one decision on a table or view request, asked once Polaris has answered:
 #   write       the credential handed out can write the table, so the access log counts its
 #               lifetime as a time the person could have written files (PROVENANCE.md 6.2)
 #   history     a load that hands out no credential, which is how a person with `describe`
 #               but not `read` loads a table, returns the whole metadata. Otherwise it carries
 #               the current version without its counts (gate/app.py current_only): the metadata
 #               also holds every version with its time, row and file counts and Trino's name for
-#               the writer, earlier schemas, and column statistics.
+#               the writer, earlier schemas, and column statistics. A view never comes with a
+#               credential, so for a view this decides whether anyone, its writers included,
+#               sees its earlier versions, each with its query text (current_view_only).
 #   properties  the property keys such a load keeps. Properties are whatever the table's writers
 #               set: engine settings and a `comment` mostly, and also labels such as an owner's
 #               name or a data-quality figure.

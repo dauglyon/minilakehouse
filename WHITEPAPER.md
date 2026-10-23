@@ -146,7 +146,12 @@ credential carries the table's columns, partitioning, properties and current ver
 removes earlier versions and schemas, column statistics, and the row and file counts and
 writer names in version summaries, all of which describe the contents. OPA's `load` rule
 decides whether a person gets the whole metadata and which properties such a load keeps; the
-shipped rules give the whole metadata to nobody and keep every property.
+shipped rules give the whole metadata to nobody and keep every property. A view's metadata is
+its query text, its columns, and its earlier versions; a view never comes with a credential, so
+the same cut leaves everyone the current version and its query text unless `load` allows the
+rest. A view runs with the rights of whoever queries it, and the gate refuses one that would
+run with its owner's rights: its tables would be read as the owner without the owner's token.
+`read` on a view therefore grants nothing beyond `describe`.
 
 ### 4.3 Derived datasets
 
