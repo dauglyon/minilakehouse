@@ -62,6 +62,13 @@ Record findings at the top of this file before changing code.
   owning it. `group-admins` keeps top-level assignment.
 - `opa/governance.rego`: fetch `/internal/groups/<subject>` with roles, or add
   `/internal/admin-of/<subject>`.
+- Private-space exemption (`PROVENANCE.md` 9): in `opa/blob.rego` (`_reads`, `vend_write`)
+  and `opa/tables.rego` (`readable`, `writable`), an entry under the subject's own personal
+  root skips the sources check, unless one of the subject's groups is on the list a carried
+  source holds for taking copies back. That list is a new per-source set of groups beside the
+  six grants (name not settled), changed by the source's root owners as `share` and `detach`
+  are, recorded and shown to its `share` holders like detaches; governance's lookups return it
+  with each source's `read` and `share`.
 
 ### Governance API
 - `POST /groups`: body `{name}`. Caller becomes the first admin and member. Owners/members in
@@ -220,10 +227,20 @@ alone; registering what was written comes after.
 ## Changes
 
 ### Blobs
-- `opa/blob.rego`: drop `allow_register`. `vend_write` takes `{subject, prefix}` and allows for
-  an admin of a group owning a root above `prefix` (not only registered datasets). The
-  credential is scoped to that prefix as today.
+- `opa/blob.rego`: drop `allow_register`. `vend_write` takes `{subject, prefix}`, where
+  `prefix` is one folder: exactly one level below a root (a new dataset), or inside an
+  existing dataset's folder (that dataset). It allows an admin of a group owning a root above
+  the folder, or the dataset's `write` grant, cut by its sources as now. A key directly under
+  a root is never writable: a dataset is a folder (`WHITEPAPER.md` 10).
 - `broker/app.py`: `POST /vend` with `mode: write` takes `prefix` instead of `dataset`.
+  Governance derives the folder's dataset id as registration does (`derive_id`), and the
+  broker logs the credential against that id before returning it, as now; the entry the
+  first event creates has the same id. A credential is never for a whole root: a folder's
+  files are matched to the write credentials logged against that dataset (`_CARRIED_SQL`),
+  by time, so a root-wide credential would either carry nothing (logged against no dataset)
+  or, matched by prefix, make every folder under the root carry its holder's reads while it
+  was valid. S3 Access Grants' `privilege=Minimal`, a credential no wider than the requested
+  target inside a wider grant, is the same shape.
 - `governance/app.py` `/events`: a key under an owned root with no entry creates one. Its id
   is derived as now; its folder is the key's first path segment below the root (deeper
   structure stays inside the dataset). Log `EVENT ... created unregistered <id>` instead of
@@ -350,7 +367,9 @@ publisher the lookup; the publisher still signs.
   entry the person wrote is dropped and logged.
 - `governance.drafts`, read-only, served like `lineage`: the person's own drafts, columns of
   `derivations` plus `engine` and `statement_id`. Built from Postgres on each load as the
-  other governance tables are.
+  other governance tables are. The gate answers the `governance` namespace itself and treats
+  any name not in `INDEX_TABLES` (`gate/app.py`) as not found, so add `drafts` there; define
+  its columns in `governance/index_table.py`. Inserts into it stay refused (`WRITABLE`).
 - Spark: OpenLineage `RunEvent` has inputs and outputs in the same shape; a second parser on
   the same route, later.
 
