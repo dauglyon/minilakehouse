@@ -288,12 +288,21 @@ publisher the lookup; the publisher still signs.
 
 ## Model
 
-- A draft is per target and per statement, written by the engine's service account. For each
-  candidate of the target it says one of three things:
+- A draft is per target and per statement, written by the engine's service account. The
+  engine knows more than what each statement read: it knows where every result went, into a
+  table or back to the client. For each candidate of the target the draft says one of three
+  things:
   - `used`: the engine read it in the writing statement;
-  - `unused`: the engine read it in that session, but not in the writing statement;
-  - nothing: the engine never saw it. A broker read, a read in another engine, or data
-    carried out of band (`PROVENANCE.md` 8). Left blank for the publisher.
+  - `unused`: the engine read it in that session, not in the writing statement, and every
+    read of it in the session wrote its rows into a table. The data never left the engine's
+    custody, and where it went is a table the log already tracks;
+  - nothing: the engine cannot vouch. It never saw the source (a broker read, another
+    engine), or it returned the source's rows to the client at some point in the session,
+    after which only the person knows whether they came back (`PROVENANCE.md` 8). Left blank
+    for the publisher.
+- A writing statement whose data comes from the client (`INSERT … VALUES`, or any statement
+  with no table input) is a write of whatever the client holds: no candidate the client has
+  received is prefilled on it.
 - An engine may speak only about reads it made. A draft naming a source the access log does
   not show that engine reading for that person is refused.
 - Over-attribution is the safe direction. Where a statement cannot be tied exactly to log
@@ -315,8 +324,10 @@ publisher the lookup; the publisher still signs.
 - Enable Trino's HTTP event listener (`event-listener.name=http`,
   `http-event-listener.connect-ingest-uri`, `log-completed=true`) pointed at governance.
   `QueryCompletedEvent` carries the user (`principal_name`), query id, start and end time,
-  `ioMetadata.inputs` (catalog, schema, table per table read) and `ioMetadata.output` (the
-  table written). No Java to write. Verify: whether the listener can present a client
+  `queryType`, `ioMetadata.inputs` (catalog, schema, table per table read), `ioMetadata.output`
+  (the table written, when the statement wrote one) and the statistics' output row count, so
+  a statement that returned rows to the client is told apart from one that wrote a table.
+  No Java to write. Verify: whether the listener can present a client
   certificate to the internal listener (port 8443); if not, a header secret as `/events`
   uses, since the listener supports custom headers.
 - Ignore inputs in the `governance` namespace.
@@ -327,9 +338,11 @@ publisher the lookup; the publisher still signs.
   route. Per event: the person is the event's user; the target is the output table; the
   statement's reads are its inputs. Validate against the access log: the person wrote the
   target in `[start, end]` (the gate logged the commit); every input is a table the person
-  read, through the gate, in that session. Candidates per `lineage` that are table reads but
-  not inputs of this statement get `unused`; `files` candidates and sources that arrived
-  through a read (`direct` false) get no row. An event whose output is not a registered
+  read, through the gate, in that session. Governance keeps, per session and engine, which
+  table reads had rows returned to the client (from the same events). Candidates per
+  `lineage` that are table reads, not inputs of this statement, and never returned to the
+  client get `unused`; a candidate returned to the client, a `files` candidate, and a source
+  that arrived through a read (`direct` false) get no row. An event whose output is not a registered
   entry the person wrote is dropped and logged.
 - `governance.drafts`, read-only, served like `lineage`: the person's own drafts, columns of
   `derivations` plus `engine` and `statement_id`. Built from Postgres on each load as the
@@ -343,7 +356,8 @@ publisher the lookup; the publisher still signs.
 
 ## Decided
 - A draft never changes who may read. Only the publisher's insert into `derivations` does.
-- An engine drafts only for reads it made; it never prefills a candidate it did not see.
+- An engine drafts only for reads it made, and marks `unused` only what never left its
+  custody. A source whose rows it returned to the client is never prefilled.
 - Over-attribute, never under-attribute, when a statement and the log cannot be matched
   exactly.
 - The engine does not sign declarations for its own reads. A deployment that wants that
@@ -352,10 +366,10 @@ publisher the lookup; the publisher still signs.
 
 ## Out of scope
 - Spark / OpenLineage parser (same endpoint; later).
-- Out-of-band carry: a person who reads `t1`, looks at the result, and types the numbers
-  into `INSERT VALUES`. The engine reports that statement as reading nothing, the draft marks
-  `t1` `unused`, and only the publisher can know better. Same limit as today
-  (`PROVENANCE.md` 8), now with a prefilled wrong answer in front of them: say so in the UI.
+- Out-of-band carry through the client: a person who reads `t1`, looks at the result, and
+  types the numbers into `INSERT VALUES`. The engine saw `t1`'s rows go to the client, so
+  `t1` stays blank on the draft and the person must say. Same limit as today
+  (`PROVENANCE.md` 8); the draft never guesses `unused` for it.
 
 ## To verify
 - Trino's HTTP event listener: TLS client certificate support; that `ioMetadata.inputs` lists
