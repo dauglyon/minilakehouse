@@ -143,7 +143,7 @@ not is visible-not-readable: it appears in a listing with its name and descripti
 table's metadata can be loaded, and its contents cannot be read. Trino requests a credential
 with every table load, and Polaris refuses the whole load when neither credential check
 passes, so the gate repeats a refused load once without the credential request: a describe-only
-table can be described through Trino, and reading it fails at storage. A load that hands out no
+table can be described through Trino, and reading it fails because Trino gets no credential for its files. A load that hands out no
 credential carries the table's columns, partitioning, properties and current version; the gate
 removes earlier versions and schemas, column statistics, and the row and file counts and
 writer names in version summaries, all of which describe the contents. OPA's `load` rule

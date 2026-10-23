@@ -12,7 +12,7 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
 4. Trino asks for a storage credential on every table load, and Polaris refuses the whole
    load when neither credential check passes, so the gate repeats such a refused load once
    without the credential request. A person who may view a table but not read it can then
-   DESCRIBE it; reading it fails at storage. A load that hands out no credential keeps only
+   DESCRIBE it; reading it fails, since no credential comes with the load. A load that hands out no credential keeps only
    the current version, with no counts in it, and the properties OPA's lakehouse.tables.load
    keeps, unless that decision allows the whole metadata (current_only). A view never comes
    with a credential, so the decision says who gets a view's whole metadata, and its load and
