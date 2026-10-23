@@ -14,6 +14,8 @@ package lakehouse.tables
 #   allow_create     input {subject, id}   gate: may create this table or view now
 #   allow_write      input {subject, id}   governance: may declare what this table was derived
 #                                          from (PROVENANCE.md 5.3)
+#   allow_history    input {subject, id}   gate: a load handing out no storage credential
+#                                          returns the table's whole metadata
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
 #   allow_change     input {subject, id, grants: [grant]}
@@ -61,6 +63,15 @@ allow_create if {
 default allow_write := false
 
 allow_write if writable(governance.groups(input.subject), table(input.id))
+
+# A table's metadata holds more than its columns: every version, with its time, row and file
+# counts and Trino's name for the writer, earlier schemas, and column statistics. Without this,
+# a load that hands out no storage credential, which is how a person with `describe` but not
+# `read` loads a table, carries only the current version and none of the counts (gate/app.py
+# current_only). The shipped rule allows it to nobody. A deployment adds clauses here, for
+# example `allow_history if readable(governance.groups(input.subject), table(input.id))`, which
+# would let a reader whose client asked for no credential see the history.
+default allow_history := false
 
 default allow_namespace := false
 

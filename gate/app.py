@@ -12,7 +12,9 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
 4. Trino asks for a storage credential on every table load, and Polaris refuses the whole
    load when neither credential check passes, so the gate repeats such a refused load once
    without the credential request. A person who may view a table but not read it can then
-   DESCRIBE it; reading it fails at storage.
+   DESCRIBE it; reading it fails at storage. A load that hands out no credential keeps only
+   the current version, with no counts in it, unless OPA's lakehouse.tables.allow_history
+   allows the whole metadata (current_only).
 5. Creation. Polaris's own check for creating a table, committing a staged create, or creating
    a namespace names only the parent, so the gate decides the name: a table or view must be
    registered in governance, still pending, with the person in its write grant; a namespace
@@ -38,6 +40,7 @@ decided by Polaris and OPA; the gate's own decisions only refuse, remove entries
 refusal into not-found.
 """
 import base64
+import json
 import logging
 import os
 import threading
@@ -229,6 +232,39 @@ def vended(r):
     expiry = next((c["s3.session-token-expires-at-ms"] for c in creds
                    if str(c.get("s3.session-token-expires-at-ms", "")).isdigit()), None)
     return True, int(expiry) if expiry is not None else None
+
+
+def current_only(r):
+    """A table load response cut to the current version. Removed: earlier versions, the
+    snapshot and metadata logs, refs other than `main`, column statistics, earlier schemas,
+    partition specs and sort orders, and every snapshot summary entry but `operation` (row and
+    file counts, the writer's name and query id). The current snapshot stays: without it the
+    metadata would describe an empty table. The ETag goes too: Polaris issues one
+    per metadata file, and a client revalidating a cut response with it would be answered 304
+    after gaining read."""
+    body = r.json()
+    m = body["metadata"]
+    current = m.get("current-snapshot-id")
+    snaps = [{**{k: s[k] for k in ("snapshot-id", "sequence-number", "timestamp-ms",
+                                   "manifest-list", "schema-id") if k in s},
+              "summary": {"operation": (s.get("summary") or {}).get("operation", "append")}}
+             for s in m.get("snapshots") or [] if s.get("snapshot-id") == current]
+    schema_ids = {m.get("current-schema-id"), *(s.get("schema-id") for s in snaps)}
+    body["metadata"] = {
+        **m, "snapshots": snaps,
+        "snapshot-log": [e for e in m.get("snapshot-log") or [] if e.get("snapshot-id") == current][-1:],
+        "metadata-log": [],
+        "refs": {"main": {"snapshot-id": current, "type": "branch"}} if snaps else {},
+        "statistics": [], "partition-statistics": [],
+        "schemas": [s for s in m.get("schemas") or [] if s.get("schema-id") in schema_ids],
+        "partition-specs": [s for s in m.get("partition-specs") or []
+                            if s.get("spec-id") == m.get("default-spec-id")],
+        "sort-orders": [s for s in m.get("sort-orders") or []
+                        if s.get("order-id") == m.get("default-sort-order-id")],
+    }
+    return Response(json.dumps(body), status=r.status_code, content_type="application/json",
+                    headers=[(k, v) for k, v in r.headers.items()
+                             if k.lower() not in DROP | {"etag", "content-type"}])
 
 
 def log_access(claims, entries):
@@ -437,6 +473,11 @@ def proxy(_):
                              and opa("allow_write", {"subject": subject, "id": held}) is True)
                 log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
                                      "expires": expires, "can_write": can_write}])
+        if (request.method == "GET" and named and named[0] == "table" and r.status_code == 200
+                and not issued and "metadata" in (r.json() if r.content else {})
+                and opa("allow_history", {"subject": subject,
+                                          "id": ident([named[1], *named[2], named[3]])}) is not True):
+            return current_only(r)
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.
