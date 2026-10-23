@@ -467,8 +467,13 @@ def _table_folder(location):
     None for a location outside warehouse/, where Polaris's catalog confines tables
     (polaris/bootstrap.sh allowedLocations), so no table folder overlaps a file dataset's."""
     head = f"s3://{S3_BUCKET}/warehouse/"
-    rest = location[len(head):].strip("/") if location and location.startswith(head) else ""
-    if not rest or "//" in rest or any(part in ("", ".", "..") for part in rest.split("/")):
+    if not location or not location.startswith(head):
+        return None
+    rest = location[len(head):]
+    rest = rest[:-1] if rest.endswith("/") else rest
+    # Only a location already in its exact form: a normalized one could name a prefix that is
+    # not where the files are.
+    if not rest or any(part in ("", ".", "..") for part in rest.split("/")):
         return None
     return f"warehouse/{rest}/"
 
@@ -1207,7 +1212,8 @@ def _session_rows(subject, sid):
 # The person's lineage (PROVENANCE.md 5.2), in the shape of Unity Catalog's
 # system.access.table_lineage: a read is a row with no target; a write is a row for each read
 # it may have used, or one row with no source when there is none. A read also brings in the
-# sources its dataset's files carried then (6, rule 1), which appear with direct false. A write may have used the
+# sources its dataset's files carried then (6, rule 1), which appear with direct false; a source
+# both read directly and brought in has a row of each. A write may have used the
 # reads of its session before it and, for a file write credential, the reads its login made
 # while the credential was valid, which covers a credential carried across a session switch.
 # A table write happens at its commit; a file write credential counts as a write until it
@@ -1239,10 +1245,9 @@ SELECT e.source,
        CASE WHEN e.source IS NULL THEN NULL
             WHEN EXISTS (SELECT 1 FROM table_entries t WHERE t.id = e.source) THEN 'table'
             ELSE 'files' END AS source_type,
-       e.target, e.target_type, s.name AS session, max(e.event_time) AS event_time,
-       bool_or(e.direct) AS direct
+       e.target, e.target_type, s.name AS session, max(e.event_time) AS event_time, e.direct
 FROM events e JOIN sessions s ON s.id = e.session
-GROUP BY e.source, e.target, e.target_type, s.name
+GROUP BY e.source, e.direct, e.target, e.target_type, s.name
 ORDER BY s.name, e.target NULLS FIRST, e.source NULLS FIRST
 """
 
@@ -1278,9 +1283,10 @@ def _check_target(subject, target, rows, lineage):
     if not _may_write(subject, target):
         raise index_table.Refused(403, "ForbiddenException", f"{target}: not in your write grant")
     candidates = {r["source"]: r["source_type"] for r in written if r["source"] is not None and r["direct"]}
-    # Sources that arrived through one of those reads (6, rule 1): named only to detach them.
+    # Sources that arrived through one of those reads (6, rule 1). Marking one unused detaches
+    # it even if it was also read directly: the files written after carry it either way.
     arrived = {r["source"]: r["source_type"] for r in written
-               if r["source"] is not None and not r["direct"] and r["source"] not in candidates}
+               if r["source"] is not None and r["direct"] is False}
     known = {**arrived, **candidates}
     declared, types, errors = {}, {}, []
     for r in rows:
@@ -1301,7 +1307,7 @@ def _check_target(subject, target, rows, lineage):
     if missing := sorted(set(candidates) - set(declared)):
         errors.append("not declared: " + ", ".join(missing))
     # OPA decides every source marked unused (6.5): a direct read, or a detach.
-    unused = [{"id": src, "direct": src in candidates} for src, used in declared.items()
+    unused = [{"id": src, "direct": src not in arrived} for src, used in declared.items()
               if not used and types.get(src) != "external"]
     if unused and not errors:
         allowed = set(opa("allowed", {"subject": subject, "target": target, "sources": unused},
