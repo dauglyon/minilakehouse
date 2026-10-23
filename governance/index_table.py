@@ -66,7 +66,8 @@ TABLES = {
                         ("last_used", TimestamptzType), ("current", BooleanType)),
     "lineage": _schema(("source", StringType), ("source_type", StringType),     # table | files
                        ("target", StringType), ("target_type", StringType),
-                       ("session", StringType), ("event_time", TimestamptzType)),
+                       ("session", StringType), ("event_time", TimestamptzType),
+                       ("direct", BooleanType)),   # false: arrived through a read
     "derivations": _schema(("source", StringType), ("source_type", StringType),  # + external
                            ("target", StringType), ("used", BooleanType)),
 }
@@ -85,6 +86,8 @@ def _update(u):
     if isinstance(u, dict) and u.get("action") == "set-statistics" and isinstance(u.get("statistics"), dict):
         return SetStatisticsUpdate(statistics=StatisticsFile.model_validate(u["statistics"]))
     return _UPDATE.validate_python(u)
+
+
 MAX_UPLOAD = 64 * 1024 * 1024   # bytes a person may hold in uploads, open multipart parts included
 MAX_OPEN_UPLOADS = 8            # multipart uploads a person may have open, oldest dropped first
 MAX_TABLES = 256          # built tables kept, least recently loaded evicted first

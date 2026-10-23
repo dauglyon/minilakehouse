@@ -69,8 +69,9 @@ allow_register if {
 }
 
 # Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset;
-# `share` and `write` by a group owning a root above its prefix, the ownership registration
-# checks.
+# `share`, `write` and `detach` by a group owning a root above its prefix, the ownership
+# registration checks: `detach` decides how far the dataset's protection follows its data
+# (PROVENANCE.md 6.5), as `share` does.
 default allow_change := false
 
 allow_change if {
@@ -88,7 +89,7 @@ _may_change(e, g) if {
 }
 
 _may_change(e, g) if {
-	g in {"share", "write"}
+	g in {"share", "write", "detach"}
 	_owns_root(e.prefix)
 }
 

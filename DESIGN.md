@@ -158,6 +158,9 @@ tables.allow_namespace  gate        {subject, id}              POST /internal/na
 tables.allow_register   governance  {subject, id}              POST /internal/namespaces    true | false
 tables.allow_change     governance  {subject, id,              GET /internal/tables/<id>,   true | false
                                      grants: [grant]}            POST /internal/namespaces
+tables.allow_write      governance  {subject, id}              GET /internal/tables/<id>    true | false
+derivations.allowed     governance  {subject, target,          POST /internal/tables,       [id]: sources that may be
+                                     sources: [{id, direct}]}    POST /internal/datasets      marked unused
 groups.allow_create     governance  {subject}                  —                            true | false
 groups.allow_change     governance  {subject, group}           GET /internal/group-owners/<group>  true | false
 allow_change_root       governance  {subject, prefix}          GET /internal/register-grants  true | false
@@ -170,8 +173,9 @@ One path for every caller because it is the only one Polaris can use: Polaris bu
 input and cannot attach an entry. Each decision makes at most one fetch; a failed fetch
 denies. Measured: a one-table `SELECT` makes one governance read, a denied one two (Polaris
 retries a denied write-credential load as a read-credential load), and a vend request one. Governance builds every candidate list and OPA says which candidates pass.
-Entries carry only the registry's *meaning/grants*, so storage churn never changes a
-decision.
+Entries carry the registry's grants, cut down by the sources the dataset's files carry
+(`PROVENANCE.md` 6), so a file written or removed can change who may read a dataset; a
+dataset's status never changes a decision.
 
 ## 6. Non-tabular data & registry freshness
 

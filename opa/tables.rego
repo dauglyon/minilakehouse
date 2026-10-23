@@ -77,8 +77,9 @@ allow_register if {
 }
 
 # Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the table;
-# `share`, `write` and `delete` by a group owning its namespace, the ownership registration
-# checks.
+# `share`, `write`, `delete` and `detach` by a group owning its namespace, the ownership
+# registration checks: `detach` decides how far the table's protection follows its data
+# (PROVENANCE.md 6.5), as `share` does.
 default allow_change := false
 
 allow_change if {
@@ -97,7 +98,7 @@ _may_change(gs, e, g) if {
 }
 
 _may_change(gs, _, g) if {
-	g in {"share", "write", "delete"}
+	g in {"share", "write", "delete", "detach"}
 	namespace_owned(gs, namespace(_parent(input.id)))
 }
 

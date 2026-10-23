@@ -190,6 +190,9 @@ DO $$ BEGIN
         ALTER TABLE table_entries RENAME COLUMN see TO describe;
     END IF;
 END $$;
+-- Who may detach a dataset from data derived from it (PROVENANCE.md 6.5).
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS detach TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS detach TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((describe || access));
 CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((describe || read || write));
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
@@ -321,10 +324,11 @@ def init_db():
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
                 raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
-                 d.get("describe", []), d.get("access", []), d.get("share", []), d.get("write", [])),
+                 d.get("describe", []), d.get("access", []), d.get("share", []), d.get("write", []),
+                 d.get("detach", [])),
             )
         for grp, members in reg.get("groups", {}).items():
             for m in members:
@@ -338,10 +342,11 @@ def init_db():
             if not TABLE_ID_RE.match(t["id"]):
                 raise ValueError(f"registry.json: bad table id {t['id']!r}")
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete") '
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete", detach) '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (t["id"], t.get("description"), t.get("steward"), t.get("describe", []),
-                 t.get("read", []), t.get("share", []), t.get("write", []), t.get("delete", [])),
+                 t.get("read", []), t.get("share", []), t.get("write", []), t.get("delete", []),
+                 t.get("detach", [])),
             )
         for grp, namespaces in reg.get("namespace_owners", {}).items():
             for ns in namespaces:
@@ -361,6 +366,7 @@ def _entry(row):
     """The meaning/grants half of a datasets row — what OPA decides over."""
     return {"id": row["id"], "prefix": row["prefix"],
             "describe": row["describe"], "access": row["access"], "share": row["share"],
+            "detach": row["detach"],
             "write": row["write"]}
 
 
@@ -461,9 +467,10 @@ def _table_folder(location):
     None for a location outside warehouse/, where Polaris's catalog confines tables
     (polaris/bootstrap.sh allowedLocations), so no table folder overlaps a file dataset's."""
     head = f"s3://{S3_BUCKET}/warehouse/"
-    if not location or not location.startswith(head) or ".." in location:
+    rest = location[len(head):].strip("/") if location and location.startswith(head) else ""
+    if not rest or "//" in rest or any(part in ("", ".", "..") for part in rest.split("/")):
         return None
-    return "warehouse/" + location[len(head):].rstrip("/") + "/"
+    return f"warehouse/{rest}/"
 
 
 def _folders():
@@ -635,7 +642,7 @@ def internal_datasets():
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
-        cur.execute("SELECT id, prefix, describe, access, share, write FROM datasets WHERE id = ANY(%s)",
+        cur.execute("SELECT id, prefix, describe, access, share, write, detach FROM datasets WHERE id = ANY(%s)",
                     (ids,))
         rows = cur.fetchall()
     # Who may read follows rule 3 (PROVENANCE.md 6): write on a file dataset reads nothing.
@@ -665,7 +672,7 @@ def internal_group_owners(grp):
         return jsonify({"owners": [r["owner"] for r in cur.fetchall()]})
 
 
-_TABLE_COLS = 'id, describe, read, share, write, "delete", status'
+_TABLE_COLS = 'id, describe, read, share, write, "delete", detach, status'
 # Rule 3 cuts a table's write as well as its read: writing a table reads it, and the credential
 # Polaris vends for writing can read the files.
 _TABLE_CUT = ("read", "write", "share")
@@ -857,9 +864,9 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
-    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write")}
+    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write", "detach")}
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "describe, access, share and write must be lists of groups"}), 400
+        return jsonify({"error": "describe, access, share, write and detach must be lists of groups"}), 400
 
     if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
@@ -875,10 +882,10 @@ def register_dataset():
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
                 return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
+                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, status) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
                 (ds_id, prefix, body.get("description"), subject,
-                 grants["describe"], grants["access"], grants["share"], grants["write"]),
+                 grants["describe"], grants["access"], grants["share"], grants["write"], grants["detach"]),
             )
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset unavailable"}), 409
@@ -930,21 +937,21 @@ def register_table():
         return err
     body = request.get_json(silent=True) or {}
     table_id = body.get("id")
-    grants = {g: body.get(g, []) for g in ("describe", "read", "share", "write", "delete")}
+    grants = {g: body.get(g, []) for g in ("describe", "read", "share", "write", "delete", "detach")}
     if not isinstance(table_id, str) or not TABLE_ID_RE.match(table_id):
         return jsonify({"error": "id must be <catalog>.<namespace...>.<table>"}), 400
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "describe, read, share, write and delete must be lists of groups"}), 400
+        return jsonify({"error": "describe, read, share, write, delete and detach must be lists of groups"}), 400
     if opa("allow_register", {"subject": subject, "id": table_id}, package="tables") is not True:
         app.logger.info("DENY register-table subject=%s id=%s", subject, table_id)
         return jsonify({"error": "forbidden"}), 403
     try:
         with db(commit=True) as cur:
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete") '
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete", detach) '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (table_id, body.get("description"), subject, grants["describe"], grants["read"],
-                 grants["share"], grants["write"], grants["delete"]))
+                 grants["share"], grants["write"], grants["delete"], grants["detach"]))
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "table unavailable"}), 409
     app.logger.info("REGISTER-TABLE subject=%s id=%s", subject, table_id)
@@ -953,8 +960,9 @@ def register_table():
 
 # The grants a change may name, per kind, and the column each is stored in. A file dataset has
 # no delete: its write credential deletes objects (WHITEPAPER 4.2).
-_GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "share": "share", "write": "write"},
-               "table": {g: g for g in ("describe", "read", "share", "write", "delete")}}
+_GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "share": "share", "write": "write",
+                           "detach": "detach"},
+               "table": {g: g for g in ("describe", "read", "share", "write", "delete", "detach")}}
 
 
 @app.patch("/permissions/<kind>/<path:entry_id>")
@@ -1021,8 +1029,8 @@ def _names(v, pattern):
 _NAME_IN_USE_SQL = """
 SELECT EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM group_owners WHERE grp = %(g)s OR owner = %(g)s)
-    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write))
-    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || share || write || "delete"))
+    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write || detach))
+    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || share || write || "delete" || detach))
     OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) AS used
 """
@@ -1198,7 +1206,8 @@ def _session_rows(subject, sid):
 
 # The person's lineage (PROVENANCE.md 5.2), in the shape of Unity Catalog's
 # system.access.table_lineage: a read is a row with no target; a write is a row for each read
-# it may have used, or one row with no source when there is none. A write may have used the
+# it may have used, or one row with no source when there is none. A read also brings in the
+# sources its dataset's files carried then (6, rule 1), which appear with direct false. A write may have used the
 # reads of its session before it and, for a file write credential, the reads its login made
 # while the credential was valid, which covers a credential carried across a session switch.
 # A table write happens at its commit; a file write credential counts as a write until it
@@ -1206,27 +1215,34 @@ def _session_rows(subject, sid):
 # with itself. Repeated events of one shape are one row, at the latest event's time.
 _LINEAGE_SQL = """
 WITH a AS (
-    SELECT id, session, sid, dataset, kind, mode, at,
+    SELECT id, session, sid, dataset, kind, mode, at, COALESCE(sources, ARRAY[dataset]) AS sources,
            CASE WHEN kind = 'files' THEN COALESCE(expires, 'infinity') ELSE at END AS until
     FROM accesses WHERE person = %(p)s
+), reads AS (  -- each read once per source it brought in; direct for the dataset read
+    SELECT a.id, a.session, a.sid, a.at, src.source, src.source = a.dataset AS direct
+    FROM a CROSS JOIN LATERAL unnest(a.sources) AS src(source) WHERE a.mode = 'read'
 ), pairs AS (
-    SELECT w.id AS write_id, w.session, r.dataset AS source, r.kind AS source_type,
+    SELECT w.id AS write_id, w.session, r.source, r.direct,
            w.dataset AS target, w.kind AS target_type, w.at AS event_time
-    FROM a w JOIN a r ON r.mode = 'read' AND r.at < w.until AND r.dataset <> w.dataset
+    FROM a w JOIN reads r ON r.at < w.until AND r.source <> w.dataset
          AND (r.session = w.session OR (w.kind = 'files' AND r.sid = w.sid AND r.at >= w.at))
     WHERE w.mode = 'write'
 ), events AS (
-    SELECT session, source, source_type, target, target_type, event_time FROM pairs
+    SELECT session, source, direct, target, target_type, event_time FROM pairs
     UNION ALL
     SELECT session, NULL, NULL, dataset, kind, at FROM a w
     WHERE mode = 'write' AND NOT EXISTS (SELECT 1 FROM pairs p WHERE p.write_id = w.id)
     UNION ALL
-    SELECT session, dataset, kind, NULL, NULL, at FROM a WHERE mode = 'read'
+    SELECT session, source, direct, NULL, NULL, at FROM reads
 )
-SELECT e.source, e.source_type, e.target, e.target_type, s.name AS session,
-       max(e.event_time) AS event_time
+SELECT e.source,
+       CASE WHEN e.source IS NULL THEN NULL
+            WHEN EXISTS (SELECT 1 FROM table_entries t WHERE t.id = e.source) THEN 'table'
+            ELSE 'files' END AS source_type,
+       e.target, e.target_type, s.name AS session, max(e.event_time) AS event_time,
+       bool_or(e.direct) AS direct
 FROM events e JOIN sessions s ON s.id = e.session
-GROUP BY e.source, e.source_type, e.target, e.target_type, s.name
+GROUP BY e.source, e.target, e.target_type, s.name
 ORDER BY s.name, e.target NULLS FIRST, e.source NULLS FIRST
 """
 
@@ -1261,7 +1277,11 @@ def _check_target(subject, target, rows, lineage):
         raise index_table.Refused(403, "ForbiddenException", f"{target}: you have not written it")
     if not _may_write(subject, target):
         raise index_table.Refused(403, "ForbiddenException", f"{target}: not in your write grant")
-    candidates = {r["source"]: r["source_type"] for r in written if r["source"] is not None}
+    candidates = {r["source"]: r["source_type"] for r in written if r["source"] is not None and r["direct"]}
+    # Sources that arrived through one of those reads (6, rule 1): named only to detach them.
+    arrived = {r["source"]: r["source_type"] for r in written
+               if r["source"] is not None and not r["direct"] and r["source"] not in candidates}
+    known = {**arrived, **candidates}
     declared, types, errors = {}, {}, []
     for r in rows:
         source, kind = r.get("source"), r.get("source_type")
@@ -1270,19 +1290,27 @@ def _check_target(subject, target, rows, lineage):
         if kind == "external":
             if not EXTERNAL_RE.match(source):
                 errors.append(f"an outside input is named sha256:<64 hex digits>, not {source}")
-        elif source not in candidates:
+        elif source not in known:
             errors.append(f"not a candidate: {source} (an outside input needs source_type 'external')")
             continue
-        elif kind not in (None, candidates[source]):
-            errors.append(f"{source} is {candidates[source]}, not {kind}")
+        elif kind not in (None, known[source]):
+            errors.append(f"{source} is {known[source]}, not {kind}")
         if declared.setdefault(source, r["used"]) != r["used"]:
             errors.append(f"{source} declared both used and unused")
-        types[source] = kind or candidates.get(source)
+        types[source] = kind or known.get(source)
     if missing := sorted(set(candidates) - set(declared)):
         errors.append("not declared: " + ", ".join(missing))
+    # OPA decides every source marked unused (6.5): a direct read, or a detach.
+    unused = [{"id": src, "direct": src in candidates} for src, used in declared.items()
+              if not used and types.get(src) != "external"]
+    if unused and not errors:
+        allowed = set(opa("allowed", {"subject": subject, "target": target, "sources": unused},
+                          package="derivations") or [])
+        errors += [f"you may not {'mark it unused' if u['direct'] else 'detach it'}: {u['id']}"
+                   for u in unused if u["id"] not in allowed]
     if errors:
         raise index_table.Refused(400, "BadRequestException", f"{target}: " + "; ".join(errors))
-    return {"candidates": sorted(candidates),
+    return {"candidates": sorted(candidates), "arrived": sorted(arrived),
             "sources": [{"source": s, "source_type": types[s], "used": u} for s, u in sorted(declared.items())]}
 
 

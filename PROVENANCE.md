@@ -177,8 +177,8 @@ Two rules make the rows:
   table read in order to append to it is not its own candidate.
 
 Repeated events of one shape are one row. The person sees only their own sessions' rows.
-Design, not built: a column `direct`, false on rows for a source that arrived through a read
-(section 6) rather than being read, so a person sees what a declaration may drop.
+A column `direct` is false on rows for a source that arrived through a read (section 6)
+rather than being read, so a person sees what a declaration may detach.
 
 An output's candidates are the sources of the rows whose target is the output, across every
 session that wrote it: `WHERE target = '<id>'`. That is how a later session declares
@@ -331,8 +331,10 @@ the commit, so the person's error names the table rather than a failed file writ
 
 ## 6. Sources travel with the data
 
-Agreed 2026-10-22. Rules 1 to 3 are built (section 10, item 11); declarations naming an
-arrived-through source, the `detach` grant, and the lifecycle in 6.6 are not. A *source* of some data is a dataset whose own `read` grant
+Agreed 2026-10-22. Built (section 10, items 11 and 12): rules 1 to 3, declarations naming an
+arrived-through source, the `detach` grant and OPA's rule for sources marked unused
+(`opa/derivations.rego`). Not built: detaches shown to the source's `share` holders, putting a
+source back (6.5), and the lifecycle in 6.6. A *source* of some data is a dataset whose own `read` grant
 limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
 propagates a classification to everything derived from a dataset and Palantir Foundry's
 markings follow data along lineage. Three rules:
@@ -419,9 +421,12 @@ Trino refuses to expire versions younger than its catalog's minimum, seven days 
 write credentials for the dataset have expired, since until then they could still write data
 from the source (6.2).
 
-A declaration that marks an arrived-through source unused is refused while files carrying it,
-other than the ones the declaration covers, remain in the folder; the refusal names step 3's
-statements. Once it is accepted, no file carries the source and rule 3 stops counting it.
+Once the declaration is accepted, the files it covers no longer carry the source and rule 3
+stops counting it. Planned and dropped: refusing the declaration while files from the source
+remain, with a message naming step 3's statements. A file is attributed by when it was
+written, and both the cleaner's old files and the rewrite come after they read the dataset,
+so the time cannot tell them apart; a declaration made before the old files are gone is
+accepted, and if they still hold the source's data it is a false claim by its declarer.
 
 ### 6.5 Detaching a source
 
@@ -598,6 +603,15 @@ attribution (4.2).
     that credential marked expired in the access log (a test shortcut), carol read the one
     remaining row. A first version of the timing rule that also counted a writer's load
     credential before any listing made `t1` carry what alice read after loading it.
+12. Detaching, run on the stack. alice appended `t1` rows to `r1` again, then in a new session
+    copied it: `CREATE TABLE c1 AS SELECT * FROM r1`. `c1`'s lineage showed `r1` read
+    directly and `t1` with `direct` false, and carol could not read `c1`. After the `t1` rows
+    were deleted from `c1` and its old versions removed, a declaration marking `r1` used and
+    `t1` unused was refused while `t1`'s `detach` named only `group-admins` ("you may not
+    detach it: lakehouse.db.t1") and accepted once it also named `jgi-writers`, and before
+    that while it was empty. With alice's write credentials for `c1` marked expired (the test
+    shortcut), `c1` carried only `r1` and carol read it, while `r1` still carried `t1` and
+    stayed hidden from her. `detach` is changed by root owners, as `share` is.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
@@ -623,8 +637,9 @@ Build order, each step usable on its own:
    sources marked unused, detaches shown to the source's `share` holders and their putting a
    source back (6.5); `lineage`'s `direct` rows; a target `live` once every writer has
    declared. Built of these: the sources each read brings in, writer credentials flagged by
-   the gate, files attributed by listing, rule 3 in governance's lookups, and notifications
-   and listing extended to table folders.
+   the gate, files attributed by listing, rule 3 in governance's lookups, notifications and
+   listing extended to table folders, the `detach` grant and OPA's rule, declarations naming
+   arrived-through sources, and `lineage`'s `direct` column.
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
