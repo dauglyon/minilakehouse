@@ -332,6 +332,15 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   write credential, the reads its login made while the credential was valid. A table write
   happens at its commit; a file write credential counts as a write until it expires, since
   governance never sees the file writes.
+- **Who may read follows the sources a dataset's files carry** (`PROVENANCE.md` 6). Each read
+  in the access log keeps what it brought in: the dataset and every source its files carried
+  then. Governance lists each dataset's and table's folder when Ceph notifies it of a change
+  (its reader may list `datasets/` and `warehouse/`), records every file's last-modified
+  time, and attributes each file to the write credentials and commits valid at that time,
+  so a file carries what its writers had read before writing it, minus what they declared
+  unused. The lookups OPA makes return a dataset's `read`, a table's `write`, and `share`
+  cut down to groups that may also read, or share, every carried source; `describe` and
+  `delete` are not cut. A write still under way counts before a listing can see its files.
 - **A declaration is a commit, checked before it is accepted** (`PROVENANCE.md` 5.3, 5.5). An
   engine inserting into `governance.derivations` uploads its files to governance's S3-style
   endpoint and commits through the gate. The endpoint takes uploads only under the signer's

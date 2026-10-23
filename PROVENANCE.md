@@ -1,6 +1,7 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-Build step 1 and the first part of step 2 (section 10) are implemented; the rest is design.
+Build step 1, the first part of step 2, and section 6's three rules (section 10) are
+implemented; the rest is design.
 Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
 document extends `WHITEPAPER.md` and replaces its derivation rule (section 4.3), which limits a
 dataset by a list of `inputs`, with sources that travel with the stored data (section 6).
@@ -330,7 +331,8 @@ the commit, so the person's error names the table rather than a failed file writ
 
 ## 6. Sources travel with the data
 
-Agreed 2026-10-22; not built. A *source* of some data is a dataset whose own `read` grant
+Agreed 2026-10-22. Rules 1 to 3 are built (section 10, item 11); declarations naming an
+arrived-through source, the `detach` grant, and the lifecycle in 6.6 are not. A *source* of some data is a dataset whose own `read` grant
 limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
 propagates a classification to everything derived from a dataset and Palantir Foundry's
 markings follow data along lineage. Three rules:
@@ -375,7 +377,19 @@ file matching several credentials carries all of their sources. An object no wri
 credential matches, such as data seeded by an administrator, carries none.
 
 Storage decides. Governance stops counting a source for a dataset only after a listing shows
-no file carrying it; Ceph's notifications tell it when to list again.
+no file carrying it; Ceph's notifications, for `datasets/` and `warehouse/`, tell it when to
+list again.
+
+A write still under way when the folder was last listed may have produced files that listing
+could not see. A commit or staged create the gate logged, and a write credential from the
+broker or Polaris, therefore count as having written a file at once, carrying what their
+writer had brought in up to now, until a listing made after the credential expires settles
+what they wrote. A table credential handed to a writer for a load counts only for files a
+listing finds from its time: counting it earlier would make a table absorb everything its
+writer reads for as long as Polaris's credential lasts, up to an hour, while every write
+notifies governance and the listing follows within seconds. Anyone holding a credential reads
+new files in the folder until it expires whatever governance knows, as with any grant
+change.
 
 ### 6.3 What a declaration covers
 
@@ -398,6 +412,12 @@ To remove a source from a dataset:
    without the deleted rows; `expire_snapshots` and `remove_orphan_files` remove old versions
    and files nothing uses. A file dataset's objects are deleted or replaced directly.
 4. Declare the rewrite, marking the source unused (6.3; example in 5.4).
+
+Trino refuses to expire versions younger than its catalog's minimum, seven days by default;
+`trino/etc/catalog/iceberg.properties` sets `iceberg.expire-snapshots.min-retention` and
+`iceberg.remove-orphan-files.min-retention` to `0s`. The restriction lifts once the cleaner's
+write credentials for the dataset have expired, since until then they could still write data
+from the source (6.2).
 
 A declaration that marks an arrived-through source unused is refused while files carrying it,
 other than the ones the declaration covers, remain in the folder; the refusal names step 3's
@@ -474,8 +494,14 @@ dataset.
 - **A file belongs to every writer whose credential was valid when it was written** (6.2).
   When several people could write a folder at once, each of their files carries all of
   their sources.
-- **Rule 3 needs each file's time.** Governance lists a dataset's folder when a source might
-  stop counting; a large table is a long listing.
+- **Rule 3 needs each file's time.** Governance lists a dataset's folder on every storage
+  notification for it and when a write credential for it expires; a large table is a long
+  listing, and a bulk upload lists the folder once per object.
+- **A dataset stays cut down while a writer's credential is valid.** A person who read a
+  source and holds a write credential for a dataset keeps it carrying that source until the
+  credential expires, up to an hour for Polaris's, even after declaring it unused.
+- **A table file belongs to everyone who could write the table when it was written**,
+  including a writer who only read the table then.
 - **A credential carried to another login is not followed.** The reads of the login it was
   issued to are paired with it; another login's are out-of-band carry-over.
 - **Lineage grows with a person's history.** Each load of `governance.lineage` computes it
@@ -561,6 +587,17 @@ attribution (4.2).
    payload did not. With boto3 on a credential from a load: a multipart upload read back
    whole, DeleteObjects removed the object, and puts over an existing file, under bob's
    prefix, and outside the governance tables were refused.
+11. Rules 1 to 3, run on the stack. `lakehouse.db.r1` registered readable by `jgi-writers` and
+    `projw-team`; alice, in a fresh session, created it from literal values, and carol
+    (`projw-team`) read it. Alice appended rows from `t1`, which only `jgi-writers` may read;
+    `r1`'s files then carried `t1` and carol's `SELECT` answered "does not exist", while the
+    lookup OPA gets showed `read` and `write` cut to `jgi-writers`. Cleaning: `DELETE` of the
+    `t1` rows, `optimize`, `expire_snapshots` and `remove_orphan_files` left one data file
+    and one version; alice declared `t1` unused. `r1` still carried `t1` through the write
+    credential Polaris had handed alice at the create, valid for another 57 minutes; with
+    that credential marked expired in the access log (a test shortcut), carol read the one
+    remaining row. A first version of the timing rule that also counted a writer's load
+    credential before any listing made `t1` carry what alice read after loading it.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
@@ -585,8 +622,9 @@ Build order, each step usable on its own:
    only undeclared files and naming arrived-through sources; the `detach` grant, OPA's rule for
    sources marked unused, detaches shown to the source's `share` holders and their putting a
    source back (6.5); `lineage`'s `direct` rows; a target `live` once every writer has
-   declared; notifications and governance's listing extended from `datasets/` to table
-   folders.
+   declared. Built of these: the sources each read brings in, writer credentials flagged by
+   the gate, files attributed by listing, rule 3 in governance's lookups, and notifications
+   and listing extended to table folders.
 3. The `sessions` lever as an insert.
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
