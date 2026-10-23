@@ -183,3 +183,77 @@ enumeration is added.
 - Inheritance is computed by governance when serving the entry, not by rego fetching parents
   and not by copying grants onto tables at registration. The registry's per-table rows stay
   the only place a table-specific grant lives.
+
+---
+
+# Section 3 — storage-first registration
+
+## Why
+
+The design's rule is "storage owns existence, the registry owns meaning", and the registry
+already reconciles against RGW events. But registration today is form-first: a dataset is
+registered (`POST /datasets`, `allow_register`) before its bytes exist, and a table must be
+registered `pending` before `CREATE TABLE` is allowed. Writing is gated on a registry entry
+that describes nothing yet. Invert it: writing under a root you own is allowed by ownership
+alone; describing what was written is registration.
+
+## Model
+
+- A **tenant admin** (section 1) may write anywhere under a root their group owns: a blob
+  folder under `datasets/<root>/`, a table under `<catalog>.<ns>`.
+- Whatever appears there is an entry at once, **undescribed**: no description, grants = those
+  inherited from the root or namespace (section 2), nothing of its own. Readable by whoever
+  the root's grants name — by default only the owning group.
+- **Describing** it (description, own grants, declared sources) is registration. The entry's
+  `described` flag replaces `pending`; `live`/`gone` stay as the storage truth.
+- The cross-tenant guard moves, it does not go: writing needs an owned root; overlapping blob
+  folders are refused when described, not when registered.
+
+## Changes
+
+### Blobs
+- `opa/blob.rego`: drop `allow_register`. `vend_write` takes `{subject, prefix}` and allows for
+  an admin of a group owning a root above `prefix` (not only registered datasets). The
+  credential is scoped to that prefix as today.
+- `broker/app.py`: `POST /vend` with `mode: write` takes `prefix` instead of `dataset`.
+- `governance/app.py` `/events`: a key under an owned root with no entry creates one. Its id
+  is derived as now; its folder is the key's first path segment below the root (deeper
+  structure stays inside the dataset). Log `EVENT ... created undescribed <id>` instead of
+  "ungoverned". A key under no owned root stays ungoverned and logged.
+- `POST /datasets` becomes `PATCH /datasets/<id>` on an undescribed entry: description,
+  own grants, `sources`. Allowed for an admin of a group owning a root above it. Keep the
+  overlap check here (refuse describing a folder that overlaps a described one).
+- Schema: `datasets.described BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
+  Drop `register_grants`.
+
+### Tables
+- `opa/tables.rego`: `allow_create` allows an admin of a group owning the namespace or one
+  above (drop the `pending` entry requirement). Drop `allow_register`.
+- `gate/app.py`: reports created tables as now; governance inserts the entry undescribed with
+  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` describes.
+- `table_entries.described` as for datasets; `pending` goes away.
+
+### Read API (sections 1–2) additions
+- `GET /groups/<name>` gains `undescribed`: entries under its roots with `described = false`,
+  each with writer (from the access log), first-seen time, object or row count, and, for a
+  blob folder, the tables whose sessions read it (so an ingest pair shows side by side).
+- `GET /datasets/<id>` / `GET /tables/<id>`: `described`, and `writer`.
+
+### Index
+- `governance.datasets` lists undescribed entries only to groups that may read them (the
+  owning group by default). A described-but-not-read entry is visible by `describe` as now.
+
+### Docs and seed
+- README "Registry freshness & governed ingest", "Flow B" (the `t2` demo) and the whitepaper's
+  register-at-ingest section change to: write, then describe. `seed/ingest-demo.py` uploads
+  with a root-scoped write credential, then describes.
+
+## UI consequence
+"Register" is not a form. It is an inbox on the group page: things in your roots nobody has
+described yet. Describing is the same grants panel as everywhere else, plus a description
+and a sources picker prefilled from lineage.
+
+## Decided
+- Writing under an owned root needs no prior registry entry.
+- Undescribed data is readable only through root/namespace grants, never wider.
+- `pending` is removed; `described` is a flag on a live entry.
