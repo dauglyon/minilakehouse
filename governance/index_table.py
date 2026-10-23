@@ -325,6 +325,13 @@ def complete_upload(subject, upload, key, numbers):
         parts = _upload(subject, upload, key)
         if not numbers or any(n not in parts for n in numbers):
             raise S3Error(400, "InvalidPart")
+        # Strictly increasing, as S3 requires: a repeated part would be joined again each time
+        # it is named, past the quota.
+        if numbers != sorted(set(numbers)):
+            raise S3Error(400, "InvalidPartOrder")
+        size = sum(len(parts[n]) for n in numbers)
+        if _held(subject) - sum(len(b) for b in parts.values()) + size > MAX_UPLOAD:
+            raise S3Error(400, "EntityTooLarge")
         data = b"".join(parts[n] for n in numbers)
         del _open[subject][upload]   # its parts' bytes now count as the object
         _store(subject, key, data)
