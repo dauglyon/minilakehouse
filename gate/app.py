@@ -15,9 +15,9 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    DESCRIBE it; reading it fails at storage. A load that hands out no credential keeps only
    the current version, with no counts in it, and the properties OPA's lakehouse.tables.load
    keeps, unless that decision allows the whole metadata (current_only). A view never comes
-   with a credential, so every view load or commit response is cut the same way unless the
-   decision allows it (current_view_only), and a view that would run with its owner's rights
-   is refused (runs_as_owner).
+   with a credential, so the decision says who gets a view's whole metadata, and its load and
+   commit responses are cut the same way for everyone else (current_view_only). A view that
+   would run with its owner's rights is refused (runs_as_owner).
 5. Creation. Polaris's own check for creating a table, committing a staged create, or creating
    a namespace names only the parent, so the gate decides the name: a table or view must be
    registered in governance, still pending, with the person in its write grant; a namespace
@@ -539,7 +539,8 @@ def proxy(_):
                        or (view and request.method in ("GET", "POST"))) else {})
         # The gate's one decision on a table or view request (opa/tables.rego load), asked once
         # Polaris has answered: only then are the credential and the properties known.
-        load = (opa("load", {"subject": subject, "id": table or view, "credential": credentialed,
+        load = (opa("load", {"subject": subject, "id": table or view,
+                             "kind": "table" if table else "view", "credential": credentialed,
                              "properties": (loaded.get("metadata") or {}).get("properties") or {}})
                 or {}) if (table or view) and (credentialed or "metadata" in loaded) else {}
         if credentialed:

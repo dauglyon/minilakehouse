@@ -14,7 +14,7 @@ package lakehouse.tables
 #   allow_create     input {subject, id}   gate: may create this table or view now
 #   allow_write      input {subject, id}   governance: may declare what this table was derived
 #                                          from (PROVENANCE.md 5.3)
-#   load             input {subject, id, credential, properties: {key: value}}
+#   load             input {subject, id, kind: table | view, credential, properties: {key: value}}
 #                    gate, once per table request that hands out a credential or loads the
 #                    metadata without one, and per view load or commit:
 #                    {write, history, properties: [key]}
@@ -73,16 +73,19 @@ allow_write if writable(governance.groups(input.subject), table(input.id))
 #               but not `read` loads a table, returns the whole metadata. Otherwise it carries
 #               the current version without its counts (gate/app.py current_only): the metadata
 #               also holds every version with its time, row and file counts and Trino's name for
-#               the writer, earlier schemas, and column statistics. A view never comes with a
-#               credential, so for a view this decides whether anyone, its writers included,
-#               sees its earlier versions, each with its query text (current_view_only).
+#               the writer, earlier schemas, and column statistics. A view (`kind` "view")
+#               never comes with a credential, so for a view this decides who sees its earlier
+#               versions, each with its query text (current_view_only).
 #   properties  the property keys such a load keeps. Properties are whatever the table's writers
 #               set: engine settings and a `comment` mostly, and also labels such as an owner's
 #               name or a data-quality figure.
-# The shipped rules show the history to nobody and keep every property. A deployment adds a
+# The shipped rules give a view's history to those who may read or write it, as a table's
+# readers and writers get its history with the credential they are handed, show a table's to
+# nobody on a load without a credential, and keep every property. A deployment adds a
 # `_load_history` clause, for example `readable(governance.groups(input.subject),
-# table(input.id))` to show it to readers whose client asked for no credential, or replaces
-# `_load_properties`'s clause, for example with one keeping only keys that start with `write.`.
+# table(input.id))` to show a table's history to readers whose client asked for no credential,
+# or replaces `_load_properties`'s clause, for example with one keeping only keys that start
+# with `write.`.
 load := {"write": _load_write, "history": _load_history, "properties": _load_properties}
 
 default _load_write := false
@@ -93,6 +96,11 @@ _load_write if {
 }
 
 default _load_history := false
+
+_load_history if {
+	input.kind == "view"
+	readable(governance.groups(input.subject), table(input.id))
+}
 
 _load_properties contains k if some k, _ in input.properties
 
