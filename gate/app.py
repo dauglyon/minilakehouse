@@ -314,12 +314,15 @@ def runs_as_owner(named, body):
     """Whether a POST creates a view, or changes one, so that it runs with its owner's rights.
     Trino marks such a view with the property OWNER_RIGHTS. Its query would read the view's
     tables as the owner without the owner's token, which the catalog cannot accept, so a view
-    runs with the rights of whoever queries it."""
+    runs with the rights of whoever queries it. The body is read as Iceberg's parser
+    (MetadataUpdateParser) reads it: the action in any case, the properties under `updates` or
+    the older `updated`."""
     if named and named[0] == "views":
         return OWNER_RIGHTS in (body.get("properties") or {})
     if named and named[0] == "view":
-        return any(u.get("action") == "set-properties" and OWNER_RIGHTS in (u.get("updates") or {})
-                   for u in body.get("updates") or [])
+        return any(str(u.get("action", "")).lower() == "set-properties"
+                   and any(OWNER_RIGHTS in (u.get(k) or {}) for k in ("updates", "updated"))
+                   for u in body.get("updates") or [] if isinstance(u, dict))
     return False
 
 
@@ -473,9 +476,17 @@ def proxy(_):
             return listing(raw, headers, *named[:3], subject)
 
         body = (request.get_json(silent=True) or {}) if request.method == "POST" else {}
-        if request.method == "POST" and runs_as_owner(named, body):
-            return forbidden("a view runs with the rights of whoever queries it here: "
-                             "create it with SECURITY INVOKER")
+        if request.method == "POST" and named and named[0] in ("views", "view"):
+            # Read from the bytes Polaris will get, whatever the content type says.
+            try:
+                sent = json.loads(request.get_data() or b"{}")
+            except ValueError:
+                sent = None
+            if not isinstance(sent, dict):
+                return forbidden("a view request's body must be a JSON object")
+            if runs_as_owner(named, sent):
+                return forbidden("a view runs with the rights of whoever queries it here: "
+                                 "create it with SECURITY INVOKER")
         new_tables, new_namespaces = creates(segments, body) if request.method == "POST" else ([], [])
         for n in new_namespaces:
             if n is not None and n.split(".")[1:2] == [INDEX_NS]:
