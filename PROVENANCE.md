@@ -382,8 +382,8 @@ no file carrying it; Ceph's notifications tell it when to list again.
 A person's declaration of a target covers their files in it that no earlier declaration of
 theirs covered. It gives a `used` value to each dataset they read directly before those
 files, as `lineage` lists them, and may name a source that arrived through one of those reads
-to mark it unused. The files it covers do not carry a source it marks unused. Who may mark an
-arrived-through source unused is open (section 9).
+to mark it unused. The files it covers do not carry a source it marks unused. Marking an
+arrived-through source unused detaches it (6.5).
 
 ### 6.4 Cleaning a dataset
 
@@ -403,7 +403,40 @@ A declaration that marks an arrived-through source unused is refused while files
 other than the ones the declaration covers, remain in the folder; the refusal names step 3's
 statements. Once it is accepted, no file carries the source and rule 3 stops counting it.
 
-### 6.5 Lifecycle of an output
+### 6.5 Detaching a source
+
+Decided 2026-10-22. Detaching states that the data a declaration covers no longer holds a
+source's data. Nobody can check that, and a false one lets data derived from the source reach
+people outside its `read` grant, so it is controlled by authority given ahead of time and by
+a record, not by approval each time.
+
+- **A sixth grant, `detach`,** on every dataset: the groups whose members may detach it from
+  data derived from it. The name was chosen over `purge`, which Polaris and Spark already use
+  for dropping a table with its files.
+- **OPA decides every source a declaration marks unused,** with one rule that receives each
+  source and whether it was read directly or arrived through a read. The shipped policy is
+  permissive: a direct read may always be marked unused, and an arrived-through source may be
+  detached by anyone who wrote the data while the source's `detach` is empty, and by its
+  members once the source's owners fill it. A deployment tightens this by editing the rule,
+  with no change to governance: strict everywhere, only a `curators` group, never for sources
+  under a given root, or the declarer also holding `share` on the target.
+- **Recorded and visible.** A detach is stored with its declarer and signed, as every
+  declaration is, and everyone holding `share` on the source sees, in
+  `governance.derivations`, every declaration by anyone that detaches it, including the
+  target's id.
+- **Reversible.** A `share` holder of the source can put it back by inserting a row that marks
+  it used for that target; governance accepts that from them for a target the source was
+  detached from, and from then on the target's files carry it again. Data read in between has
+  gone out, and the record names who said the data was clean.
+
+Rejected: holding each detach until someone with `share` on the source approves it. The
+approver cannot check the claim, which is about data they may not be allowed to read; the
+data stays restricted until people outside the work respond; and a dataset carrying many
+sources needs as many approvals. Authority given ahead of time is how Palantir Foundry handles
+markings, whose administrators choose who may remove them, and how declassification
+authority is delegated for classified documents.
+
+### 6.6 Lifecycle of an output
 
 - Registered `pending`, created as today: the gate admits a create for a registered pending
   table whose caller is in its `write`; a file dataset gets a write credential on `write`.
@@ -471,9 +504,6 @@ Open: whether a scratch folder's own read grant is cut down by what its files ca
 That keeps a project member from reading data derived from something they may not read, but
 locks them out of the shared folder; the alternative is a scratch folder per person.
 
-**Who may drop a source that arrived through a read** (6.3): anyone who wrote the data, as
-with any declaration, or only someone holding `share` on that source, as Foundry requires a
-permission to remove a marking.
 
 
 ## 10. Evidence and build order
@@ -552,10 +582,12 @@ Build order, each step usable on its own:
    commit parsing and validation, the signed record. Second, section 6: the sources each read
    brings in kept with it; writer table credentials logged as writes; files attributed by a
    listing; who may read from rule 3 in governance's lookups for OPA; declarations covering
-   only undeclared files and naming arrived-through sources; `lineage`'s `direct` rows; a
-   target `live` once every writer has declared. Waits on who may drop an arrived-through
-   source (section 9).
+   only undeclared files and naming arrived-through sources; the `detach` grant, OPA's rule for
+   sources marked unused, detaches shown to the source's `share` holders and their putting a
+   source back (6.5); `lineage`'s `direct` rows; a target `live` once every writer has
+   declared; notifications and governance's listing extended from `datasets/` to table
+   folders.
 3. The `sessions` lever as an insert.
 
-Section 13 of `WHITEPAPER.md` and the "inputs are trusted" statements in its sections 4.3,
-10 and 11 change when step 2 lands.
+Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
+and 11, and its section 4.2's list of grants, which gains `detach`, change when step 2 lands.
