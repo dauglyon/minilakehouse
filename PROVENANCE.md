@@ -571,8 +571,8 @@ handoff's section 3), so what follows applies folder by folder.
   read every source their files carry when they wrote them; losing `read` on a source later
   leaves them their own copies, as a download would. Everyone else is cut there as anywhere,
   and sharing a folder still takes `share` on every source it carries.
-- A source's root owners can take a person's own copies back. Each source has a list of
-  groups (name not settled); for anyone in a listed group the exemption does not apply to
+- A source's root owners can take a person's own copies back. Each source has `revoked`, a
+  set of groups; for anyone in one of them the exemption does not apply to
   anything carrying that source, private space included. One person is named through their
   group of one. Additions are recorded with who made them and when, shown to the source's
   `share` holders, and reversible, as detaches are (6.5). Credentials already handed out last

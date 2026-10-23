@@ -64,9 +64,8 @@ Record findings at the top of this file before changing code.
   `/internal/admin-of/<subject>`.
 - Private-space exemption (`PROVENANCE.md` 9): in `opa/blob.rego` (`_reads`, `vend_write`)
   and `opa/tables.rego` (`readable`, `writable`), an entry under the subject's own personal
-  root skips the sources check, unless one of the subject's groups is on the list a carried
-  source holds for taking copies back. That list is a new per-source set of groups beside the
-  six grants (name not settled), changed by the source's root owners as `share` and `detach`
+  root skips the sources check, unless one of the subject's groups is in a carried source's
+  `revoked`. `revoked` is a new per-source set of groups beside the six grants, changed by the source's root owners as `share` and `detach`
   are, recorded and shown to its `share` holders like detaches; governance's lookups return it
   with each source's `read` and `share`.
 
