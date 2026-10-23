@@ -2,8 +2,8 @@
 
 For a coding agent with access to the `KBaseDataLakehouse` org. This records a design
 discussion held without that access; the first task is to check its assumptions against the
-real tenant code, then implement. Work is on branch `identity-passthrough-grants-out-of-opa`
-(head `8b909bb`). Other docs: `WHITEPAPER.md` (target design), `DESIGN.md` (the code),
+real tenant code, then implement. Work is on `main` (fast-forwarded from
+`identity-passthrough-grants-out-of-opa` on 2026-10-23). Other docs: `WHITEPAPER.md` (target design), `DESIGN.md` (the code),
 `docs/HANDOFF-2026-10-20.md` (what is built and running), root `HANDOFF.md` (the BERDL/Gravitino
 review).
 
@@ -131,8 +131,12 @@ enumeration is added.
 ## Changes
 
 ### Schema (`governance/app.py`)
-- `namespace_grants (namespace TEXT PRIMARY KEY, describe, read, share, write, delete TEXT[])`,
-  the same five sets as `table_entries`. `namespace` is `<catalog>` or
+- `namespace_grants (namespace TEXT PRIMARY KEY, describe, read, share, write, delete, detach
+  TEXT[])`, the same six sets as `table_entries` (`detach` was added after this section was
+  first written). An empty `detach` lets any writer of a derived output detach the table
+  (`PROVENANCE.md` 6.5), so inheriting it narrows: a namespace's `detach` restricts every table
+  under it, and a table's effective `detach` is empty only when its own and every ancestor's
+  are. `namespace` is `<catalog>` or
   `<catalog>.<namespace...>`.
 
 ### Internal lookups
@@ -151,8 +155,8 @@ enumeration is added.
 
 ### API
 - `PATCH /permissions/namespace/<id>`: new kind. `describe`/`read` change for a group holding
-  the namespace's `share`; `share`/`write`/`delete` for an admin of a group owning the
-  namespace or one above (section 1's role model).
+  the namespace's `share`; `share`/`write`/`delete`/`detach` for an admin of a group owning
+  the namespace or one above (section 1's role model).
 - `POST /tables`: accept a list of entries in one request, all under one namespace, in one
   transaction. Grants on each are optional and default to empty (inherit only). Registering
   from an ingest config's table list is the intended use.

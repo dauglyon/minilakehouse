@@ -558,9 +558,14 @@ the scratch files carried. No dataset sits inside another or inside a project fo
 nesting was rejected because a parent's write credential reaches the child's files, and
 reading one's own project folder would make the whole project a source of the child.
 
-Open: whether a scratch folder's own read grant is cut down by what its files carry (rule 3).
-That keeps a project member from reading data derived from something they may not read, but
-locks them out of the shared folder; the alternative is a scratch folder per person.
+Decided 2026-10-23: scratch is per person. Each person has a default group with themselves
+as its only member, which owns their private space (the personal space in
+`docs/HANDOFF-2026-10-22-groups.md` section 1; its name in a UI is not settled, "My Data" is a
+candidate). Rule 3 cuts that space's read grant like any other. Its one reader could read
+every source its files carry when they read them, so the cut takes the space from them only if
+they later lose `read` on one of those sources. A shared folder would
+lock out any member who may not read a source another member's files carry, which is why
+scratch is not shared.
 
 
 

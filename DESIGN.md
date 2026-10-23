@@ -491,6 +491,9 @@ reference (the sections above are current-state).
   the error's cause, which the CLI prints with `--debug`.
 - `share` carries only its change right, since derived datasets (its widening right) are
   not built.
+- A person who may describe a table but not read it still sees, in the cut metadata, the
+  current version's write time and sequence number and the metadata file's name, whose
+  leading number counts the table's commits. Kept for now (2026-10-23).
 - Polaris 1.5 refuses a token whose name has no stored principal, so the gate has governance
   create each person's on first use (`POST /principals/me`, as the `provisioner` principal,
   which OPA confines to creating principals). When a Polaris release includes the `external`
