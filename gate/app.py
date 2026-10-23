@@ -243,8 +243,8 @@ def current_only(r, keep):
     metadata would describe an empty table. The ETag goes too: Polaris issues one
     per metadata file, and a client revalidating a cut response with it would be answered 304
     after gaining read. The metadata is rebuilt from the fields named here, so one they do not
-    name is dropped, such as format v3's `next-row-id`, a running row count; a client that
-    requires it fails to load the table."""
+    name is dropped. Format v3's `next-row-id` is the number of rows ever written, and Iceberg
+    refuses v3 metadata without it, so it is 0."""
     body = r.json()
     m = body["metadata"]
     current = m.get("current-snapshot-id")
@@ -259,6 +259,7 @@ def current_only(r, keep):
                              "last-partition-id", "default-sort-order-id") if k in m},
         "properties": {k: v for k, v in (m.get("properties") or {}).items() if k in keep},
         **({"current-snapshot-id": current} if snaps else {}),
+        **({"next-row-id": 0} if m.get("format-version", 0) >= 3 else {}),
         "last-sequence-number": snaps[0].get("sequence-number", 0) if snaps else 0,
         "snapshots": snaps,
         "snapshot-log": [e for e in m.get("snapshot-log") or [] if e.get("snapshot-id") == current][-1:],
