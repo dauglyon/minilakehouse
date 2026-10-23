@@ -59,6 +59,11 @@ session therefore gives each agent its own service account, or a login that has 
 inserts a session name as each agent's first statement; agents sharing one account share a
 pointer, and an insert by one moves it for all.
 
+Keycloak's login lifetime settings affect convenience only. A login that outlives Keycloak's
+session maximum forces a re-login mid-work, and the new login's pointer continues the same
+session. Setting the maximum to an environment's intended lifetime removes the interruption.
+Unverified: whether an offline session (a long-lived refresh token) keeps a stable `sid`.
+
 What a session is not: an environment or a login. Two environments can work in one session;
 one environment can move through several. Data that stays in an environment across a session
 boundary is out-of-band carry-over, section 8, the same as a download.
@@ -361,10 +366,11 @@ dataset.
 
 ## 9. Open
 
-**Project folders.** A file written into a project folder is not a registered output, and
-sharing it means it must become a dataset. Conclusions offered on 2026-10-22, not accepted:
-a project folder is scratch, not a dataset; writing into it is not a share and reading it is
-not an input, since the project group is the trust boundary; a scratch object's provenance is
+**Project folders.** Decided 2026-10-22: a project folder is scratch, not a dataset, and a file
+written into it is not a registered output. Open: whether reading scratch is an input, since
+data a session read can reach another session, or another project member, through a scratch
+file. Conclusions offered earlier, now in question: writing into it is not a share and reading
+it is not an input, since the project group is the trust boundary; a scratch object's provenance is
 its writing session's; publishing moves the objects into a new dataset's own folder, done by
 governance, so no dataset is ever nested in another. Nesting was analysed and rejected: a
 child's audience must stay a superset of its parent's forever, which the derivation rule can
@@ -375,11 +381,6 @@ scratch, and a publish of many objects can half-fail, which `pending` already ex
 
 **Writes to a live output.** Whether a declared output may be written again without
 returning to `pending`, and if so how the new session's reads reach a future declaration.
-
-**Session lifetime settings.** With sessions decoupled from logins these are convenience: a
-login that outlives Keycloak's session maximum forces a re-login mid-work, which the default
-pointer absorbs. Setting the maximum to an environment's intended lifetime removes the
-interruption. Whether offline sessions keep a stable `sid` is unverified.
 
 
 ## 10. Evidence and build order
