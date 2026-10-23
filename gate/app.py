@@ -13,8 +13,8 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    load when neither credential check passes, so the gate repeats such a refused load once
    without the credential request. A person who may view a table but not read it can then
    DESCRIBE it; reading it fails at storage. A load that hands out no credential keeps only
-   the current version, with no counts in it, unless OPA's lakehouse.tables.allow_history
-   allows the whole metadata (current_only).
+   the current version, with no counts in it, and the properties OPA's lakehouse.tables.load
+   keeps, unless that decision allows the whole metadata (current_only).
 5. Creation. Polaris's own check for creating a table, committing a staged create, or creating
    a namespace names only the parent, so the gate decides the name: a table or view must be
    registered in governance, still pending, with the person in its write grant; a namespace
@@ -234,11 +234,12 @@ def vended(r):
     return True, int(expiry) if expiry is not None else None
 
 
-def current_only(r):
+def current_only(r, keep):
     """A table load response cut to the current version. Removed: earlier versions, the
     snapshot and metadata logs, refs other than `main`, column statistics, earlier schemas,
-    partition specs and sort orders, and every snapshot summary entry but `operation` (row and
-    file counts, the writer's name and query id). The current snapshot stays: without it the
+    partition specs and sort orders, every snapshot summary entry but `operation` (row and
+    file counts, the writer's name and query id), and the properties whose keys are not in
+    `keep`. The current snapshot stays: without it the
     metadata would describe an empty table. The ETag goes too: Polaris issues one
     per metadata file, and a client revalidating a cut response with it would be answered 304
     after gaining read. The metadata is rebuilt from the fields named here, so one they do not
@@ -255,7 +256,8 @@ def current_only(r):
     body["metadata"] = {
         **{k: m[k] for k in ("format-version", "table-uuid", "location", "last-updated-ms",
                              "last-column-id", "current-schema-id", "default-spec-id",
-                             "last-partition-id", "default-sort-order-id", "properties") if k in m},
+                             "last-partition-id", "default-sort-order-id") if k in m},
+        "properties": {k: v for k, v in (m.get("properties") or {}).items() if k in keep},
         **({"current-snapshot-id": current} if snaps else {}),
         "last-sequence-number": snaps[0].get("sequence-number", 0) if snaps else 0,
         "snapshots": snaps,
@@ -466,9 +468,18 @@ def proxy(_):
         # A 304 to a credentialed load means the engine reuses the credential it was given with
         # this table earlier, possibly in another session.
         issued, expires = vended(r)
-        if issued or (request.method == "GET" and r.status_code == 304 and delegated):
-            if named and named[0] == "table":
-                held, mode = ident([named[1], *named[2], named[3]]), "read"
+        credentialed = issued or (request.method == "GET" and r.status_code == 304 and delegated)
+        table = ident([named[1], *named[2], named[3]]) if named and named[0] == "table" else None
+        loaded = (r.json() if table and request.method == "GET" and r.status_code == 200
+                  and not issued and r.content else {})
+        # The gate's one decision on a table request (opa/tables.rego load), asked once Polaris
+        # has answered: only then are the credential and the table's properties known.
+        load = (opa("load", {"subject": subject, "id": table, "credential": credentialed,
+                             "properties": (loaded.get("metadata") or {}).get("properties") or {}})
+                or {}) if table and (credentialed or "metadata" in loaded) else {}
+        if credentialed:
+            if table:
+                held, mode = table, "read"
             elif named and named[0] == "tables" and request.method == "POST":
                 held, mode = (new_tables or [None])[0], "write"
             else:
@@ -476,15 +487,11 @@ def proxy(_):
             if not (mode == "write" and held in written):
                 # A credential handed to someone who may write the table can write it, so its
                 # time is a time they could have written files (PROVENANCE.md 6.2).
-                can_write = (mode == "read" and held is not None
-                             and opa("allow_write", {"subject": subject, "id": held}) is True)
+                can_write = mode == "read" and load.get("write") is True
                 log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
                                      "expires": expires, "can_write": can_write}])
-        if (request.method == "GET" and named and named[0] == "table" and r.status_code == 200
-                and not issued and "metadata" in (r.json() if r.content else {})
-                and opa("allow_history", {"subject": subject,
-                                          "id": ident([named[1], *named[2], named[3]])}) is not True):
-            return current_only(r)
+        if "metadata" in loaded and load.get("history") is not True:
+            return current_only(r, set(load.get("properties") or []))
         if r.status_code == 403 and named and named[2]:
             kind, catalog, levels, name = named
             # A create, or anything else on a table or view collection, names its namespace.

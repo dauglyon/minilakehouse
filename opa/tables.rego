@@ -14,8 +14,9 @@ package lakehouse.tables
 #   allow_create     input {subject, id}   gate: may create this table or view now
 #   allow_write      input {subject, id}   governance: may declare what this table was derived
 #                                          from (PROVENANCE.md 5.3)
-#   allow_history    input {subject, id}   gate: a load handing out no storage credential
-#                                          returns the table's whole metadata
+#   load             input {subject, id, credential, properties: {key: value}}
+#                    gate, once per table request that hands out a credential or loads the
+#                    metadata without one: {write, history, properties: [key]}
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_register   input {subject, id}   governance: may register this table
 #   allow_change     input {subject, id, grants: [grant]}
@@ -64,14 +65,33 @@ default allow_write := false
 
 allow_write if writable(governance.groups(input.subject), table(input.id))
 
-# A table's metadata holds more than its columns: every version, with its time, row and file
-# counts and Trino's name for the writer, earlier schemas, and column statistics. Without this,
-# a load that hands out no storage credential, which is how a person with `describe` but not
-# `read` loads a table, carries only the current version and none of the counts (gate/app.py
-# current_only). The shipped rule allows it to nobody. A deployment adds clauses here, for
-# example `allow_history if readable(governance.groups(input.subject), table(input.id))`, which
-# would let a reader whose client asked for no credential see the history.
-default allow_history := false
+# The gate's one decision on a table request, asked once Polaris has answered:
+#   write       the credential handed out can write the table, so the access log counts its
+#               lifetime as a time the person could have written files (PROVENANCE.md 6.2)
+#   history     a load that hands out no credential, which is how a person with `describe`
+#               but not `read` loads a table, returns the whole metadata. Otherwise it carries
+#               the current version without its counts (gate/app.py current_only): the metadata
+#               also holds every version with its time, row and file counts and Trino's name for
+#               the writer, earlier schemas, and column statistics.
+#   properties  the property keys such a load keeps. Properties are whatever the table's writers
+#               set: engine settings and a `comment` mostly, and also labels such as an owner's
+#               name or a data-quality figure.
+# The shipped rules show the history to nobody and keep every property. A deployment adds a
+# `_load_history` clause, for example `readable(governance.groups(input.subject),
+# table(input.id))` to show it to readers whose client asked for no credential, or replaces
+# `_load_properties`'s clause, for example with one keeping only keys that start with `write.`.
+load := {"write": _load_write, "history": _load_history, "properties": _load_properties}
+
+default _load_write := false
+
+_load_write if {
+	input.credential
+	writable(governance.groups(input.subject), table(input.id))
+}
+
+default _load_history := false
+
+_load_properties contains k if some k, _ in input.properties
 
 default allow_namespace := false
 

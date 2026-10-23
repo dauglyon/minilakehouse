@@ -144,8 +144,9 @@ passes, so the gate repeats a refused load once without the credential request: 
 table can be described through Trino, and reading it fails at storage. A load that hands out no
 credential carries the table's columns, partitioning, properties and current version; the gate
 removes earlier versions and schemas, column statistics, and the row and file counts and
-writer names in version summaries, all of which describe the contents. OPA's `allow_history`
-rule can let a person have the whole metadata; the shipped rule lets nobody.
+writer names in version summaries, all of which describe the contents. OPA's `load` rule
+decides whether a person gets the whole metadata and which properties such a load keeps; the
+shipped rules give the whole metadata to nobody and keep every property.
 
 ### 4.3 Derived datasets
 

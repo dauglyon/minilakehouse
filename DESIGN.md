@@ -95,7 +95,7 @@ files/blobs over S3) under the *same* governance model as tables.
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
 | **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, accepts governed ingest, table registration, and grant, group and root ownership changes, records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `lineage`, `derivations`), accepts declarations as commits to `governance.derivations` and signs them, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
-| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata, cut to the current version without counts unless OPA's `tables.allow_history` allows the rest; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance log each table credential it passes on and each table write it forwards, refusing the request when the log fails; has governance create a person's Polaris principal before their first request; answers for the `governance` namespace's tables itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
+| **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata, cut to the current version without counts unless OPA's `tables.load` allows the rest; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance log each table credential it passes on and each table write it forwards, refusing the request when the log fails; has governance create a person's Polaris principal before their first request; answers for the `governance` namespace's tables itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
 | **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision: `blob-vendor` to read (get, list), `blob-writer` to write (put, delete, no get), and has governance log it before returning it. No engine in the byte path. |
 | **Ceph RGW** | Object store + native STS + bucket notifications. Enforces the vended credential. |
@@ -159,7 +159,8 @@ tables.allow_register   governance  {subject, id}              POST /internal/na
 tables.allow_change     governance  {subject, id,              GET /internal/tables/<id>,   true | false
                                      grants: [grant]}            POST /internal/namespaces
 tables.allow_write      governance  {subject, id}              GET /internal/tables/<id>    true | false
-tables.allow_history    gate        {subject, id}              —                            true | false
+tables.load             gate        {subject, id, credential,  GET /internal/tables/<id>,   {write, history,
+                                     properties: {key: value}}   with a credential only       properties: [key]}
 derivations.allowed     governance  {subject, target,          POST /internal/tables,       [id]: sources that may be
                                      sources: [{id, direct}]}    POST /internal/datasets      marked unused
 groups.allow_create     governance  {subject}                  —                            true | false
@@ -168,7 +169,7 @@ allow_change_root       governance  {subject, prefix}          GET /internal/reg
 tables.allow_change_root  governance  {subject, id}            POST /internal/namespaces    true | false
 ```
 
-Every rule but `tables.allow_history`, whose shipped version fetches nothing, also fetches `GET /internal/groups/<subject>`.
+Every rule also fetches `GET /internal/groups/<subject>`, except the shipped `tables.load` on a load without a credential, which fetches nothing.
 
 One path for every caller because it is the only one Polaris can use: Polaris builds its own
 input and cannot attach an entry. Each decision makes at most one fetch; a failed fetch
@@ -352,8 +353,9 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 - **A table's history comes with a credential.** A table load that hands out no storage
   credential carries the table's columns, partitioning, properties and current version: the
   gate removes earlier versions and schemas, column statistics, and the row and file counts
-  and writer names in version summaries. OPA's `tables.allow_history` can allow the whole
-  metadata; the shipped rule allows it to nobody.
+  and writer names in version summaries. OPA's `tables.load`, the gate's one decision on a
+  table request, says whether a person gets the whole metadata and which properties such a
+  load keeps; the shipped rules give the whole metadata to nobody and keep every property.
 - **A declaration is a commit, checked before it is accepted** (`PROVENANCE.md` 5.3, 5.5). An
   engine inserting into `governance.derivations` uploads its files to governance's S3-style
   endpoint and commits through the gate. The endpoint takes uploads only under the signer's
