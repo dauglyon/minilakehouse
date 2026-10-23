@@ -24,11 +24,9 @@ import json
 import logging
 import os
 import re
-import secrets
 import ssl
 import threading
 import time
-import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -40,6 +38,8 @@ import psycopg2
 import requests
 from botocore.config import Config
 from cryptography.hazmat.primitives import serialization
+from defusedxml import DefusedXmlException
+from defusedxml.ElementTree import ParseError, fromstring as parse_xml
 from flask import Flask, Response, jsonify, request
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
@@ -1204,11 +1204,10 @@ def _s3_error(status, code):
 
 # The S3 calls engines make on the governance tables' files, served on INDEX_PORT to requests
 # addressed to governance-index.storage. The signature names the person; they may read only
-# their own prefix, and write only under their own writable tables (index_table.writable_key).
+# their own prefix, and write only under their own tables (index_table.writable_key), within
+# their upload quota (index_table.MAX_UPLOAD).
 index_app = Flask("index")
-MAX_UPLOADS = 64   # multipart uploads in progress, oldest dropped first
-_uploads = {}      # upload id -> (subject, key, {part number: bytes})
-_uploads_lock = threading.Lock()
+index_app.config["MAX_CONTENT_LENGTH"] = index_table.MAX_UPLOAD
 
 
 def _signer():
@@ -1219,6 +1218,16 @@ def _signer():
 def _xml(tag, inner, status=200):
     return Response(f'<?xml version="1.0" encoding="UTF-8"?><{tag}>{inner}</{tag}>', status=status,
                     content_type="application/xml")
+
+
+def _xml_texts(suffix):
+    """The text of every element in the request's XML body whose tag ends with suffix. defusedxml
+    refuses document type declarations, so no entity can expand."""
+    try:
+        root = parse_xml(request.get_data())
+    except (ParseError, DefusedXmlException) as e:
+        raise index_table.S3Error(400, "MalformedXML") from e
+    return [e.text or "" for e in root.iter() if e.tag.endswith(suffix)]
 
 
 def _payload():
@@ -1242,13 +1251,18 @@ def _payload():
     return raw
 
 
+@index_app.errorhandler(index_table.S3Error)
+def _refused_upload(e):
+    return _s3_error(e.status, e.code)
+
+
 @index_app.post("/")
 def index_delete_objects():
     # DeleteObjects names its keys in the body; an engine sends it to abandon a write.
     subject = _signer()
     if subject is None or "delete" not in request.args:
         return _s3_error(403, "AccessDenied")
-    keys = [e.text or "" for e in ET.fromstring(request.get_data()).iter() if e.tag.endswith("Key")]
+    keys = _xml_texts("Key")
     for k in keys:
         if index_table.writable_key(subject, k):
             index_table.delete(k)
@@ -1260,55 +1274,35 @@ def index_write(key):
     subject = _signer()
     if subject is None or not index_table.writable_key(subject, key):
         return _s3_error(403, "AccessDenied")
-    args = request.args
+    args, upload = request.args, request.args.get("uploadId")
     if request.method == "POST" and "uploads" in args:   # CreateMultipartUpload
-        upload = secrets.token_hex(16)
-        with _uploads_lock:
-            _uploads[upload] = (subject, key, {})
-            while len(_uploads) > MAX_UPLOADS:
-                _uploads.pop(next(iter(_uploads)))
+        upload = index_table.start_upload(subject, key)
         return _xml("InitiateMultipartUploadResult",
                     f"<Bucket>{index_table.BUCKET}</Bucket><Key>{escape(key)}</Key><UploadId>{upload}</UploadId>")
-    upload = args.get("uploadId")
-    with _uploads_lock:
-        state = _uploads.get(upload) if upload else None
-    if upload and (state is None or state[:2] != (subject, key)):
-        return _s3_error(404, "NoSuchUpload")
-    if request.method == "DELETE":
-        if upload:                                         # AbortMultipartUpload
-            with _uploads_lock:
-                _uploads.pop(upload, None)
-        else:                                              # DeleteObject
-            index_table.delete(key)
-        return Response(status=204)
     if request.method == "POST" and upload:                # CompleteMultipartUpload
-        numbers = [int(e.text) for e in ET.fromstring(request.get_data()).iter() if e.tag.endswith("PartNumber")]
-        parts = state[2]
-        if not numbers or any(n not in parts for n in numbers):
-            return _s3_error(400, "InvalidPart")
-        data = b"".join(parts[n] for n in numbers)
-        with _uploads_lock:
-            _uploads.pop(upload, None)
-        if not index_table.put(subject, key, data):
-            return _s3_error(403, "AccessDenied")
+        numbers = [int(n) for n in _xml_texts("PartNumber") if n.isdigit()]
+        data = index_table.complete_upload(subject, upload, key, numbers)
         etag = f'"{hashlib.md5(data).hexdigest()}-{len(numbers)}"'
         return _xml("CompleteMultipartUploadResult",
                     f"<Bucket>{index_table.BUCKET}</Bucket><Key>{escape(key)}</Key><ETag>{escape(etag)}</ETag>")
+    if request.method == "DELETE":
+        if upload:                                         # AbortMultipartUpload
+            index_table.abort_upload(subject, upload, key)
+        else:                                              # DeleteObject
+            index_table.delete(key)
+        return Response(status=204)
     if request.method != "PUT":
         return _s3_error(400, "InvalidRequest")
     data = _payload()
     if data is None:
         return _s3_error(400, "XAmzContentSHA256Mismatch")
     if upload:                                             # UploadPart
-        with _uploads_lock:
-            state[2][int(args.get("partNumber", "0"))] = data
-            held = sum(len(b) for b in state[2].values())
-        if held > index_table.MAX_UPLOAD:
-            with _uploads_lock:
-                _uploads.pop(upload, None)
-            return _s3_error(400, "EntityTooLarge")
-    elif not index_table.put(subject, key, data):          # PutObject
-        return _s3_error(403, "AccessDenied")
+        number = args.get("partNumber", "")
+        if not number.isdigit():
+            return _s3_error(400, "InvalidArgument")
+        index_table.put_part(subject, upload, key, int(number), data)
+    else:                                                  # PutObject
+        index_table.put(subject, key, data)
     return Response(status=200, headers={"ETag": f'"{hashlib.md5(data).hexdigest()}"'})
 
 

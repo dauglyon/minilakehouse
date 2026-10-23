@@ -288,13 +288,17 @@ An Iceberg write from any client is three catalog steps. The gate sees all three
    signature and keeps the bytes in memory (`governance/app.py`, `index_write`). It accepts
    PutObject, multipart uploads and DeleteObjects; it refuses a put to a key that already
    holds a file, since engines write every file once under a new name and governance's own
-   files must stay as built, and it caps a person's uploads at 64 MiB.
+   files must stay as built; it caps a person's uploads, open multipart parts included, at
+   64 MiB and eight open multipart uploads; and it parses XML bodies with defusedxml, which
+   refuses document type declarations.
 3. Commit: requirements, such as the branch still pointing at the loaded snapshot, and
    updates: `add-snapshot` naming the manifest list, `set-snapshot-ref`, and Trino's
    `set-statistics`. Governance checks the requirements against the table the person last
    loaded, so a commit against a changed table is refused the standard way, applies the
    updates with pyiceberg, follows the new snapshot's manifests to the data files it added,
-   reads their rows with pyarrow, validates them as section 5.3 says, and in one Postgres
+   refusing any file outside the person's own table, since the in-memory store holds every
+   person's files and a refusal's message would echo rows read from another's, reads their
+   rows with pyarrow, validates them as section 5.3 says, and in one Postgres
    transaction stores the record. Anything but appended rows is refused, so a `DELETE` or
    `UPDATE` fails. The response is the committed metadata, the engine's own snapshot
    included; the next load rebuilds the table from Postgres.

@@ -85,7 +85,8 @@ def _update(u):
     if isinstance(u, dict) and u.get("action") == "set-statistics" and isinstance(u.get("statistics"), dict):
         return SetStatisticsUpdate(statistics=StatisticsFile.model_validate(u["statistics"]))
     return _UPDATE.validate_python(u)
-MAX_UPLOAD = 64 * 1024 * 1024   # bytes a person may hold in uploaded files at once
+MAX_UPLOAD = 64 * 1024 * 1024   # bytes a person may hold in uploads, open multipart parts included
+MAX_OPEN_UPLOADS = 8            # multipart uploads a person may have open, oldest dropped first
 MAX_TABLES = 256          # built tables kept, least recently loaded evicted first
 CREDENTIAL_TTL = 900      # seconds a storage credential from /index/load stays valid
 CLOCK_SKEW = 900          # seconds a signed request's date may differ from now
@@ -95,6 +96,16 @@ _files = {}               # s3 path -> bytes, for every built table
 _tables = OrderedDict()   # (subject, table, version) -> {"metadata-location", "metadata"}
 _keys = {}                # access key -> (secret, session token, subject, expires)
 _current = {}             # (subject, table) -> the table the person last loaded or committed
+_uploaded = {}            # subject -> paths of the objects they uploaded
+_open = {}                # subject -> {upload id: (key, {part number: bytes})}, oldest first
+
+
+class S3Error(Exception):
+    """An upload refused with an S3 error: HTTP status and code."""
+
+    def __init__(self, status, code):
+        super().__init__(code)
+        self.status, self.code = status, code
 
 
 class Refused(Exception):
@@ -206,23 +217,35 @@ def commit(subject, name, body, check):
     except CommitFailedException as e:
         raise Refused(409, "CommitFailedException", str(e)) from e
     new = update_table_metadata(base, updates)
+    # Every file the commit names must be the person's own upload to this table: the in-memory
+    # store holds everyone's tables, and rows read from another person's file would come back
+    # to this person in a refusal's message.
+    own = f"s3://{BUCKET}/{subject}/{name}/"
+
+    def check_path(path):
+        if not path.startswith(own):
+            raise Refused(400, "BadRequestException", f"governance.{name} reads only files under {own}")
+        return path
+
     io, rows = MemIO(), []
     for snapshot in new.snapshots:
         if base.snapshot_by_id(snapshot.snapshot_id) is not None:
             continue
         if snapshot.summary is None or snapshot.summary.operation != Operation.APPEND:
             raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+        check_path(snapshot.manifest_list)
         for manifest in snapshot.manifests(io):
             if manifest.added_snapshot_id != snapshot.snapshot_id:
                 continue   # carried over from an earlier snapshot
             if manifest.content != ManifestContent.DATA:
                 raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
+            check_path(manifest.manifest_path)
             for entry in manifest.fetch_manifest_entry(io):
                 if entry.status != ManifestEntryStatus.ADDED:
                     continue
                 if entry.data_file.content != DataFileContent.DATA:
                     raise Refused(400, "BadRequestException", f"governance.{name} accepts only inserted rows")
-                data = read(entry.data_file.file_path)
+                data = read(check_path(entry.data_file.file_path))
                 if data is None:
                     raise Refused(400, "BadRequestException", f"missing data file {entry.data_file.file_path}")
                 rows += pq.read_table(pa.BufferReader(data)).to_pylist()
@@ -244,21 +267,74 @@ def writable_key(subject, key):
     return len(parts) > 2 and parts[0] == subject and parts[1] in TABLES
 
 
-def put(subject, key, data):
-    """Store an uploaded object. Refused (False) when the key already holds a file, since engines
-    write every file once under a new name and governance's own files must stay as built, or
-    when the person's uploads would exceed MAX_UPLOAD."""
+def _held(subject):
+    """Bytes the person's uploads hold: their stored objects and open multipart parts. The
+    caller holds _lock."""
+    paths = _uploaded.setdefault(subject, set())
+    paths.intersection_update(_files)   # deleted, or evicted with the table they were under
+    return (sum(len(_files[p]) for p in paths)
+            + sum(len(b) for _, parts in _open.get(subject, {}).values() for b in parts.values()))
+
+
+def _store(subject, key, data):
+    """Store an uploaded object; the caller holds _lock and has counted it against the quota.
+    A key that already holds a file is refused: engines write every file once under a new name,
+    and governance's own files must stay as built."""
     path = f"s3://{BUCKET}/{key}"
-    mine = f"s3://{BUCKET}/{subject}/"
+    if path in _files:
+        raise S3Error(403, "AccessDenied")
+    _files[path] = data
+    _uploaded.setdefault(subject, set()).add(path)
+
+
+def put(subject, key, data):
     with _lock:
-        if path in _files:
-            return False
-        held = sum(len(v) for p, v in _files.items()
-                   if p.startswith(mine) and not p.endswith(".metadata.json"))
-        if held + len(data) > MAX_UPLOAD:
-            return False
-        _files[path] = data
-    return True
+        if _held(subject) + len(data) > MAX_UPLOAD:
+            raise S3Error(400, "EntityTooLarge")
+        _store(subject, key, data)
+
+
+def start_upload(subject, key):
+    upload = secrets.token_hex(16)
+    with _lock:
+        mine = _open.setdefault(subject, OrderedDict())
+        mine[upload] = (key, {})
+        while len(mine) > MAX_OPEN_UPLOADS:
+            mine.popitem(last=False)
+    return upload
+
+
+def _upload(subject, upload, key):
+    state = _open.get(subject, {}).get(upload)
+    if state is None or state[0] != key:
+        raise S3Error(404, "NoSuchUpload")
+    return state[1]
+
+
+def put_part(subject, upload, key, number, data):
+    with _lock:
+        parts = _upload(subject, upload, key)
+        if _held(subject) - len(parts.get(number, b"")) + len(data) > MAX_UPLOAD:
+            raise S3Error(400, "EntityTooLarge")
+        parts[number] = data
+
+
+def complete_upload(subject, upload, key, numbers):
+    """Store the parts, in the order named, as one object; returns it."""
+    with _lock:
+        parts = _upload(subject, upload, key)
+        if not numbers or any(n not in parts for n in numbers):
+            raise S3Error(400, "InvalidPart")
+        data = b"".join(parts[n] for n in numbers)
+        del _open[subject][upload]   # its parts' bytes now count as the object
+        _store(subject, key, data)
+    return data
+
+
+def abort_upload(subject, upload, key):
+    with _lock:
+        _upload(subject, upload, key)
+        del _open[subject][upload]
 
 
 def delete(key):

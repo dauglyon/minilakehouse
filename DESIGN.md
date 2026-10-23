@@ -335,9 +335,9 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 - **A declaration is a commit, checked before it is accepted** (`PROVENANCE.md` 5.3, 5.5). An
   engine inserting into `governance.derivations` uploads its files to governance's S3-style
   endpoint and commits through the gate. The endpoint takes uploads only under the signer's
-  own governance tables, never over an existing file, at most 64 MiB per person. Governance
-  checks the commit's requirements against the table the person last loaded, accepts only
-  appended rows, and refuses the commit unless every target was written by the person, is in
+  own governance tables, never over an existing file, at most 64 MiB per person counting open
+  multipart parts. Governance checks the commit's requirements against the table the person
+  last loaded, reads only files under that person's own table, accepts only appended rows, and refuses the commit unless every target was written by the person, is in
   their `write`, and has each of their own candidates declared used or unused, outside inputs
   named by `sha256:` hash. An accepted declaration is stored with a DSSE envelope signed by
   governance's Ed25519 key, which the `pki` job makes beside governance's server certificate.
