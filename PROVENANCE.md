@@ -353,7 +353,10 @@ markings follow data along lineage. Three rules:
    the file marked unused (6.3).
 3. **Who may read a dataset**: a person in its own `read` grant who is also in the own `read`
    grant of every source carried by any file in its folder, through any of their groups.
-   `share` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit.
+   `share` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit, and so does
+   `write`, for files as for tables (decided 2026-10-23): a file write credential cannot get
+   or list, so without the cut someone who may not read a source would overwrite or delete
+   files they cannot see and could not read back their own.
 
 This replaces `WHITEPAPER.md` 4.3's per-dataset `inputs`. A file's sources already include
 everything upstream of it, so rule 3 needs no chain of inputs-of-inputs: it looks up each
@@ -561,11 +564,24 @@ reading one's own project folder would make the whole project a source of the ch
 Decided 2026-10-23: scratch is per person. Each person has a default group with themselves
 as its only member, which owns their private space (the personal space in
 `docs/HANDOFF-2026-10-22-groups.md` section 1; its name in a UI is not settled, "My Data" is a
-candidate). Rule 3 cuts that space's read grant like any other. Its one reader could read
-every source its files carry when they read them, so the cut takes the space from them only if
-they later lose `read` on one of those sources. A shared folder would
-lock out any member who may not read a source another member's files carry, which is why
-scratch is not shared.
+candidate). Each top-level folder in it is a dataset of its own, as under any root (the
+handoff's section 3), so what follows applies folder by folder.
+
+- The person's own reads and writes in their private space are not cut by rule 3. They could
+  read every source their files carry when they wrote them; losing `read` on a source later
+  leaves them their own copies, as a download would. Everyone else is cut there as anywhere,
+  and sharing a folder still takes `share` on every source it carries.
+- A source's root owners can take a person's own copies back. Each source has a list of
+  groups (name not settled); for anyone in a listed group the exemption does not apply to
+  anything carrying that source, private space included. One person is named through their
+  group of one. Additions are recorded with who made them and when, shown to the source's
+  `share` holders, and reversible, as detaches are (6.5). Credentials already handed out last
+  until they expire, and files the person downloaded are out of reach (section 8).
+- The exemption is a rule in OPA. A deployment that wants losing `read` on a source to reach
+  every copy derived from it, as Palantir Foundry's markings do, turns it off.
+
+A shared folder would lock out any member who may not read a source another member's files
+carry, which is why scratch is not shared.
 
 
 

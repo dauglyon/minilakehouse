@@ -129,6 +129,8 @@ request, since every rule looks the person's groups up at decision time.
   audience of datasets built from it.
 - **write**: for a file dataset, a write credential for its folder, which permits put and
   delete and not get; for a table, creating it and performing DDL and data writes on it.
+  Writing is narrowed by what a dataset was built from exactly as reading is, so no one writes
+  into a dataset they may not read.
 - **delete**: for a table, dropping it, which also removes its files. Writing a table does
   not include dropping it. A file dataset has no `delete`: its `write` credential already
   deletes objects.

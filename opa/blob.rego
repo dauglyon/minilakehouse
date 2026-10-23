@@ -32,14 +32,18 @@ vend := {"allow": true, "prefix": e.prefix} if {
 	_reads(e)
 }
 
-# Writing (WHITEPAPER 4.2): put and delete in the dataset's folder, granted by `write` alone; it
-# implies neither `describe` nor `read`.
+# Writing (WHITEPAPER 4.2): put and delete in the dataset's folder, granted by `write`; it
+# implies neither `describe` nor `read`. Rule 3 cuts it as it cuts reading, as for tables: the
+# credential cannot get or list, so someone who may not read a source the folder's files carry
+# would otherwise overwrite or delete files they cannot see, and could not read back their own.
 default vend_write := {"allow": false}
 
 vend_write := {"allow": true, "prefix": e.prefix} if {
 	e := _entries[input.dataset]
-	some g in _groups
-	g in e.write
+	_holds(e.write)
+	every s in object.get(e, "sources", []) {
+		_holds(s.read)
+	}
 }
 
 discover := {"visible": visible, "readable": readable}

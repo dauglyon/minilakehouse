@@ -346,7 +346,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   so a file carries what its writers had read before writing it, minus what they declared
   unused. The lookups OPA makes return each dataset's own grants and the sources its files
   carry, with each source's own `read` and `share` and whether a declaration says it was used;
-  OPA's rules let a person read, or for a table write, only if they may also read every
+  OPA's rules let a person read or write only if they may also read every
   source, and change `describe` and `read` only if they also hold `share` on every source.
   `describe` and `delete` are not cut. How undeclared data is treated is a rule a deployment
   can change. A commit counts before a listing can see its files.
