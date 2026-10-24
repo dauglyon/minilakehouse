@@ -71,6 +71,13 @@ TABLES = {
     "derivations": _schema(("source", StringType), ("source_type", StringType),  # + external
                            ("target", StringType), ("used", BooleanType),
                            ("declared_by", StringType), ("declared_at", TimestamptzType)),
+    "releases": _schema(("id", StringType), ("target", StringType), ("source", StringType),
+                        ("grantee", StringType), ("status", StringType),  # pending | approved | declined | withdrawn
+                        ("requested_by", StringType), ("requested_at", TimestamptzType),
+                        ("decided_by", StringType), ("decided_at", TimestamptzType),
+                        ("withdrawn_by", StringType), ("withdrawn_at", TimestamptzType)),
+    "grants": _schema(("entry", StringType), ("kind", StringType),   # Unity Catalog's column names
+                      ("privilege_type", StringType), ("grantee", StringType)),
 }
 WRITABLE = {"derivations"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine

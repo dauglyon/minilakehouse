@@ -43,6 +43,16 @@ may_reattach contains s.id if {
 	g in _entry(s.id).share
 }
 
+# Approving, declining or withdrawing a release past a source (6.7): a holder of the source's
+# `share`, as for putting a source back.
+#
+#   may_release   input {subject, sources: [{id}]}   the ids whose releases the subject decides
+may_release contains s.id if {
+	some s in input.sources
+	some g in governance.groups(input.subject)
+	g in _entry(s.id).share
+}
+
 _ids := [s.id | some s in input.sources]
 
 _tables := governance.post("/internal/tables", {"ids": _ids}).entries

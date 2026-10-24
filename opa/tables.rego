@@ -118,10 +118,11 @@ allow_register if {
 	namespace_owned(gs, namespace(_parent(input.id)))
 }
 
-# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the table;
-# `share`, `write`, `delete` and `detach` by a group owning its namespace, the ownership
-# registration checks: `detach` decides how far the table's protection follows its data
-# (PROVENANCE.md 6.5), as `share` does.
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the table
+# itself; a group added that may not read a source stays blocked by rule 3 until the source's
+# share holders release the table to it (PROVENANCE.md 6.7). `share`, `write`, `delete` and
+# `detach` by a group owning its namespace, the ownership registration checks: `detach` decides
+# how far the table's protection follows its data (6.5), as `share` does.
 default allow_change := false
 
 allow_change if {
@@ -135,7 +136,7 @@ allow_change if {
 
 _may_change(gs, e, g) if {
 	g in {"describe", "read"}
-	shares(gs, e)
+	_holds(gs, e.share)
 }
 
 _may_change(gs, _, g) if {
@@ -161,13 +162,16 @@ _parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
 }
 
 # A table's grants, and the sources its files carry (PROVENANCE.md 6, rule 3). Governance's
-# entry lists each source with its own `read` and `share` grants and whether a declaration says
-# it was used (`declared`), or it is there because a writer has not declared yet. The shipped
-# rules treat both alike: a person may read or write the table only if they may also read every
-# source, through any of their groups. A deployment changes how undeclared data is treated
-# here, for example by requiring `s.declared` in viewable's describe clause. For tables, write
-# implies read: writing an Iceberg table reads its metadata, and the credential Polaris vends
-# for writing can read the files.
+# entry lists each source with its own `read` and `share` grants, whether a declaration says it
+# was used (`declared`) or it is there because a writer has not declared yet, and `released`:
+# for each path the source arrived by, the groups a release lets past it (6.7). The shipped
+# rules treat declared and undeclared alike: a person may read or write the table only if, for
+# every source, they may read it or a release covers them on every path; writing needs it
+# because a writer who could not read the table's data would be writing blind. A deployment
+# changes how undeclared data
+# is treated here, for example by requiring `s.declared` in viewable's describe clause. For
+# tables, write implies read: writing an Iceberg table reads its metadata, and the credential
+# Polaris vends for writing can read the files.
 readable(groups, e) if {
 	_holds(groups, array.concat(e.read, e.write))
 	sources_allow(groups, e)
@@ -185,16 +189,19 @@ writable(groups, e) if {
 	sources_allow(groups, e)
 }
 
-shares(groups, e) if {
-	_holds(groups, e.share)
+sources_allow(groups, e) if {
 	every s in object.get(e, "sources", []) {
-		_holds(groups, s.share)
+		source_admits(groups, s)
 	}
 }
 
-sources_allow(groups, e) if {
-	every s in object.get(e, "sources", []) {
-		_holds(groups, s.read)
+source_admits(groups, s) if _holds(groups, s.read)
+
+source_admits(groups, s) if {
+	released := object.get(s, "released", [])
+	count(released) > 0
+	every path in released {
+		_holds(groups, path)
 	}
 }
 

@@ -164,6 +164,8 @@ tables.load             gate        {subject, id, credential,  GET /internal/tab
                                      properties: {key: value}}   with a credential only       properties: [key]}
 derivations.allowed     governance  {subject, target,          POST /internal/tables,       [id]: sources that may be
                                      sources: [{id, direct}]}    POST /internal/datasets      marked unused
+derivations.may_release governance  {subject, sources: [{id}]} POST /internal/tables,       [id]: sources whose releases
+                                                                 POST /internal/datasets      the subject decides
 groups.allow_create     governance  {subject}                  —                            true | false
 groups.allow_change     governance  {subject, group}           GET /internal/group-owners/<group>  true | false
 allow_change_root       governance  {subject, prefix}          GET /internal/register-grants  true | false
@@ -348,7 +350,8 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   unused. The lookups OPA makes return each dataset's own grants and the sources its files
   carry, with each source's own `read` and `share` and whether a declaration says it was used;
   OPA's rules let a person read or write only if they may also read every
-  source, and change `describe` and `read` only if they also hold `share` on every source.
+  source or a release covers them (`PROVENANCE.md` 6.7), and change `describe` and `read` with
+  `share` on the entry itself; a source's own `share` holders decide releases past it.
   `describe` and `delete` are not cut. How undeclared data is treated is a rule a deployment
   can change. A commit counts before a listing can see its files.
 - **A table's history comes with a credential.** A table load that hands out no storage

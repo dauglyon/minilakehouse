@@ -233,6 +233,25 @@ CREATE INDEX IF NOT EXISTS accesses_person ON accesses (person, mode, at);
 -- in the table's write grant can write, so its time counts as a time they could have written.
 ALTER TABLE accesses ADD COLUMN IF NOT EXISTS sources TEXT[];
 ALTER TABLE accesses ADD COLUMN IF NOT EXISTS can_write BOOLEAN NOT NULL DEFAULT false;
+-- For each source a read brought in through the dataset read, the datasets it arrived through,
+-- once per path: {source: [[dataset, ...], ...]}. A release of any of them covers it (6.7).
+ALTER TABLE accesses ADD COLUMN IF NOT EXISTS marks JSONB;
+-- Releases (PROVENANCE.md 6.7): a target's share holder asks for a source's share holders to
+-- let a group read the target although the group may not read the source.
+CREATE TABLE IF NOT EXISTS releases (
+    id           BIGSERIAL PRIMARY KEY,
+    target       TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    grp          TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    approved     BOOLEAN,                    -- null until decided
+    decided_by   TEXT,
+    decided_at   TIMESTAMPTZ,
+    withdrawn_by TEXT,
+    withdrawn_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS releases_source ON releases (source, target);
 CREATE INDEX IF NOT EXISTS accesses_dataset ON accesses (dataset, mode);
 -- The files in each dataset's folder, as the last listing of it found them (6.2).
 CREATE TABLE IF NOT EXISTS files (
@@ -559,20 +578,22 @@ WITH f AS (
     SELECT LEAST(now(), w.until), w.person, w.session, w.sid, w.at FROM w
     LEFT JOIN folder_listings l ON l.dataset = %(t)s
     WHERE %(unlisted)s OR (w.instant AND w.until + %(tol)s * interval '1 second' > l.listed_at)
-), brought AS (
-    SELECT DISTINCT fw.person, fw.lm, s.source
+), brought AS (  -- with each path the source arrived by: [] for the dataset read itself
+    SELECT DISTINCT fw.person, fw.lm, s.source, p.path
     FROM fw JOIN accesses r ON r.person = fw.person AND r.mode = 'read'
          AND r.at < fw.lm + %(slack)s * interval '1 second'
          AND (r.session = fw.session OR (r.sid = fw.sid AND r.at >= fw.at))
     CROSS JOIN LATERAL unnest(COALESCE(r.sources, ARRAY[r.dataset])) AS s(source)
+    CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.marks -> s.source, '[[]]'::jsonb)) AS p(path)
 ), covered AS (  -- each file's source with the writer's declaration covering the file, if any
-    SELECT b.source, (
+    SELECT b.source, b.path, (
         SELECT max(d.id) FROM declarations d
         WHERE d.person = b.person AND d.target = %(t)s AND NOT d.reattach
           AND d.declared_at >= b.lm + %(slack)s * interval '1 second') AS declaration
     FROM brought b WHERE b.source <> %(t)s
 )
-SELECT c.source, bool_and(c.declaration IS NOT NULL) AS declared FROM covered c
+SELECT c.source, bool_and(c.declaration IS NOT NULL) AS declared, jsonb_agg(DISTINCT c.path) AS paths
+FROM covered c
 WHERE NOT EXISTS (
     SELECT 1 FROM declared_sources ds JOIN declarations dd ON dd.id = ds.declaration
     WHERE ds.declaration = c.declaration AND ds.source = c.source AND NOT ds.used
@@ -586,8 +607,9 @@ GROUP BY c.source ORDER BY 1
 
 def carried(ds_id):
     """The sources the files in a dataset's folder carry, each with whether a declaration says it
-    was used (declared) rather than its being there because a writer has not declared yet,
-    as [{id, declared}]. The folder is listed first if it never
+    was used (declared) rather than its being there because a writer has not declared yet, and
+    the paths it arrived by, each the datasets it passed through, as [{id, declared, paths}].
+    The folder is listed first if it never
     has been, or if a credential that could write it has expired since the last listing, so
     that what it wrote, or did not, is settled by storage even if a notification was lost."""
     unlisted = _folder(ds_id) is None
@@ -606,7 +628,8 @@ def carried(ds_id):
     with db() as cur:
         cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "slack": FILE_TIME_SLACK,
                                    "unlisted": unlisted})
-        return [{"id": r["source"], "declared": r["declared"]} for r in cur.fetchall()]
+        return [{"id": r["source"], "declared": r["declared"], "paths": r["paths"]}
+                for r in cur.fetchall()]
 
 
 def _own_grants(ids):
@@ -620,13 +643,31 @@ def _own_grants(ids):
     return own
 
 
+def _released(target, sources):
+    """{source: [[group]]}: for each carried source, one list per path it arrived by, of the
+    groups an approved release not withdrawn lets past it, made on this target or on a dataset
+    that path passed through (PROVENANCE.md 6.7)."""
+    with db() as cur:
+        cur.execute("SELECT target, source, grp FROM releases WHERE source = ANY(%s) AND approved "
+                    "AND withdrawn_at IS NULL", ([c["id"] for c in sources],))
+        active = {}
+        for r in cur.fetchall():
+            active.setdefault((r["source"], r["target"]), set()).add(r["grp"])
+    return {c["id"]: [sorted(set().union(*(active.get((c["id"], d), set()) for d in {*path, target})))
+                      for path in c["paths"]]
+            for c in sources}
+
+
 def _with_sources(ds_id, entry):
     """The entry as stored, with the sources its files carry: each source's own read and share
-    grants and whether a declaration says it was used. OPA's rules decide what they mean
-    (PROVENANCE.md 6, rule 3); a source with no entry has no grants, so it admits no one."""
+    grants, whether a declaration says it was used, and the groups released past it on each path
+    it arrived by. OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no
+    entry has no grants, so it admits no one."""
     sources = carried(ds_id)
     own = _own_grants([c["id"] for c in sources])
-    return {**entry, "sources": [{**c, **own.get(c["id"], {"read": [], "share": []})} for c in sources]}
+    released = _released(ds_id, sources)
+    return {**entry, "sources": [{"id": c["id"], "declared": c["declared"], "released": released[c["id"]],
+                                  **own.get(c["id"], {"read": [], "share": []})} for c in sources]}
 
 
 def reconcile(ds_id):
@@ -811,17 +852,27 @@ def record_accesses():
     body = request.get_json(silent=True) or {}
     if not _accesses_valid(body):
         return jsonify({"error": "person, sub, sid and entries [{dataset, kind, mode, expires}] required"}), 400
-    # A read keeps the sources it brought in: the dataset and what its files carry now (rule 1).
-    brought = {i: [e["dataset"], *(c["id"] for c in carried(e["dataset"]))] if e["mode"] == "read" else None
-               for i, e in enumerate(body["entries"])}
+    # A read keeps the sources it brought in: the dataset and what its files carry now (rule 1),
+    # and, for each carried source, the datasets it arrived through on each path: this one and
+    # those the path had passed (6.7).
+    brought, marks = {}, {}
+    for i, e in enumerate(body["entries"]):
+        if e["mode"] != "read":
+            brought[i] = marks[i] = None
+            continue
+        sources = carried(e["dataset"])
+        brought[i] = [e["dataset"], *(c["id"] for c in sources)]
+        marks[i] = json.dumps({c["id"]: [list(p) for p in sorted({tuple(sorted({*path, e["dataset"]}))
+                                                                   for path in c["paths"]})]
+                               for c in sources})
     with db(commit=True) as cur:
         session = _pointer(cur, body["person"], body["sid"], create=True)
         for i, e in enumerate(body["entries"]):
             cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires, "
-                        "sources, can_write) VALUES (%s, %s, %s, %s, %s, %s, %s, "
-                        "to_timestamp(%s / 1000.0), %s, %s)",
+                        "sources, can_write, marks) VALUES (%s, %s, %s, %s, %s, %s, %s, "
+                        "to_timestamp(%s / 1000.0), %s, %s, %s)",
                         (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
-                         e["mode"], e.get("expires"), brought[i], e.get("can_write", False)))
+                         e["mode"], e.get("expires"), brought[i], e.get("can_write", False), marks[i]))
         cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
         name = cur.fetchone()["name"]
     app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,
@@ -1424,6 +1475,174 @@ def _declare(subject, rows):
         for t, c in checked.items()))
 
 
+@app.post("/declarations")
+def declare():
+    # The same declaration as an insert into governance.derivations (PROVENANCE.md 5.3), for a
+    # client with no Iceberg engine: {"rows": [{source, source_type, target, used}]}, checked,
+    # stored and signed by the same code. The check depends only on the person, not the login.
+    subject, err = authed_user()
+    if err:
+        return err
+    rows = (request.get_json(silent=True) or {}).get("rows")
+    if not (isinstance(rows, list) and rows and all(
+            isinstance(r, dict) and set(r) <= {"source", "source_type", "target", "used"} for r in rows)):
+        return jsonify({"error": "rows must be [{source, source_type, target, used}]"}), 400
+    try:
+        _declare(subject, [{"source": r.get("source"), "source_type": r.get("source_type"),
+                            "target": r.get("target"), "used": r.get("used"),
+                            "declared_by": None, "declared_at": None} for r in rows])
+    except index_table.Refused as e:
+        app.logger.info("REFUSE declaration person=%s: %s", subject, e.message)
+        return jsonify({"error": e.message}), e.status
+    return jsonify({"ok": True, "targets": sorted({r["target"] for r in rows})}), 201
+
+
+def _kind(entry_id):
+    """("tables", "id") for a table id, ("blob", "dataset") for a file dataset's: the OPA package
+    deciding about it and the input key it names the entry by."""
+    return ("tables", "id") if TABLE_ID_RE.match(entry_id) else ("blob", "dataset")
+
+
+def _own_read(entry_id):
+    """The groups in an entry's own read grant (a table's write included), or None if it has no
+    entry."""
+    with db() as cur:
+        if TABLE_ID_RE.match(entry_id):
+            cur.execute("SELECT read || write AS r FROM table_entries WHERE id = %s", (entry_id,))
+        else:
+            cur.execute("SELECT access AS r FROM datasets WHERE id = %s", (entry_id,))
+        row = cur.fetchone()
+    return None if row is None else set(row["r"])
+
+
+@app.post("/releases")
+def request_release():
+    # Ask a source's share holders to let a group read a target built from it (PROVENANCE.md
+    # 6.7): {target, source, group}, by someone who may change who reads the target, once the
+    # group is in its read grant and its declarations mark the source used.
+    subject, err = authed_user()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    target, source, grp = body.get("target"), body.get("source"), body.get("group")
+    if not all(isinstance(v, str) and v for v in (target, source, grp)) or not GROUP_RE.match(grp):
+        return jsonify({"error": "target, source and group required"}), 400
+    package, key = _kind(target)
+    readers = _own_read(target)
+    if readers is None or opa("allow_change", {"subject": subject, key: target, "grants": ["read"]},
+                              package=package) is not True:
+        return jsonify({"error": "forbidden"}), 403
+    if grp not in readers:
+        return jsonify({"error": f"add {grp} to {target}'s read grant first"}), 409
+    carried_by = {c["id"]: c for c in carried(target)}
+    if source not in carried_by:
+        return jsonify({"error": f"{source} is not a source of {target}"}), 409
+    if not carried_by[source]["declared"]:
+        return jsonify({"error": f"declare {target}'s sources first: {source} is undeclared"}), 409
+    if grp in (_own_read(source) or set()):
+        return jsonify({"error": f"{grp} may already read {source}"}), 409
+    with db(commit=True) as cur:
+        cur.execute("SELECT 1 FROM releases WHERE target = %s AND source = %s AND grp = %s "
+                    "AND withdrawn_at IS NULL AND approved IS NOT FALSE", (target, source, grp))
+        if cur.fetchone():
+            return jsonify({"error": "already requested or released"}), 409
+        cur.execute("INSERT INTO releases (target, source, grp, requested_by) VALUES (%s, %s, %s, %s) "
+                    "RETURNING id", (target, source, grp, subject))
+        rid = cur.fetchone()["id"]
+    app.logger.info("RELEASE-REQUEST id=%s subject=%s target=%s source=%s group=%s",
+                    rid, subject, target, source, grp)
+    return jsonify({"id": rid, "status": "pending"}), 201
+
+
+def _may_release(subject, source):
+    """Whether the subject may approve, decline or withdraw releases past this source: a holder
+    of its share, as opa/derivations.rego may_release decides."""
+    return source in (opa("may_release", {"subject": subject, "sources": [{"id": source}]},
+                          package="derivations") or [])
+
+
+@app.post("/releases/<int:rid>/<decision>")
+def decide_release(rid, decision):
+    subject, err = authed_user()
+    if err:
+        return err
+    if decision not in ("approve", "decline"):
+        return jsonify({"error": "not found"}), 404
+    with db(commit=True) as cur:
+        cur.execute("SELECT source FROM releases WHERE id = %s AND approved IS NULL "
+                    "AND withdrawn_at IS NULL FOR UPDATE", (rid,))
+        row = cur.fetchone()
+        if row is None or not _may_release(subject, row["source"]):
+            return jsonify({"error": "no pending request you may decide"}), 404
+        cur.execute("UPDATE releases SET approved = %s, decided_by = %s, decided_at = now() WHERE id = %s",
+                    (decision == "approve", subject, rid))
+    app.logger.info("RELEASE-%s id=%s subject=%s", decision.upper(), rid, subject)
+    return jsonify({"id": rid, "status": "approved" if decision == "approve" else "declined"})
+
+
+@app.delete("/releases/<int:rid>")
+def withdraw_release(rid):
+    # Withdrawn by a share holder of the source, or, while pending, by whoever asked.
+    subject, err = authed_user()
+    if err:
+        return err
+    with db(commit=True) as cur:
+        cur.execute("SELECT source, requested_by, approved FROM releases WHERE id = %s "
+                    "AND withdrawn_at IS NULL AND approved IS NOT FALSE FOR UPDATE", (rid,))
+        row = cur.fetchone()
+        if row is None or not (_may_release(subject, row["source"])
+                               or (row["approved"] is None and row["requested_by"] == subject)):
+            return jsonify({"error": "no release you may withdraw"}), 404
+        cur.execute("UPDATE releases SET withdrawn_by = %s, withdrawn_at = now() WHERE id = %s",
+                    (subject, rid))
+    app.logger.info("RELEASE-WITHDRAW id=%s subject=%s", rid, subject)
+    return jsonify({"id": rid, "status": "withdrawn"})
+
+
+# governance.releases: the releases a person asked for, and those on targets or past sources
+# whose share one of their groups holds.
+_RELEASES_SQL = """
+SELECT r.id::text AS id, r.target, r.source, r.grp AS grantee,
+       CASE WHEN r.withdrawn_at IS NOT NULL THEN 'withdrawn' WHEN r.approved THEN 'approved'
+            WHEN r.approved = false THEN 'declined' ELSE 'pending' END AS status,
+       r.requested_by, r.requested_at, r.decided_by, r.decided_at, r.withdrawn_by, r.withdrawn_at
+FROM releases r
+WHERE r.requested_by = %(p)s
+   OR EXISTS (SELECT 1 FROM datasets d WHERE d.id IN (r.target, r.source) AND d.share && %(g)s::text[])
+   OR EXISTS (SELECT 1 FROM table_entries t WHERE t.id IN (r.target, r.source) AND t.share && %(g)s::text[])
+ORDER BY r.id
+"""
+
+
+def _release_rows(subject):
+    with db() as cur:
+        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
+        groups = [r["grp"] for r in cur.fetchall()]
+        cur.execute(_RELEASES_SQL, {"p": subject, "g": groups})
+        return cur.fetchall()
+
+
+def _grant_rows(subject):
+    """governance.grants: every grant on the entries governance.datasets lists for the subject,
+    one row per group, as Unity Catalog's privilege views list them."""
+    seen = _index_rows(subject)
+    files = [r["id"] for r in seen if r["kind"] == "files"]
+    tables = [r["id"] for r in seen if r["kind"] == "table"]
+    rows = []
+    with db() as cur:
+        cur.execute('SELECT id, describe, access AS read, share, write, detach, "delete" FROM datasets '
+                    "WHERE id = ANY(%s)", (files,))
+        for r in cur.fetchall():
+            rows += [{"entry": r["id"], "kind": "files", "privilege_type": g, "grantee": grp}
+                     for g in ("describe", "read", "share", "write", "detach", "delete") for grp in r[g]]
+        cur.execute('SELECT id, describe, read, share, write, "delete", detach FROM table_entries '
+                    "WHERE id = ANY(%s)", (tables,))
+        for r in cur.fetchall():
+            rows += [{"entry": r["id"], "kind": "table", "privilege_type": g, "grantee": grp}
+                     for g in ("describe", "read", "share", "write", "delete", "detach") for grp in r[g]]
+    return sorted(rows, key=lambda r: (r["entry"], r["privilege_type"], r["grantee"]))
+
+
 def _iceberg_error(status, kind, message):
     return jsonify({"error": {"message": message, "type": kind, "code": status}}), status
 
@@ -1469,6 +1688,10 @@ def index_load():
         rows = _lineage_rows(subject)
     elif name == "derivations":
         rows = _derivation_rows(subject)
+    elif name == "releases":
+        rows = _release_rows(subject)
+    elif name == "grants":
+        rows = _grant_rows(subject)
     else:
         return jsonify({"error": "no such table"}), 404
     table = index_table.build(subject, name, rows)

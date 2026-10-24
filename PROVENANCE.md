@@ -356,7 +356,8 @@ markings follow data along lineage. Three rules:
    `share` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit, and so does
    `write`, for files as for tables (decided 2026-10-23): a file write credential cannot get
    or list, so without the cut someone who may not read a source would overwrite or delete
-   files they cannot see and could not read back their own.
+   files they cannot see and could not read back their own. A release past a source (6.7)
+   counts as its `read` here.
 
 This replaces `WHITEPAPER.md` 4.3's per-dataset `inputs`. A file's sources already include
 everything upstream of it, so rule 3 needs no chain of inputs-of-inputs: it looks up each
@@ -523,7 +524,10 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   Reading the target brings in the source marked with the release, so data built from the
   target carries the mark and the group may read that too. Data that took the source by
   another path is not covered and still needs the source's `read`.
-- **Read only.** A release grants `read`; the group cannot release the target further.
+- **Reading, and writing what it reads.** A release lets its group past the source wherever
+  rule 3 asks for the source's `read`, for writing as for reading: writing needs it only so
+  that no one writes blind, and the group can read what it writes. It does not let the group
+  release the target further.
 - **Recorded, visible, withdrawable.** A release is stored with who requested and approved it
   and when, shown to the source's `share` holders, and withdrawn by any of them. A release
   stays when its approver later loses `share` on the source.
@@ -531,6 +535,20 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   closes to the group, and so does everything built from it that people read only through
   the release, except a person's own copies in their private space (section 9), which stay
   theirs unless the source's owners add them to its `revoked`.
+- **How it is carried.** A read records, for each source it brings in, the datasets the source
+  arrived through on each path. Governance's lookups give OPA, for each source a dataset
+  carries, the groups released past it on each path: releases on the dataset itself or on any
+  dataset the path passed through. Rule 3 admits a person who may read the source or is in
+  such a group on every path, so a release approved after a read still covers what that read
+  produced.
+- **Calls and tables.** `POST /releases {target, source, group}` asks,
+  `POST /releases/<id>/approve` or `/decline` decides, `DELETE /releases/<id>` withdraws (a
+  pending request also by whoever asked); grant changes are HTTP too (`PATCH /permissions`),
+  as Trino's Iceberg connector refuses `GRANT`. `governance.releases` shows a person the
+  releases they asked for and those on targets or past sources whose `share` they hold, and
+  `governance.grants` the grants on every entry `governance.datasets` shows them, in Unity
+  Catalog's column names. A declaration can also be posted as `POST /declarations`, checked by
+  the same code as the insert.
 
 ## 7. What this enforces, decides, declares
 
@@ -603,8 +621,9 @@ handoff's section 3), so what follows applies folder by folder.
 
 - The person's own reads and writes in their private space are not cut by rule 3. They could
   read every source their files carry when they wrote them; losing `read` on a source later
-  leaves them their own copies, as a download would. Everyone else is cut there as anywhere,
-  and sharing a folder still takes `share` on every source it carries.
+  leaves them their own copies, as a download would. Everyone else is cut there as anywhere:
+  whoever the person shares a folder with is held to its sources unless a release (6.7) covers
+  them.
 - A source's root owners can take a person's own copies back. Each source has `revoked`, a
   set of groups; for anyone in one of them the exemption does not apply to
   anything carrying that source, private space included. One person is named through their
@@ -713,6 +732,21 @@ attribution (4.2).
     index, a broker vend and `seed/check-index-narrowing.py` were as before. A syntax error
     in the lookup's query denied every read during the change, which is the fail-closed path
     working.
+15. Releases, run on the stack 2026-10-24. alice built `rel1` from `t1`, readable by
+    `jgi-writers` and `projw-team`; carol (`projw-team`) was refused it. A release request
+    before declaring was refused ("declare lakehouse.db.rel1's sources first"); alice declared
+    over `POST /declarations` and asked; carol could not decide it (no `share` on `t1`), alice
+    approved, and carol read `rel1`. In a fresh session carol built `rel4` from `rel1` and read
+    it. `rel3`, built by alice from `rel1` and from `t1` directly, stayed closed to carol, and
+    the lookup showed `t1` on two paths, one released and one not. Holding `share` on `rel1`
+    alone, carol added a group to its `read` and asked for a release for it. alice withdrew
+    the release; carol lost `rel1` and `rel4`, alice kept `rel1`. carol could drop `rel4`,
+    whose `delete` she held, only after giving her group `describe` on it, since Trino loads a
+    table before dropping it. Found on the way: rule 3 must admit a release for writing as for
+    reading, or carol could not build anything from what she was allowed to read; and test
+    entries deleted from the registry instead of marked `gone` left reads that named them,
+    and a source with no entry admits no one, so alice could not write until they were put
+    back as `gone`.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
@@ -742,7 +776,7 @@ Build order, each step usable on its own:
    arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
    columns with detaches shown to the source's `share` holders, and putting a source back.
 3. The `sessions` lever as an insert.
-4. Releases (6.7).
+4. Releases (6.7). Built 2026-10-24.
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
 and 11, and its section 4.2's list of grants, which gains `detach`, change when step 2 lands.

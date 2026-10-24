@@ -377,8 +377,7 @@ Build step 1 of `PROVENANCE.md`. Governance logs every dataset credential handed
 and every table write, stamped with the session the person's login points at, before the gate
 or the broker passes it on; when the log fails, the request is refused. A person's first
 access starts a session named `default`, and a new login continues the most recently used
-session. Naming and switching sessions, and declaring what an output was derived from, are
-not built yet.
+session. Naming and switching sessions is not built yet.
 
 `governance.lineage` has the shape of Unity Catalog's `system.access.table_lineage`: a read
 is a row with an empty target, and a write is a row for each read of its session before it.
@@ -425,7 +424,40 @@ source that arrived through a read, such as `t1` in a copy of a table made from 
 detached by naming it unused once its data is gone; its `detach` grant says who may, and
 holders of its `share` see every detach and can put the source back. A write needs no
 declaration: until the writer declares, everything that could be in the data limits who may
-read it, and declaring widens that.
+read it, and declaring widens that. The same declaration can be posted to governance as
+`POST /declarations` with `{"rows": [{source, source_type, target, used}]}`, for a client with
+no Iceberg engine; it is checked, stored and signed by the same code.
+
+A release (`PROVENANCE.md` 6.7) lets a group read a dataset built from a source the group may
+not read, with the source's owners' approval. A `share` holder of the target asks, once the
+group is in the target's `read` and the target's declarations mark the source used; a `share`
+holder of the source approves or declines, and any of them can withdraw it. What the group
+builds from the target stays readable to it; data that took the source by another path does
+not. Run in-network, as alice, who holds `share` on both `rel1` and `t1`, once she has built
+`lakehouse.db.rel1` from `t1`, registered with `read` for `jgi-writers` and `projw-team`, and
+declared it with `t1` used:
+
+```bash
+docker compose exec -T governance python -c "
+import subprocess, requests
+t = subprocess.run(['python', '/seed/user_token.py', 'alice', 'governance'], capture_output=True, text=True).stdout.strip()
+h = {'Authorization': 'Bearer ' + t}
+r = requests.post('http://localhost:8000/releases', headers=h,
+                  json={'target': 'lakehouse.db.rel1', 'source': 'lakehouse.db.t1', 'group': 'projw-team'})
+print(r.json())
+print(requests.post(f'http://localhost:8000/releases/{r.json()[\"id\"]}/approve', headers=h).json())"
+#  -> {'id': 1, 'status': 'pending'}     (409 'declare lakehouse.db.rel1's sources first: ...' before declaring)
+#  -> {'id': 1, 'status': 'approved'}    (DELETE /releases/1 withdraws it)
+q carol --execute "SELECT * FROM iceberg.db.rel1"
+#  -> "1","10"
+q alice --execute "SELECT id, target, source, grantee, status FROM iceberg.governance.releases"
+#  -> "1","lakehouse.db.rel1","lakehouse.db.t1","projw-team","approved"
+```
+
+`governance.grants` lists every grant on the entries `governance.datasets` shows the person,
+with Unity Catalog's column names (`privilege_type`, `grantee`). Changing grants and releasing
+are HTTP calls, since Trino's Iceberg connector refuses `GRANT` ("This connector does not
+support grants on tables").
 
 ## Security model
 
@@ -436,8 +468,10 @@ read it, and declaring widens that.
   to what may be viewed) / creating (a registered table with the person in its `write`, or a
   schema under one their group owns) / writes and read-write credentials (`write`) /
   dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `vend`
-  (read) / `vend_write` (write) / `visible` (describe or read) / `allow_register` (ingest). Grant changes (`allow_change` in
-  both): `describe` and `read` by `share` holders; `share`, `write` and `delete` by root owners.
+  (read) / `vend_write` (write) / `vend_delete` (delete) / `visible` (describe or read) /
+  `allow_register` (ingest). Grant changes (`allow_change` in
+  both): `describe` and `read` by `share` holders of the entry itself, sources being the
+  business of releases; `share`, `write`, `delete` and `detach` by root owners.
   Group changes (`opa/groups.rego`): a group's owners change its members and owners;
   `group-admins` create groups. Root ownership (`allow_change_root` in `blob.rego` and
   `tables.rego`): `group-admins` for top-level roots, owners of a root or one above it below. Group membership and every grant

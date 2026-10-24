@@ -19,6 +19,7 @@ package lakehouse.blob
 
 import data.lakehouse.governance
 import data.lakehouse.groups
+import data.lakehouse.tables
 import future.keywords.contains
 import future.keywords.every
 import future.keywords.if
@@ -37,13 +38,14 @@ vend := {"allow": true, "prefix": e.prefix} if {
 # implies neither `describe` nor `read`. Rule 3 cuts it as it cuts reading, as for tables: the
 # credential cannot get or list, so someone who may not read a source the folder's files carry
 # would otherwise overwrite or delete files they cannot see, and could not read back their own.
+# A release past a source admits its group here as it does for reading (PROVENANCE.md 6.7).
 default vend_write := {"allow": false}
 
 vend_write := {"allow": true, "prefix": e.prefix} if {
 	e := _entries[input.dataset]
 	_holds(e.write)
 	every s in object.get(e, "sources", []) {
-		_holds(s.read)
+		tables.source_admits(_groups, s)
 	}
 }
 
@@ -88,7 +90,8 @@ allow_register if {
 	_owns_root(input.prefix)
 }
 
-# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset;
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset
+# itself, sources being the business of releases (PROVENANCE.md 6.7);
 # `share`, `write`, `detach` and `delete` by a group owning a root above its prefix, the
 # ownership registration checks: `detach` decides how far the dataset's protection follows its
 # data (PROVENANCE.md 6.5), as `share` does.
@@ -105,9 +108,6 @@ allow_change if {
 _may_change(e, g) if {
 	g in {"describe", "read"}
 	_holds(e.share)
-	every s in object.get(e, "sources", []) {
-		_holds(s.share)
-	}
 }
 
 _may_change(e, g) if {
@@ -143,12 +143,13 @@ _entries := governance.post("/internal/datasets", {"ids": _ids}).entries
 _groups := governance.groups(input.subject)
 
 # A dataset's `read` (stored as access), and every source its files carry (PROVENANCE.md 6,
-# rule 3): governance lists each with its own grants and whether a declaration says it was
-# used; the shipped rule treats an undeclared source like a declared one.
+# rule 3): governance lists each with its own grants, whether a declaration says it was used,
+# and the groups releases let past it on each path it arrived by; the shipped rule treats an
+# undeclared source like a declared one, as tables.rego does.
 _reads(e) if {
 	_holds(e.access)
 	every s in object.get(e, "sources", []) {
-		_holds(s.read)
+		tables.source_admits(_groups, s)
 	}
 }
 

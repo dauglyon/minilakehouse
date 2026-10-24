@@ -162,6 +162,10 @@ reading data through it still takes `read` on the tables it uses.
 
 ### 4.3 Derived datasets
 
+This section is the earlier design, over declared `inputs`. The built design has sources travel
+with stored files and is in `PROVENANCE.md` 6, releases in 6.7; this section changes to match
+it, with the other statements `PROVENANCE.md` section 10 lists.
+
 An entry with a non-empty `inputs` list is derived. `read` and `share` are inherited; `describe`
 and `write` are declared only.
 
