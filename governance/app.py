@@ -1785,13 +1785,19 @@ def change_member(cid, member):
     if err:
         return err
     subject = subject_of(claims)
-    kind = _member_kind(member)
+    with db(commit=True) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (COLLECTIONS_LOCK_KEY,))
+        cur.execute("SELECT 1 FROM collections WHERE id = %s", (cid,))
+        exists = cur.fetchone() is not None
+        # A member is removed as what it was added as, whatever it has become since.
+        cur.execute("SELECT member_kind FROM collection_members WHERE collection = %s AND member = %s", (cid, member))
+        held = cur.fetchone()
+    kind = held["member_kind"] if request.method == "DELETE" and held else _member_kind(member)
     inp = {"subject": subject, "collection": cid, "member": member, "kind": kind,
            "platform_admin": platform_admin(claims)}
     with db(commit=True) as cur:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (COLLECTIONS_LOCK_KEY,))
-        cur.execute("SELECT 1 FROM collections WHERE id = %s", (cid,))
-        if cur.fetchone() is None or kind is None:
+        if not exists or kind is None:
             return jsonify({"error": "forbidden"}), 403
         if request.method == "DELETE":
             if opa("allow_remove", inp, package="collections") is not True:
@@ -1956,12 +1962,14 @@ SELECT EXISTS (SELECT 1 FROM groups WHERE name = %(g)s)
                WHERE split_part(n, '#', 1) = %(g)s)
     OR EXISTS (SELECT 1 FROM releases WHERE split_part(grp, '#', 1) = %(g)s)
     OR EXISTS (SELECT 1 FROM folder_grants, unnest(describe || read || manage || write || "delete" || detach) n
-               WHERE split_part(n, '#', 1) = %(g)s OR split_part(prefix, '/', 2) = %(g)s)
+               WHERE split_part(n, '#', 1) = %(g)s)
+    OR EXISTS (SELECT 1 FROM folder_grants WHERE split_part(prefix, '/', 2) = %(g)s)
     OR EXISTS (SELECT 1 FROM namespaces, unnest(describe || read || manage || write || "delete" || detach) n
                WHERE split_part(n, '#', 1) = %(g)s)
     OR EXISTS (SELECT 1 FROM namespaces WHERE split_part(id, '.', 2) = %(g)s)
+    OR EXISTS (SELECT 1 FROM collections WHERE owner = %(g)s)
     OR EXISTS (SELECT 1 FROM collections, unnest(describe || read || manage || write || "delete") n
-               WHERE owner = %(g)s OR split_part(n, '#', 1) = %(g)s)
+               WHERE split_part(n, '#', 1) = %(g)s)
     -- A space with entries in it: the new group's defaults would reach them.
     OR EXISTS (SELECT 1 FROM datasets WHERE split_part(prefix, '/', 2) = %(g)s)
     OR EXISTS (SELECT 1 FROM table_entries WHERE split_part(id, '.', 2) = %(g)s) AS used
@@ -2120,6 +2128,10 @@ def delete_group(name):
                     "split_part(id, '.', 2) = %(g)s AND status = 'live') AS holds", {"g": name})
         if cur.fetchone()["holds"]:
             return jsonify({"error": f"{name}'s space holds data; delete or transfer it first"}), 409
+        # A collection's owner decides who changes it; a group recreated under the name would.
+        cur.execute("SELECT 1 FROM collections WHERE owner = %s LIMIT 1", (name,))
+        if cur.fetchone():
+            return jsonify({"error": f"{name} owns collections; delete them first"}), 409
         cur.execute("DELETE FROM group_members WHERE grp = %s", (name,))
         cur.execute("DELETE FROM groups WHERE name = %s", (name,))
     app.logger.info("DELETE-GROUP subject=%s group=%s", subject, name)

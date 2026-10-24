@@ -136,3 +136,7 @@ check("removing a member takes away what the collection gave",
       and vend("carol", plain).status_code == 403)
 check("its admins delete a collection, its members untouched",
       gov("DELETE", f"/collections/{share}", "alice").status_code == 200 and vend("alice", built).status_code == 200)
+g = f"cg{ts}"
+gov("POST", "/groups", "bob", {"name": g})
+gov("POST", "/collections", "bob", {"group": g, "name": "empty"})
+check("a group owning a collection is not deleted", gov("DELETE", f"/groups/{g}", "bob").status_code == 409)
