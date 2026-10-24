@@ -1,7 +1,7 @@
 """
 governance — the PAP + dataset registry, and the single source of truth (Postgres-backed).
 
-It owns groups (their members and owners), the dataset and table registries, and all
+It owns groups (each person's role in them), the dataset and table registries, and all
 grants; OPA holds none, and Keycloak only proves who a person is. Every caller, governance
 included, sends OPA only who is asking and what they name; OPA's rules fetch the grants they
 need from the /internal/* lookups here, at decision time. Durable state lives in a dedicated
@@ -82,7 +82,24 @@ CATALOG_AUDIENCE = os.environ.get("CATALOG_AUDIENCE", "polaris")
 # untrusted. Confine it: datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
 # policy-size limit and restricted so no control/space/unicode reaches the ARN.
 PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}/$")
-GROUP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# A new group's name: BERDL's rule (minio_manager_service src/s3/utils/validators.py), 2 to 64
+# lowercase letters and digits starting with a letter, and not one of its reserved names or
+# `governance`, the namespace the gate answers itself.
+GROUP_RE = re.compile(r"^[a-z][a-z0-9]{1,63}$")
+RESERVED_GROUPS = {"admin", "root", "system", "all", "everyone", "public", "default", "minio",
+                   "service", "backup", "warehouse", "governance"}
+# A group named in a grant, a release or root ownership, made by anyone or by governance.
+GROUP_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$")
+# What a grant names: a group, every role in it, or one role and those above it, in the
+# `<group>#<role>` notation of Zanzibar and SpiceDB (_group_names).
+GRANTEE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}(#(owner|admin|member|steward))?$")
+ROLES = ("owner", "admin", "member", "viewer")
+# The names each role holds besides the group's own, highest role first: an owner is also an
+# admin and a member.
+ROLE_NAMES = {"owner": ("owner", "admin", "member"), "admin": ("admin", "member"),
+              "member": ("member",), "viewer": ()}
+# The Keycloak realm role marking a platform admin, read from the verified token.
+PLATFORM_ADMIN_ROLE = os.environ.get("PLATFORM_ADMIN_ROLE", "platform-admin")
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$")  # <catalog>.<namespace...>
 SUBJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$")
 # An input from outside the platform is named by the hash of its content (PROVENANCE.md 5.3).
@@ -139,16 +156,22 @@ CREATE TABLE IF NOT EXISTS datasets (
     status          TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
     last_reconciled TIMESTAMPTZ
 );
+CREATE TABLE IF NOT EXISTS groups (
+    name       TEXT PRIMARY KEY,
+    created_by TEXT,                         -- null for a group the seed made
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS group_members (
-    grp    TEXT NOT NULL,
-    member TEXT NOT NULL,                    -- a person's subject (the token's principal_name)
+    grp     TEXT NOT NULL,
+    member  TEXT NOT NULL,                   -- a person's subject (the token's principal_name)
+    role    TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member', 'viewer')),
+    steward BOOLEAN NOT NULL DEFAULT false,  -- set by platform admins only, for a member or above
     PRIMARY KEY (grp, member)
 );
-CREATE TABLE IF NOT EXISTS group_owners (
-    grp   TEXT NOT NULL,
-    owner TEXT NOT NULL,                     -- a group whose members may change grp's members/owners
-    PRIMARY KEY (grp, owner)
-);
+-- A group's owners were groups (group_owners); they are now people holding the owner role.
+ALTER TABLE group_members ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'member';
+ALTER TABLE group_members ADD COLUMN IF NOT EXISTS steward BOOLEAN NOT NULL DEFAULT false;
+DROP TABLE IF EXISTS group_owners;
 CREATE TABLE IF NOT EXISTS table_entries (
     id          TEXT PRIMARY KEY,            -- <catalog>.<namespace...>.<table>
     description TEXT,
@@ -369,14 +392,12 @@ def init_db():
                  d.get("describe", []), d.get("access", []), d.get("manage", []), d.get("write", []),
                  d.get("detach", []), d.get("delete", [])),
             )
-        for grp, members in reg.get("groups", {}).items():
-            for m in members:
-                cur.execute("INSERT INTO group_members (grp, member) VALUES (%s, %s) "
-                            "ON CONFLICT DO NOTHING", (grp, m))
-        for grp, owners in reg.get("group_owners", {}).items():
-            for o in owners:
-                cur.execute("INSERT INTO group_owners (grp, owner) VALUES (%s, %s) "
-                            "ON CONFLICT DO NOTHING", (grp, o))
+        stewards = reg.get("stewards", {})
+        for grp, people in reg.get("groups", {}).items():   # {group: {person: role}}
+            cur.execute("INSERT INTO groups (name) VALUES (%s) ON CONFLICT DO NOTHING", (grp,))
+            for m, role in people.items():
+                cur.execute("INSERT INTO group_members (grp, member, role, steward) VALUES (%s, %s, %s, %s) "
+                            "ON CONFLICT DO NOTHING", (grp, m, role, m in stewards.get(grp, [])))
         for t in reg.get("tables", []):
             if not TABLE_ID_RE.match(t["id"]):
                 raise ValueError(f"registry.json: bad table id {t['id']!r}")
@@ -444,6 +465,26 @@ def authed_user(audience=AUDIENCE):
     """(subject, None) for the request's verified bearer token, or (None, error_response)."""
     claims, err = authed_claims(audience)
     return (subject_of(claims), None) if claims else (None, err)
+
+
+def platform_admin(claims):
+    """Whether the verified token carries the Keycloak realm role marking a platform admin."""
+    return PLATFORM_ADMIN_ROLE in ((claims.get("realm_access") or {}).get("roles") or [])
+
+
+def _group_names(cur, subject):
+    """The names a person holds grants through, as (read, write) lists: each group they are in,
+    `<g>`, with `<g>#<role>` for their role and those below it and `<g>#steward` if they are
+    its steward. A grant naming a group gives `describe` and `read` to everyone in it and every
+    other grant to its members and above, so a viewer's names are in `read` only."""
+    cur.execute("SELECT grp, role, steward FROM group_members WHERE member = %s", (subject,))
+    read, write = [], []
+    for r in cur.fetchall():
+        names = [r["grp"], *(f"{r['grp']}#{x}" for x in ROLE_NAMES[r["role"]])]
+        names += [f"{r['grp']}#steward"] if r["steward"] else []
+        read += names
+        write += names if r["role"] != "viewer" else []
+    return sorted(read), sorted(write)
 
 
 def opa(rule, inp, package="blob"):
@@ -753,15 +794,8 @@ def internal_register_grants():
 @internal_app.get("/internal/groups/<subject>")
 def internal_groups(subject):
     with db() as cur:
-        cur.execute("SELECT grp FROM group_members WHERE member = %s ORDER BY grp", (subject,))
-        return jsonify({"groups": [r["grp"] for r in cur.fetchall()]})
-
-
-@internal_app.get("/internal/group-owners/<grp>")
-def internal_group_owners(grp):
-    with db() as cur:
-        cur.execute("SELECT owner FROM group_owners WHERE grp = %s ORDER BY owner", (grp,))
-        return jsonify({"owners": [r["owner"] for r in cur.fetchall()]})
+        read, write = _group_names(cur, subject)
+    return jsonify({"groups": read, "write_groups": write})
 
 
 _TABLE_COLS = 'id, describe, read, manage, write, "delete", detach, status'
@@ -956,9 +990,10 @@ def events():
 def register_dataset():
     # Register a new dataset. The steward supplies the PREFIX (which they own); the id is
     # derived from it. authN = the caller's token; authZ = OPA's allow_register.
-    subject, err = authed_user()
+    claims, err = authed_claims()
     if err:
         return err
+    subject = subject_of(claims)
 
     body = request.get_json(silent=True) or {}
     prefix = body.get("prefix")
@@ -966,10 +1001,11 @@ def register_dataset():
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
     grants = {g: body.get(g, []) for g in ("describe", "access", "manage", "write", "detach", "delete")}
-    if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
+    if not all(_names(v, GRANTEE_RE) for v in grants.values()):
         return jsonify({"error": "describe, access, manage, write, detach and delete must be lists of groups"}), 400
 
-    if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
+    if opa("allow_register", {"subject": subject, "prefix": prefix,
+                              "platform_admin": platform_admin(claims)}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
         return jsonify({"error": "forbidden"}), 403
 
@@ -1033,18 +1069,20 @@ def provision_principal():
 def register_table():
     # Register a table before it is created: Polaris (through the gate) creates only a
     # registered, pending table, for someone in its write grant. authZ = OPA's
-    # lakehouse.tables.allow_register (a steward whose group owns the namespace).
-    subject, err = authed_user()
+    # lakehouse.tables.allow_register (a steward of a group owning the namespace).
+    claims, err = authed_claims()
     if err:
         return err
+    subject = subject_of(claims)
     body = request.get_json(silent=True) or {}
     table_id = body.get("id")
     grants = {g: body.get(g, []) for g in ("describe", "read", "manage", "write", "delete", "detach")}
     if not isinstance(table_id, str) or not TABLE_ID_RE.match(table_id):
         return jsonify({"error": "id must be <catalog>.<namespace...>.<table>"}), 400
-    if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
+    if not all(_names(v, GRANTEE_RE) for v in grants.values()):
         return jsonify({"error": "describe, read, manage, write, delete and detach must be lists of groups"}), 400
-    if opa("allow_register", {"subject": subject, "id": table_id}, package="tables") is not True:
+    if opa("allow_register", {"subject": subject, "id": table_id,
+                              "platform_admin": platform_admin(claims)}, package="tables") is not True:
         app.logger.info("DENY register-table subject=%s id=%s", subject, table_id)
         return jsonify({"error": "forbidden"}), 403
     try:
@@ -1076,15 +1114,16 @@ def change_permissions(kind, entry_id):
     # write replaces. An unknown id is refused exactly as a denied change. OPA's lookups into
     # /internal/* during that decision borrow pool connections too, so beyond POOL_MAX
     # concurrent changes a lookup times out and the change is refused rather than deadlocking.
-    subject, err = authed_user()
+    claims, err = authed_claims()
     if err:
         return err
+    subject = subject_of(claims)
     cols = _GRANT_COLS.get(kind)
     if cols is None:
         return jsonify({"error": "not found"}), 404
     changes = (request.get_json(silent=True) or {}).get("changes")
     if not (isinstance(changes, list) and changes and all(
-            isinstance(c, dict) and isinstance(c.get("group"), str) and c["group"]
+            isinstance(c, dict) and isinstance(c.get("group"), str) and GRANTEE_RE.match(c["group"])
             and all(isinstance(c.get(k, []), list) and set(c.get(k, [])) <= cols.keys()
                     for k in ("add", "remove"))
             for c in changes)):
@@ -1099,7 +1138,8 @@ def change_permissions(kind, entry_id):
     with db(commit=True) as cur:
         cur.execute(f"SELECT {col_sql} FROM {table} WHERE id = %s FOR UPDATE", (entry_id,))
         row = cur.fetchone()
-        allowed = opa("allow_change", {"subject": subject, key: entry_id, "grants": named},
+        allowed = opa("allow_change", {"subject": subject, key: entry_id, "grants": named,
+                                       "platform_admin": platform_admin(claims)},
                       package=package) is True
         if row is None or not allowed:
             app.logger.info("DENY change subject=%s %s=%s grants=%s", subject, kind, entry_id, named)
@@ -1117,8 +1157,8 @@ def change_permissions(kind, entry_id):
 
 
 def _lock_group(cur, name):
-    # Every writer of a group's members or owners takes this lock, so the owners OPA fetches
-    # while it is held are the ones the write replaces.
+    # Every writer of a group's people takes this lock, so the roles OPA fetches while it is held
+    # are the ones the write replaces.
     cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("group:" + name,))
 
 
@@ -1126,31 +1166,47 @@ def _names(v, pattern):
     return isinstance(v, list) and all(isinstance(x, str) and pattern.match(x) for x in v)
 
 
-# A name some grant or ownership already names: creating it would hand whoever joins it those
-# grants, so it is refused.
+# A name some grant, release or ownership already names, alone or as `<name>#<role>`: creating
+# it would hand its owner those grants, so it is refused.
 _NAME_IN_USE_SQL = """
-SELECT EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
-    OR EXISTS (SELECT 1 FROM group_owners WHERE grp = %(g)s OR owner = %(g)s)
-    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || manage || write || detach || "delete"))
-    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || manage || write || "delete" || detach))
+SELECT EXISTS (SELECT 1 FROM groups WHERE name = %(g)s)
+    OR EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
+    OR EXISTS (SELECT 1 FROM datasets, unnest(describe || access || manage || write || detach || "delete") n
+               WHERE split_part(n, '#', 1) = %(g)s)
+    OR EXISTS (SELECT 1 FROM table_entries, unnest(describe || read || manage || write || "delete" || detach) n
+               WHERE split_part(n, '#', 1) = %(g)s)
+    OR EXISTS (SELECT 1 FROM releases WHERE split_part(grp, '#', 1) = %(g)s)
     OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) AS used
 """
 
 
+def _people(cur, name):
+    """{person: {role, steward}} for a group's people."""
+    cur.execute("SELECT member, role, steward FROM group_members WHERE grp = %s", (name,))
+    return {r["member"]: {"role": r["role"], "steward": r["steward"]} for r in cur.fetchall()}
+
+
+def _group_view(name, people):
+    return {"group": name, "tenant": any(p["steward"] for p in people.values()),
+            **{f"{role}s": sorted(m for m, p in people.items() if p["role"] == role) for role in ROLES},
+            "stewards": sorted(m for m, p in people.items() if p["steward"])}
+
+
 @app.post("/groups")
 def create_group():
-    # Create a group with its first owners: {"name", "owners": [group], "members": [subject]}.
-    # authZ = OPA's lakehouse.groups.allow_create.
+    # Create a group, {"name"}; the caller becomes its owner (docs/HANDOFF-2026-10-22-groups.md
+    # section 1). authZ = OPA's lakehouse.groups.allow_create; the name follows GROUP_RE and is
+    # not reserved or in use.
     subject, err = authed_user()
     if err:
         return err
     body = request.get_json(silent=True) or {}
-    name, owners, members = body.get("name"), body.get("owners"), body.get("members", [])
-    if not (isinstance(name, str) and GROUP_RE.match(name) and owners
-            and _names(owners, GROUP_RE) and _names(members, SUBJECT_RE)):
-        return jsonify({"error": "name and a non-empty owners list of groups required; "
-                                 "members is a list of subjects"}), 400
+    name = body.get("name")
+    if set(body) != {"name"} or not isinstance(name, str) or not GROUP_RE.match(name) \
+            or name in RESERVED_GROUPS:
+        return jsonify({"error": "body is {name}: 2 to 64 lowercase letters and digits, starting "
+                                 "with a letter, and not " + ", ".join(sorted(RESERVED_GROUPS))}), 400
     if opa("allow_create", {"subject": subject}, package="groups") is not True:
         app.logger.info("DENY create-group subject=%s group=%s", subject, name)
         return jsonify({"error": "forbidden"}), 403
@@ -1159,56 +1215,245 @@ def create_group():
         cur.execute(_NAME_IN_USE_SQL, {"g": name})
         if cur.fetchone()["used"]:
             return jsonify({"error": "group name in use"}), 409
-        for o in set(owners):
-            cur.execute("INSERT INTO group_owners (grp, owner) VALUES (%s, %s)", (name, o))
-        for m in set(members):
-            cur.execute("INSERT INTO group_members (grp, member) VALUES (%s, %s)", (name, m))
-    app.logger.info("CREATE-GROUP subject=%s group=%s owners=%s", subject, name, sorted(set(owners)))
-    return jsonify({"ok": True, "group": name, "owners": sorted(set(owners)),
-                    "members": sorted(set(members))}), 201
+        cur.execute("INSERT INTO groups (name, created_by) VALUES (%s, %s)", (name, subject))
+        cur.execute("INSERT INTO group_members (grp, member, role) VALUES (%s, %s, 'owner')", (name, subject))
+    app.logger.info("CREATE-GROUP subject=%s group=%s", subject, name)
+    return jsonify({"ok": True, **_group_view(name, {subject: {"role": "owner", "steward": False}})}), 201
+
+
+# The body's fields and the role each sets.
+_ROLE_FIELDS = {"owners": "owner", "admins": "admin", "members": "member", "viewers": "viewer"}
 
 
 @app.patch("/groups/<name>")
 def change_group(name):
-    # Add or remove a group's members and owners:
-    # {"members": {"add": [subject], "remove": [subject]}, "owners": {"add": [group], "remove": [group]}}.
-    # authZ = OPA's lakehouse.groups.allow_change (the caller is in one of the group's owners),
-    # asked while this transaction holds the group's lock. An unknown group has no owners, so
-    # it is refused exactly as a denied change. A change leaving no owner is refused, since
-    # only owners can change a group.
+    # Add people to a role, or remove them from the group:
+    # {"owners"|"admins"|"members"|"viewers": {"add": [subject], "remove": [subject]}}. A person
+    # holds one role, so adding someone already in the group moves them. authZ = OPA's
+    # lakehouse.groups.allow_change over every role the change names or moves someone out of,
+    # asked while this transaction holds the group's lock. An unknown group is refused exactly
+    # as a denied change. Refused: a change leaving no owner, and one leaving a steward a viewer
+    # or out of the group, since only platform admins remove a steward.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    body = request.get_json(silent=True) or {}
+    if not (body and set(body) <= _ROLE_FIELDS.keys() and all(
+            isinstance(body[f], dict) and body[f] and set(body[f]) <= {"add", "remove"}
+            and all(_names(v, SUBJECT_RE) for v in body[f].values())
+            for f in body)):
+        return jsonify({"error": "body is {owners|admins|members|viewers: {add: [subject], remove: [subject]}}"}), 400
+    with db(commit=True) as cur:
+        _lock_group(cur, name)
+        cur.execute("SELECT 1 FROM groups WHERE name = %s", (name,))
+        exists = cur.fetchone() is not None
+        people = _people(cur, name)
+        roles = {m: p["role"] for m, p in people.items()}
+        for f, ops in body.items():
+            for m in ops.get("remove", []):
+                if roles.get(m) == _ROLE_FIELDS[f]:
+                    del roles[m]
+            for m in ops.get("add", []):
+                roles[m] = _ROLE_FIELDS[f]
+        moved = {m for m in {*people, *roles} if roles.get(m) != (people.get(m) or {}).get("role")}
+        touched = {_ROLE_FIELDS[f] for f in body} | {people[m]["role"] for m in moved if m in people}
+        if not exists or opa("allow_change", {"subject": subject, "group": name, "roles": sorted(touched),
+                                              "platform_admin": platform_admin(claims)},
+                             package="groups") is not True:
+            app.logger.info("DENY change-group subject=%s group=%s", subject, name)
+            return jsonify({"error": "forbidden"}), 403
+        if "owner" not in roles.values():
+            return jsonify({"error": "a group keeps at least one owner"}), 409
+        if demoted := sorted(m for m in moved if m in people and people[m]["steward"]
+                             and roles.get(m) in (None, "viewer")):
+            return jsonify({"error": f"{', '.join(demoted)}: a steward is a member or above; "
+                                     "a platform admin removes the steward first"}), 409
+        for m in moved:
+            if m in roles:
+                cur.execute("INSERT INTO group_members (grp, member, role) VALUES (%s, %s, %s) "
+                            "ON CONFLICT (grp, member) DO UPDATE SET role = EXCLUDED.role", (name, m, roles[m]))
+            else:
+                cur.execute("DELETE FROM group_members WHERE grp = %s AND member = %s", (name, m))
+        people = _people(cur, name)
+    app.logger.info("CHANGE-GROUP subject=%s group=%s change=%s", subject, name, body)
+    return jsonify({"ok": True, **_group_view(name, people)})
+
+
+@app.route("/groups/<name>/stewards/<person>", methods=["PUT", "DELETE"])
+def change_steward(name, person):
+    # Appoint (PUT) or remove (DELETE) a steward: platform admins only (OPA's
+    # lakehouse.groups.allow_steward). A steward is a member or above of the group; a group with
+    # one is a tenant.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    with db(commit=True) as cur:
+        _lock_group(cur, name)
+        if opa("allow_steward", {"subject": subject, "group": name, "platform_admin": platform_admin(claims)},
+               package="groups") is not True:
+            app.logger.info("DENY steward subject=%s group=%s person=%s", subject, name, person)
+            return jsonify({"error": "forbidden"}), 403
+        people = _people(cur, name)
+        if request.method == "PUT" and (people.get(person) or {}).get("role") in (None, "viewer"):
+            return jsonify({"error": f"{person} is not a member or above of {name}"}), 409
+        cur.execute("UPDATE group_members SET steward = %s WHERE grp = %s AND member = %s",
+                    (request.method == "PUT", name, person))
+        people = _people(cur, name)
+    app.logger.info("STEWARD %s subject=%s group=%s person=%s", request.method, subject, name, person)
+    return jsonify({"ok": True, **_group_view(name, people)})
+
+
+@app.delete("/groups/<name>")
+def delete_group(name):
+    # Delete a group: its owners (OPA's lakehouse.groups.allow_delete). Refused while it owns a
+    # root, which its space will replace (docs/PLAN-2026-10-24.md item 3). Grants naming it stay,
+    # and keep its name from being created again.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    with db(commit=True) as cur:
+        _lock_group(cur, name)
+        cur.execute("SELECT 1 FROM groups WHERE name = %s", (name,))
+        if cur.fetchone() is None or opa("allow_delete", {
+                "subject": subject, "group": name, "platform_admin": platform_admin(claims)},
+                package="groups") is not True:
+            app.logger.info("DENY delete-group subject=%s group=%s", subject, name)
+            return jsonify({"error": "forbidden"}), 403
+        cur.execute("SELECT EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) "
+                    "OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s) AS owns", {"g": name})
+        if cur.fetchone()["owns"]:
+            return jsonify({"error": f"{name} owns a prefix root or a namespace; hand it over first"}), 409
+        cur.execute("DELETE FROM group_members WHERE grp = %s", (name,))
+        cur.execute("DELETE FROM groups WHERE name = %s", (name,))
+    app.logger.info("DELETE-GROUP subject=%s group=%s", subject, name)
+    return jsonify({"ok": True, "group": name})
+
+
+# The read API (docs/HANDOFF-2026-10-22-groups.md section 1), narrowed by the same OPA rules as
+# the writes.
+
+
+@app.get("/me")
+def me():
+    # The caller's groups with their role in each, whether they are its steward and whether it
+    # is a tenant; and whether they are a platform admin.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    with db() as cur:
+        cur.execute("SELECT m.grp, m.role, m.steward, EXISTS (SELECT 1 FROM group_members s "
+                    "WHERE s.grp = m.grp AND s.steward) AS tenant FROM group_members m "
+                    "WHERE m.member = %s ORDER BY m.grp", (subject,))
+        groups = [{"group": r["grp"], "role": r["role"], "steward": r["steward"], "tenant": r["tenant"]}
+                  for r in cur.fetchall()]
+    return jsonify({"subject": subject, "platform_admin": platform_admin(claims), "groups": groups})
+
+
+@app.get("/groups/<name>")
+def get_group(name):
+    # A group's people by role and its stewards, for its viewers and above (OPA's
+    # lakehouse.groups.allow_view). An unknown group is refused exactly as a denied one.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    with db() as cur:
+        cur.execute("SELECT created_by, created_at FROM groups WHERE name = %s", (name,))
+        row = cur.fetchone()
+        if row is None or opa("allow_view", {"subject": subject, "group": name,
+                                             "platform_admin": platform_admin(claims)},
+                              package="groups") is not True:
+            return jsonify({"error": "not found"}), 404
+        people = _people(cur, name)
+    return jsonify({**_group_view(name, people), "created_by": row["created_by"],
+                    "created_at": row["created_at"]})
+
+
+def _implied(name):
+    """Every name a holder of this grantee name holds: `<g>#admin` is also `<g>#member` and `<g>`."""
+    g, _, role = name.partition("#")
+    if not role:
+        return [g]
+    return sorted({g, f"{g}#member", f"{g}#{role}", *(f"{g}#{x}" for x in ROLE_NAMES.get(role, ()))})
+
+
+def _describable(subject, ids):
+    """The ids among these that the subject may describe."""
+    tables = [i for i in ids if TABLE_ID_RE.match(i)]
+    files = [i for i in ids if not TABLE_ID_RE.match(i)]
+    seen = set(opa("discover", {"subject": subject, "datasets": files})["visible"]) if files else set()
+    if tables:
+        seen |= set(opa("decide", {"subject": subject, "tables": tables, "namespaces": []},
+                        package="tables")["tables"])
+    return seen
+
+
+def _entry_view(kind, entry_id):
+    """An entry for someone who may describe it: its grants as stored, the names in its read
+    (a table's write included) all of whose holders pass every source, its status, whether the
+    caller may read it, and, when they may not, why: whether they hold `read` at all, the
+    carried sources that refuse them, each named only if they may describe it, and releases of
+    it to them that were withdrawn."""
     subject, err = authed_user()
     if err:
         return err
-    body = request.get_json(silent=True) or {}
-    patterns = {"members": SUBJECT_RE, "owners": GROUP_RE}
-    if not (body and set(body) <= patterns.keys() and all(
-            isinstance(body[f], dict) and body[f] and set(body[f]) <= {"add", "remove"}
-            and all(_names(v, patterns[f]) for v in body[f].values())
-            for f in body)):
-        return jsonify({"error": "body is {members|owners: {add: [...], remove: [...]}}"}), 400
-    with db(commit=True) as cur:
-        _lock_group(cur, name)
-        if opa("allow_change", {"subject": subject, "group": name}, package="groups") is not True:
-            app.logger.info("DENY change-group subject=%s group=%s", subject, name)
-            return jsonify({"error": "forbidden"}), 403
-        cur.execute("SELECT member FROM group_members WHERE grp = %s", (name,))
-        now = {"members": {r["member"] for r in cur.fetchall()}}
-        cur.execute("SELECT owner FROM group_owners WHERE grp = %s", (name,))
-        now["owners"] = {r["owner"] for r in cur.fetchall()}
-        for f, ops in body.items():
-            now[f] = (now[f] | set(ops.get("add", []))) - set(ops.get("remove", []))
-        if not now["owners"]:
-            return jsonify({"error": "a group keeps at least one owner"}), 409
-        for f, (tbl, col) in {"members": ("group_members", "member"),
-                              "owners": ("group_owners", "owner")}.items():
-            cur.execute(f"DELETE FROM {tbl} WHERE grp = %s AND NOT ({col} = ANY(%s))",
-                        (name, sorted(now[f])))
-            for x in now[f]:
-                cur.execute(f"INSERT INTO {tbl} (grp, {col}) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                            (name, x))
-    app.logger.info("CHANGE-GROUP subject=%s group=%s change=%s", subject, name, body)
-    return jsonify({"ok": True, "group": name, "members": sorted(now["members"]),
-                    "owners": sorted(now["owners"])})
+    if kind == "dataset":
+        package, key, cols = "blob", "dataset", _GRANT_COLS["dataset"]
+        d = opa("discover", {"subject": subject, "datasets": [entry_id]})
+        visible, readable = entry_id in d["visible"], entry_id in d["readable"]
+        table, extra = "datasets", "prefix"
+    else:
+        package, key, cols = "tables", "id", _GRANT_COLS["table"]
+        t = opa("decide", {"subject": subject, "tables": [entry_id], "namespaces": []}, package="tables")
+        visible, readable = entry_id in t["tables"], entry_id in t["readable"]
+        table, extra = "table_entries", "location"
+    if not visible:
+        return jsonify({"error": "not found"}), 404
+    col_sql = ", ".join(f'"{c}"' for c in cols.values())
+    with db() as cur:
+        cur.execute(f"SELECT description, steward, status, {extra}, {col_sql} FROM {table} WHERE id = %s",
+                    (entry_id,))
+        row = cur.fetchone()
+        read_names, _ = _group_names(cur, subject)
+    if row is None:
+        return jsonify({"error": "not found"}), 404
+    grants = {g: sorted(row[c]) for g, c in cols.items()}
+    readers = sorted(set(grants["read"]) | (set(grants["write"]) if kind == "table" else set()))
+    effective = opa("effective_read", {key: entry_id, "holders": {n: _implied(n) for n in readers}},
+                    package=package) or []
+    out = {"id": entry_id, "kind": "files" if kind == "dataset" else "table", extra: row[extra],
+           "description": row["description"], "steward": row["steward"], "status": row["status"],
+           "grants": grants, "effective_read": sorted(effective), "can_read": readable}
+    if not readable:
+        blocking = sorted(opa("blocking", {"subject": subject, key: entry_id}, package=package) or [])
+        named = _describable(subject, blocking) if blocking else set()
+        with db() as cur:
+            cur.execute("SELECT source, grp, withdrawn_by, withdrawn_at FROM releases WHERE target = %s "
+                        "AND approved AND withdrawn_at IS NOT NULL AND grp = ANY(%s) ORDER BY id",
+                        (entry_id, read_names))
+            withdrawn = cur.fetchall()
+        named |= _describable(subject, sorted({r["source"] for r in withdrawn})) if withdrawn else set()
+        out["why"] = {"holds_read": bool(set(read_names) & set(readers)),
+                      "sources": [s for s in blocking if s in named],
+                      "hidden_sources": len([s for s in blocking if s not in named]),
+                      "withdrawn_releases": [{"source": r["source"] if r["source"] in named else None,
+                                              "group": r["grp"], "withdrawn_at": r["withdrawn_at"]}
+                                             for r in withdrawn]}
+    return jsonify(out)
+
+
+@app.get("/datasets/<path:ds_id>")
+def get_dataset(ds_id):
+    return _entry_view("dataset", ds_id)
+
+
+@app.get("/tables/<table_id>")
+def get_table(table_id):
+    return _entry_view("table", table_id)
 
 
 @app.patch("/roots/<kind>/<path:root_id>")
@@ -1219,20 +1464,22 @@ def change_root_owners(kind, root_id):
     # owns everything under it. authZ = OPA's allow_change_root, which reads the ownership of
     # this root and those above it; root changes are rare, so one lock serializes them all and
     # the decision and the write see the same ownership.
-    subject, err = authed_user()
+    claims, err = authed_claims()
     if err:
         return err
+    subject = subject_of(claims)
+    inp = {"subject": subject, "platform_admin": platform_admin(claims)}
     if kind == "dataset":
         root = f"datasets/{root_id}/"
-        valid, package, inp = _confined_prefix(root), "blob", {"subject": subject, "prefix": root}
+        valid, package, inp = _confined_prefix(root), "blob", {**inp, "prefix": root}
     elif kind == "namespace":
         root = root_id
-        valid, package, inp = bool(NAMESPACE_RE.match(root)), "tables", {"subject": subject, "id": root}
+        valid, package, inp = bool(NAMESPACE_RE.match(root)), "tables", {**inp, "id": root}
     else:
         return jsonify({"error": "not found"}), 404
     owners = (request.get_json(silent=True) or {}).get("owners")
     if not (valid and isinstance(owners, dict) and owners and set(owners) <= {"add", "remove"}
-            and all(_names(v, GROUP_RE) for v in owners.values())):
+            and all(_names(v, GROUP_REF_RE) for v in owners.values())):
         return jsonify({"error": "a valid root and {owners: {add: [group], remove: [group]}} required"}), 400
     with db(commit=True) as cur:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (ROOTS_LOCK_KEY,))
@@ -1274,8 +1521,7 @@ def _index_rows(subject):
     narrowing drops only entries OPA would refuse, and OPA's cost follows what the person may
     see rather than the catalog's size. seed/check-index-narrowing.py checks the two agree."""
     with db() as cur:
-        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
-        groups = [r["grp"] for r in cur.fetchall()]
+        groups, _ = _group_names(cur, subject)
         cur.execute("SELECT id, description, steward FROM datasets WHERE status = 'live' "
                     "AND (describe || access) && %s::text[]", (groups,))
         files = cur.fetchall()
@@ -1378,8 +1624,7 @@ ORDER BY d.id, s.source NULLS FIRST
 
 def _derivation_rows(subject):
     with db() as cur:
-        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
-        groups = [r["grp"] for r in cur.fetchall()]
+        _, groups = _group_names(cur, subject)
         cur.execute(_DERIVATIONS_SQL, {"p": subject, "groups": groups})
         return cur.fetchall()
 
@@ -1561,7 +1806,7 @@ def request_release():
         return err
     body = request.get_json(silent=True) or {}
     target, source, grp = body.get("target"), body.get("source"), body.get("group")
-    if not all(isinstance(v, str) and v for v in (target, source, grp)) or not GROUP_RE.match(grp):
+    if not all(isinstance(v, str) and v for v in (target, source, grp)) or not GRANTEE_RE.match(grp):
         return jsonify({"error": "target, source and group required"}), 400
     package, key = _kind(target)
     readers = _own_read(target)
@@ -1652,8 +1897,7 @@ ORDER BY r.id
 
 def _release_rows(subject):
     with db() as cur:
-        cur.execute("SELECT grp FROM group_members WHERE member = %s", (subject,))
-        groups = [r["grp"] for r in cur.fetchall()]
+        _, groups = _group_names(cur, subject)
         cur.execute(_RELEASES_SQL, {"p": subject, "g": groups})
         return cur.fetchall()
 

@@ -26,7 +26,8 @@ package polaris.authz
 #                       credential): write on every target.
 #  8. drop            — dropping a table or view, with or without purging its files: delete on
 #                       it. Not implied by any other grant.
-#  9. namespace admin — dropping a namespace or changing its properties: its owners.
+#  9. namespace admin — dropping a namespace or changing its properties: members and above
+#                       of a group owning it.
 #
 # Anything not named in a lane is root-only: admin operations (principals, roles, grants,
 # catalogs, policies, credentials), and renaming, registering or relocating a table, since
@@ -107,37 +108,38 @@ _allow if {
 	_namespaces_pass("own")
 }
 
-# Every target is a table or view, and the principal's groups hold `grant` on its entry. An
-# unregistered table has no entry, so nothing passes.
+# Every target is a table or view, and the names the principal holds grants through hold
+# `grant` on its entry. An unregistered table has no entry, so nothing passes.
 _tables_pass(grant) if {
-	gs := governance.groups(input.actor.principal)
+	h := governance.holder(input.actor.principal)
 	count(input.resource.targets) > 0
 	every t in input.resource.targets {
 		t.type == "TABLE_LIKE"
-		_table_holds(grant, gs, tables.table(_id(t)))
+		_table_holds(grant, h, tables.table(_id(t)))
 	}
 }
 
-_table_holds("read", gs, e) if tables.readable(gs, e)
+_table_holds("read", h, e) if tables.readable(h, e)
 
-_table_holds("view", gs, e) if tables.viewable(gs, e)
+_table_holds("view", h, e) if tables.viewable(h, e)
 
-_table_holds("write", gs, e) if tables.writable(gs, e)
+_table_holds("write", h, e) if tables.writable(h, e)
 
-_table_holds("delete", gs, e) if tables.droppable(gs, e)
+_table_holds("delete", h, e) if tables.droppable(h, e)
 
 _namespaces_pass(grant) if {
-	gs := governance.groups(input.actor.principal)
+	h := governance.holder(input.actor.principal)
 	count(input.resource.targets) > 0
 	every t in input.resource.targets {
 		t.type == "NAMESPACE"
-		_namespace_holds(grant, gs, tables.namespace(_id(t)))
+		_namespace_holds(grant, h, tables.namespace(_id(t)))
 	}
 }
 
-_namespace_holds("view", gs, e) if tables.namespace_viewable(gs, e)
+_namespace_holds("view", h, e) if tables.namespace_viewable(h, e)
 
-_namespace_holds("own", gs, e) if tables.namespace_owned(gs, e)
+# A member or above of a group owning it.
+_namespace_holds("own", h, e) if tables.namespace_owned(h.write, e)
 
 _view_ops := {"LOAD_TABLE", "TABLE_EXISTS", "LOAD_VIEW", "VIEW_EXISTS"}
 

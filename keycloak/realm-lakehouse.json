@@ -3,6 +3,11 @@
   "enabled": true,
   "sslRequired": "none",
   "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "platform-admin", "description": "Appoints and removes group stewards; passes every steward and group check (governance)" }
+    ]
+  },
   "users": [
     {
       "username": "alice",
@@ -33,6 +38,7 @@
       "firstName": "Carol",
       "lastName": "ProjW",
       "email": "carol@example.org",
+      "realmRoles": ["platform-admin"],
       "credentials": [
         { "type": "password", "value": "carol", "temporary": false }
       ]

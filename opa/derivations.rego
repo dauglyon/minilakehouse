@@ -30,7 +30,7 @@ allowed contains s.id if {
 allowed contains s.id if {
 	some s in input.sources
 	s.direct == false
-	some g in governance.groups(input.subject)
+	some g in governance.holder(input.subject).write
 	g in _entry(s.id).detach
 }
 
@@ -39,7 +39,7 @@ allowed contains s.id if {
 #   may_reattach   input {subject, target, sources: [{id}]}   the ids the subject may put back
 may_reattach contains s.id if {
 	some s in input.sources
-	some g in governance.groups(input.subject)
+	some g in governance.holder(input.subject).write
 	g in _entry(s.id).manage
 }
 
@@ -49,7 +49,7 @@ may_reattach contains s.id if {
 #   may_release   input {subject, sources: [{id}]}   the ids whose releases the subject decides
 may_release contains s.id if {
 	some s in input.sources
-	some g in governance.groups(input.subject)
+	some g in governance.holder(input.subject).write
 	g in _entry(s.id).manage
 }
 

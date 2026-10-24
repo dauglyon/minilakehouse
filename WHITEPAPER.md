@@ -113,10 +113,14 @@ service.
 
 ### 4.2 Six grants
 
-Each grant is a set of groups. Governance holds the groups and who belongs to each, beside the
-grants; Keycloak only proves who a person is. Each group has owners, which are groups, and
-section 4.4 says who changes membership. A membership change applies at the person's next
-request, since every rule looks the person's groups up at decision time.
+Each grant is a set of groups, or of roles in a group: `<g>#member`, `<g>#admin`, `<g>#owner` and
+`<g>#steward`, the notation Zanzibar and SpiceDB use. Governance holds the groups beside the
+grants: each person in a group is its owner, admin, member or viewer, and a member or above can
+also be its steward. Keycloak only proves who a person is; its realm role `platform-admin` marks
+platform admins, who hold no role in any group. A grant naming a group gives `describe` and
+`read` to everyone in it and every other grant to its members and above, so a viewer never
+writes. Section 4.4 says who changes membership. A membership change applies at the person's
+next request, since every rule looks the person's groups up at decision time.
 
 - **describe**: the dataset appears in listings for this group. For a table, in Polaris's listing
   through the gate, and its metadata can be loaded: whether it exists, its columns, and its
@@ -227,21 +231,26 @@ governance like any other rule; every writer of a row takes its lock, so the ent
 the one the write replaces.
 
 - `describe` and `read` of dataset d: callers holding `manage` on d.
-- `manage`, `write`, `delete` and `detach` of d: callers in a group owning the folder root (a
+- `manage`, `write`, `delete` and `detach` of d: stewards of a group owning the folder root (a
   file dataset) or namespace (a table) that d sits under.
 - Releasing d past source s to group x: asked by callers holding `manage` on d, once x is in
   d's `read` and d's declarations mark s used; approved, declined or withdrawn by callers
   holding `manage` on s.
 - Putting back a source detached from d: callers holding `manage` on the source.
-- A group's members and owners: callers in one of the group's owners, decided under a lock
-  on that group. A change leaving a group without an owner is refused.
-- Creating a group: callers in `group-admins`, who name its first owners. A name any grant or
-  ownership already uses is refused, since whoever joined the new group would hold those
-  grants.
-- Owners of a folder root or namespace: callers in `group-admins` for a top-level one, and
-  callers in a group owning it or one above it. A group owning a root owns everything under
-  it, so an owner can hand part of its tree to another group and can always take it back;
-  nothing records who delegated what.
+- A group's people, decided under a lock on that group: its owners change owners and admins;
+  its owners, admins and stewards change members and viewers. A change leaving a group without
+  an owner is refused, and so is one leaving a steward a viewer or out of the group.
+- A group's stewards: platform admins, choosing among its members and above. A group with a
+  steward is a tenant.
+- Creating a group: anyone signed in, who becomes its owner. Names follow BERDL's rule, 2 to
+  64 lowercase letters and digits starting with a letter, and its reserved names plus
+  `governance`. A name any grant or ownership already uses is refused, since the new group's
+  owner would hold those grants.
+- Deleting a group: its owners, while it owns no root.
+- Owners of a folder root or namespace: stewards of a group owning it or one above it. A group
+  owning a root owns everything under it, so a steward can hand part of its tree to another
+  group and can always take it back; nothing records who delegated what.
+- Platform admins pass every check an owner or a steward passes.
 
 ## 5. Components and trust
 
@@ -378,8 +387,7 @@ denies every read.
 ### Publisher
 
 6. **Publish a source dataset.** Log in. Register: id or folder, description, the grant
-   sets. Governance checks the person is a steward and a group of theirs owns that folder's
-   root. Entry is `pending`; governance checks the folder once and sets `live` if it already
+   sets. Governance checks the person is a steward of a group owning that folder's root. Entry is `pending`; governance checks the folder once and sets `live` if it already
    has objects. For files, ask the broker for a write credential, granted on `write`, then
    upload; storage events do the rest. For tables, create the table through Polaris; the
    gate admits the creation because the entry exists and the caller is in its `write`, and
@@ -395,11 +403,11 @@ denies every read.
 
 ### Operator
 
-10. **People and groups.** People in Keycloak; groups in governance, created by
-    `group-admins` and changed by each group's owners (4.4). Each person's Polaris principal
-    is created on first use (section 5).
-11. **Which groups own which folder roots and namespaces.** `group-admins` assign top-level
-    ones; their owners delegate below them (4.4).
+10. **People and groups.** People in Keycloak; groups in governance, created by anyone and
+    changed by their owners, admins and stewards (4.4). Platform admins, a Keycloak realm role,
+    appoint stewards. Each person's Polaris principal is created on first use (section 5).
+11. **Which groups own which folder roots and namespaces.** Platform admins assign top-level
+    ones; stewards of the owning groups delegate below them (4.4).
 
 ## 8. What OPA decides
 
@@ -419,11 +427,12 @@ everyone but root.
 | `derivations.allowed` | governance, for a declaration | target and the sources it marks unused | which may be marked unused: a direct read always, a detach by `detach` (4.3) |
 | `derivations.may_release`, `may_reattach` | governance | source ids | which sources' releases and putting back the caller decides: a caller group in the source's `manage` |
 | `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
-| `allow_register` | governance | requested folder | the caller is a steward and a caller group owns a root above the folder |
+| `allow_register` | governance | requested folder, whether the caller is a platform admin | the caller is a steward of a group owning a root above the folder, or a platform admin |
 | `allow_change` | governance | dataset id and the requested change | the rules of 4.4 |
-| `groups.allow_create` | governance | | the caller is in `group-admins` |
-| `groups.allow_change` | governance | group name | a caller group is among the group's owners |
-| `allow_change_root` | governance | folder root or namespace | the caller is in `group-admins` and it is top-level, or a caller group owns it or one above it |
+| `groups.allow_create` | governance | | the caller is signed in; governance checks the name |
+| `groups.allow_change` | governance | group name, the roles the change touches | the rules of 4.4 for each role |
+| `groups.allow_steward` | governance | group name | the caller is a platform admin |
+| `allow_change_root` | governance | folder root or namespace | the caller is a steward of a group owning it or one above it, or a platform admin |
 | Polaris: list namespaces, list tables, list views | Polaris | namespace | allowed for any authenticated person; the gate trims the response by `visible` |
 | Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group owns the namespace or one above it, or any table in it is visible to the caller |
 | Polaris: create table, create view, commit a staged create | Polaris | namespace | the caller may view the namespace; the gate has already decided per table with `allow_create`, since Polaris names only the namespace |
@@ -546,8 +555,9 @@ callers send OPA only who is asking and the ids they name, and every rule fetche
 and entries it needs with `http.send`; table names are
 confidential, so `describe` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
-set-location are root-only; `group-admins` assign top-level folder roots and namespaces, and
-their owners delegate below them; `read` implies `describe`.
+set-location are root-only; platform admins, a Keycloak realm role and not a group, assign
+top-level folder roots and namespaces and appoint stewards, and stewards of the owning groups
+delegate below them; `read` implies `describe`.
 
 ## 13. Status against the repository
 
@@ -556,7 +566,7 @@ Implemented today: the catalog with `describe`, `read`, `manage`, `write`, `dele
 `governance.datasets`, listing both kinds; the broker, scoping read, write and delete
 credentials to the folder in OPA's decision; Polaris delegating to OPA with per-table
 credentials, viewing a table gated on `describe` or `read` and read-write credentials on
-`write`, drops on `delete`; registration gated by `stewards` and root ownership; OPA holding
+`write`, drops on `delete`; registration by stewards of a group owning the root; OPA holding
 policy and no grants, every rule fetching what it needs from governance with `http.send`;
 Trino authenticating people by their Keycloak token over HTTPS and forwarding it to Polaris as
 the `token` extra credential; the gate as the only way to Polaris, verifying the token,
@@ -565,8 +575,10 @@ for a refused name the person may not view, repeating a refused credentialed loa
 credential request and cutting that load to the current version, refusing views that would run
 with their owner's rights, deciding table and namespace creation, and reporting table creates
 and drops; tables registered as entries with the same six grants by group; grant changes
-through governance, decided by OPA under the entry's row lock as in 4.4; group membership and
-owners, and root ownership, in governance, changed through it as in 4.4; each person's Polaris
+through governance, decided by OPA under the entry's row lock as in 4.4; groups with each
+person's role, stewards appointed by platform admins, and root ownership, in governance, changed
+through it as in 4.4 and read back through `GET /me`, `GET /groups/<name>`, `GET /datasets/<id>`
+and `GET /tables/<id>`; each person's Polaris
 principal created on first use; a login proxy that keeps a client session past the token's
 5-minute life by holding the refresh token and forwarding a fresh token to Trino; OPA
 reachable only by its callers; persistent storage events, each checking one folder, and no

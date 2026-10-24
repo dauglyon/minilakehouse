@@ -32,13 +32,13 @@ def token(user, audience):
 
 
 def main():
-    # 1. register the dataset WITH ITS MEANING, as a steward whose group owns datasets/projz/
+    # 1. register the dataset WITH ITS MEANING, as a steward of jgi, which owns datasets/projz/
     r = requests.post(f"{GOV}/datasets", headers={"Authorization": f"Bearer {token('alice', 'governance')}"}, json={
         "prefix": PREFIX,
         "description": "projz ingested dataset",
-        "describe": ["jgi-writers"],
-        "access": ["jgi-writers"],
-        "write": ["jgi-writers"],
+        "describe": ["jgi"],
+        "access": ["jgi"],
+        "write": ["jgi"],
     })
     print("register:", r.status_code, r.json())   # -> id "projz" (derived from the prefix)
     if r.status_code != 409:

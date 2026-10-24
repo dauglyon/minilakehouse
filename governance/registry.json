@@ -1,58 +1,54 @@
 {
   "groups": {
-    "jgi-writers": ["alice"],
-    "stewards": ["alice", "carol"],
-    "projw-team": ["carol"],
-    "no-access": ["bob"],
-    "group-admins": ["carol"]
+    "jgi": { "alice": "owner" },
+    "projw": { "carol": "owner" },
+    "noaccess": { "bob": "owner" },
+    "bobonly": {}
   },
-  "group_owners": {
-    "jgi-writers": ["jgi-writers"],
-    "stewards": ["group-admins"],
-    "projw-team": ["projw-team"],
-    "no-access": ["group-admins"],
-    "group-admins": ["group-admins"]
+  "stewards": {
+    "jgi": ["alice"],
+    "projw": ["carol"]
   },
-  "namespace_owners": { "jgi-writers": ["lakehouse.db"] },
+  "namespace_owners": { "jgi": ["lakehouse.db"] },
   "tables": [
     {
       "id": "lakehouse.db.t1",
       "description": "demo table",
       "steward": "alice",
       "describe": [],
-      "read": ["jgi-writers"],
-      "manage": ["jgi-writers"],
-      "write": ["jgi-writers"],
-      "delete": ["jgi-writers"]
+      "read": ["jgi"],
+      "manage": ["jgi"],
+      "write": ["jgi"],
+      "delete": ["jgi"]
     }
   ],
   "register_grants": {
-    "jgi-writers": ["datasets/projx/", "datasets/projz/"],
-    "projw-team": ["datasets/projw/"]
+    "jgi": ["datasets/projx/", "datasets/projz/"],
+    "projw": ["datasets/projw/"]
   },
   "datasets": [
     {
       "prefix": "datasets/projx/public/",
       "description": "projx public data",
       "steward": "alice",
-      "describe": ["jgi-writers"],
-      "access": ["jgi-writers"],
-      "manage": ["jgi-writers"]
+      "describe": ["jgi"],
+      "access": ["jgi"],
+      "manage": ["jgi"]
     },
     {
       "prefix": "datasets/projx/private/",
       "description": "projx private data",
       "steward": "alice",
-      "describe": ["jgi-writers"],
+      "describe": ["jgi"],
       "access": [],
-      "manage": ["jgi-writers"]
+      "manage": ["jgi"]
     },
     {
       "prefix": "datasets/projy/secret/",
       "description": "projy secret data",
       "steward": "bob",
-      "describe": ["bob-only"],
-      "access": ["bob-only"]
+      "describe": ["bobonly"],
+      "access": ["bobonly"]
     }
   ]
 }
