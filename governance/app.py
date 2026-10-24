@@ -113,6 +113,12 @@ GRANTS = ("describe", "read", "manage", "write", "delete", "detach", "revoked")
 # The columns holding them: a file dataset stores `read` as `access`.
 _GRANT_SQL = ", ".join(f'"{g}"' for g in GRANTS)
 _DATASET_GRANT_SQL = ", ".join(f'"{"access" if g == "read" else g}"' for g in GRANTS)
+# A collection's id: its group and a name, <group>:<name>. The colon is in no folder or table id.
+COLLECTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_@.-]{0,254}:[a-z][a-z0-9_-]{0,62}$")
+# A collection's grants (docs/HANDOFF-2026-10-22-groups.md section 5): `describe` and `read`
+# reach every member, through nested collections; the others are the collection's own.
+COLLECTION_GRANTS = ("describe", "read", "manage", "write", "delete")
+_COLLECTION_GRANT_SQL = ", ".join(f'"{g}"' for g in COLLECTION_GRANTS)
 # A person's personal group, and so the name of their space: u_<user>, for a user name that can
 # name a folder and a namespace level.
 PERSONAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,61}$")
@@ -139,6 +145,7 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "lakehouse")
 MAX_EVENT_RECORDS = 1000  # refuse larger deliveries: the endpoint is unauthenticated
 SEED_LOCK_KEY = 0x6D6C68      # arbitrary fixed key: serialize the one-time registry seed
 PUBLISH_LOCK_KEY = 0x6D6C72   # arbitrary fixed key: serialize publishing, so published datasets never nest
+COLLECTIONS_LOCK_KEY = 0x6D6C63  # arbitrary fixed key: serialize collection membership, so no cycle forms
 # Short timeouts: a slow or absent RGW fails the check quickly, and the event that triggered it
 # is delivered again (persistent topic), so governance never hangs on storage.
 _boto_cfg = Config(signature_version="s3v4", connect_timeout=5, read_timeout=5,
@@ -409,6 +416,29 @@ CREATE TABLE IF NOT EXISTS sources_version (
     dataset TEXT PRIMARY KEY,
     version BIGINT NOT NULL
 );
+-- Collections (docs/HANDOFF-2026-10-22-groups.md section 5): published datasets and other
+-- collections, by reference, owned by a group. A collection holds no data.
+CREATE TABLE IF NOT EXISTS collections (
+    id          TEXT PRIMARY KEY,             -- <group>:<name>
+    owner       TEXT NOT NULL,                -- the group
+    description TEXT,
+    created_by  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    describe    TEXT[] NOT NULL DEFAULT '{}',
+    read        TEXT[] NOT NULL DEFAULT '{}',
+    manage      TEXT[] NOT NULL DEFAULT '{}',
+    write       TEXT[] NOT NULL DEFAULT '{}',
+    "delete"    TEXT[] NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS collection_members (
+    collection  TEXT NOT NULL REFERENCES collections (id) ON DELETE CASCADE,
+    member      TEXT NOT NULL,                -- a published folder's id, a published namespace's, a collection's
+    member_kind TEXT NOT NULL,                -- files | namespace | collection
+    added_by    TEXT NOT NULL,
+    added_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (collection, member)
+);
+CREATE INDEX IF NOT EXISTS collection_members_member ON collection_members (member);
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -717,6 +747,8 @@ def list_folder(ds_id, found=None):
         return False
     found = _listing(prefix) if found is None else found
     with db(commit=True) as cur:
+        # A storage event and a lookup can list one folder at once; each replaces the rows whole.
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"list:{ds_id}",))
         cur.execute("DELETE FROM files WHERE dataset = %s", (ds_id,))
         for key, modified, _ in found:
             cur.execute("INSERT INTO files (dataset, key, last_modified) VALUES (%s, %s, %s)",
@@ -945,21 +977,49 @@ def _folder_layers(cur, items):
 
 def _namespace_layers(cur, names):
     """{namespace id: ([(where, grants)], the nearest published namespace at or above it, or
-    None)}: the grants of the namespace and of each one above it, nearest first, and its space's
-    defaults."""
+    None)}: the grants of the namespace and of each one above it, nearest first, its space's
+    defaults, and the describe and read of each collection holding a published one of them."""
     cur.execute(f"SELECT id, description, published, published_by, {_GRANT_SQL} FROM namespaces "
                 "WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) n "
                 "WHERE n = id OR starts_with(n, id || '.'))", (sorted(set(names)),))
     rows = sorted(cur.fetchall(), key=lambda r: -len(r["id"]))
     spaces = _spaces(cur, {_table_space(n) for n in names})
+    held = _collection_layers(cur, [r["id"] for r in rows if r["published"]])
     out = {}
     for n in names:
         above = [r for r in rows if n == r["id"] or n.startswith(r["id"] + ".")]
         layers = [(r["id"], _grants_of(r)) for r in above]
+        layers += [l for r in above for l in held.get(r["id"], [])]
         if _table_space(n) in spaces:
             layers.append(("space", spaces[_table_space(n)]))
         out[n] = (layers, next((r for r in above if r["published"]), None))
     return out
+
+
+# Every collection holding each of these members, directly or through other collections, with
+# its own describe and read.
+_UP_SQL = """
+WITH RECURSIVE up(member, collection) AS (
+    SELECT member, collection FROM collection_members WHERE member = ANY(%s)
+    UNION
+    SELECT up.member, cm.collection FROM up JOIN collection_members cm ON cm.member = up.collection
+)
+SELECT up.member, c.id, c.describe, c.read FROM up JOIN collections c ON c.id = up.collection
+"""
+
+
+def _collection_layers(cur, members):
+    """{member: [(where, grants)]}: for each published folder, published namespace or collection,
+    the `describe` and `read` of every collection holding it, directly or through others, each
+    as a layer (where "collection <id>") with no other grant (docs/HANDOFF-2026-10-22-groups.md
+    section 5)."""
+    cur.execute(_UP_SQL, (sorted(set(members)),))
+    out = {}
+    for r in cur.fetchall():
+        out.setdefault(r["member"], []).append(
+            (f"collection {r['id']}", {**{g: [] for g in GRANTS}, "describe": sorted(r["describe"]),
+                                       "read": sorted(r["read"])}))
+    return {m: sorted(ls, key=lambda l: l[0]) for m, ls in out.items()}
 
 
 _DATASET_SQL = (f"SELECT id, prefix, description, steward, published, status, moved_to, {_DATASET_GRANT_SQL} "
@@ -986,6 +1046,9 @@ def _file_entries(ids, would_be=False):
             items += [(i, f"datasets/{i}/", None) for i in ids
                       if i not in rows and _confined_prefix(f"datasets/{i}/")]
         layers = _folder_layers(cur, items)
+        # A published folder in a collection also has the collection's describe and read.
+        held = _collection_layers(cur, [i for i, _, own in items if own is not None])
+        layers = {i: ls + held.get(i, []) for i, ls in layers.items()}
         cur.execute("SELECT id, prefix FROM datasets WHERE published")
         published = cur.fetchall()
         cur.execute("SELECT id, prefix FROM datasets WHERE status = 'moved'")
@@ -1034,6 +1097,29 @@ def _table_entries(ids, would_be=False):
                       "description": pub["description"] if pub else None,
                       "steward": pub["published_by"] if pub else None, **_union(layers[i])}
     return entries, layers
+
+
+def _collection_entries(ids):
+    """{id: entry} for collections: their own grants, with `describe` and `read` also those of
+    every collection holding them, the owning group, and their members as [{id, kind}]."""
+    with db() as cur:
+        cur.execute(f"SELECT id, owner, description, {_COLLECTION_GRANT_SQL} FROM collections WHERE id = ANY(%s)",
+                    (list(ids),))
+        rows = {r["id"]: r for r in cur.fetchall()}
+        held = _collection_layers(cur, list(rows))
+        cur.execute("SELECT collection, member, member_kind FROM collection_members WHERE collection = ANY(%s) "
+                    "ORDER BY member", (list(rows),))
+        members = {}
+        for m in cur.fetchall():
+            members.setdefault(m["collection"], []).append({"id": m["member"], "kind": m["member_kind"]})
+    out = {}
+    for i, r in rows.items():
+        own = {g: sorted(r[g]) for g in COLLECTION_GRANTS}
+        out[i] = {"id": i, "owner": r["owner"], "description": r["description"], **own,
+                  "describe": sorted({*own["describe"], *(n for _, l in held.get(i, []) for n in l["describe"])}),
+                  "read": sorted({*own["read"], *(n for _, l in held.get(i, []) for n in l["read"])}),
+                  "members": members.get(i, [])}
+    return out
 
 
 def _effective(ids):
@@ -1156,6 +1242,14 @@ def internal_folders():
                    **_union(([(p, own[p])] if p in own else []) + layers[i])}
                for i, p in items if any(where == "space" for where, _ in layers[i])}
     return jsonify({"entries": entries})
+
+
+@internal_app.post("/internal/collections")
+def internal_collections():
+    # {id: entry} for the named collections (_collection_entries); an unknown id is absent.
+    if (ids := _ids_from_body()) is None:
+        return jsonify({"error": "ids must be a list of strings"}), 400
+    return jsonify({"entries": _collection_entries(ids)})
 
 
 @internal_app.get("/internal/groups/<subject>")
@@ -1594,6 +1688,167 @@ def transfer_table():
     return jsonify({"ok": True, "from": src, "to": dst, "transfer": tid})
 
 
+# Collections (docs/HANDOFF-2026-10-22-groups.md section 5). A collection belongs to a group,
+# whose space's defaults it takes: describe, read and write for the group, manage for its
+# stewards, delete for its admins.
+
+
+@app.post("/collections")
+def create_collection():
+    # {"group", "name", "description"}: a member or above of the group (OPA's
+    # lakehouse.collections.allow_create). Its id is <group>:<name>.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    body = request.get_json(silent=True) or {}
+    group, name = body.get("group"), body.get("name")
+    cid = f"{group}:{name}"
+    if not (isinstance(group, str) and isinstance(name, str) and COLLECTION_RE.match(cid)
+            and isinstance(body.get("description", ""), str) and set(body) <= {"group", "name", "description"}):
+        return jsonify({"error": "body is {group, name, description}; a name is lowercase letters, digits, _ and -"}), 400
+    if opa("allow_create", {"subject": subject, "group": group, "platform_admin": platform_admin(claims)},
+           package="collections") is not True:
+        return jsonify({"error": "forbidden"}), 403
+    with db(commit=True) as cur:
+        cur.execute(f"INSERT INTO collections (id, owner, description, created_by, {_COLLECTION_GRANT_SQL}) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING RETURNING id",
+                    (cid, group, body.get("description"), subject, [group], [group], [f"{group}#steward"],
+                     [group], [f"{group}#admin"]))
+        if cur.fetchone() is None:
+            return jsonify({"error": f"{cid} exists"}), 409
+    app.logger.info("COLLECTION create %s (%s)", cid, subject)
+    return jsonify({"ok": True, "id": cid, **_collection_entries([cid])[cid]}), 201
+
+
+@app.patch("/collections/<cid>")
+def change_collection(cid):
+    # {"description"} with `write` on it, and {"changes": [{group, add, remove}]} as in the
+    # permissions API: `describe` and `read` by its `manage` holders, `manage`, `write` and
+    # `delete` by the owning group's stewards (OPA's allow_change), decided under a lock on it.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    body = request.get_json(silent=True) or {}
+    changes = body.get("changes", [])
+    changes_ok = not changes or (_valid_changes(changes) and all(
+        set(c.get(k, [])) <= set(COLLECTION_GRANTS) for c in changes for k in ("add", "remove")))
+    if not (body and set(body) <= {"description", "changes"} and isinstance(body.get("description", ""), str)
+            and changes_ok):
+        return jsonify({"error": "body is {description, changes: [{group, add: [grant], remove: [grant]}]} "
+                                 f"with grants from {list(COLLECTION_GRANTS)}"}), 400
+    named = sorted({g for c in changes for k in ("add", "remove") for g in c.get(k, [])})
+    with db(commit=True) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"collection:{cid}",))
+        cur.execute(f"SELECT {_COLLECTION_GRANT_SQL} FROM collections WHERE id = %s", (cid,))
+        row = cur.fetchone()
+        inp = {"subject": subject, "collection": cid, "platform_admin": platform_admin(claims)}
+        if row is None or ("description" in body and opa("allow_write", inp, package="collections") is not True) \
+                or (named and opa("allow_change", {**inp, "grants": named}, package="collections") is not True):
+            return jsonify({"error": "forbidden"}), 403
+        sets = {g: set(row[g]) for g in COLLECTION_GRANTS}
+        for c in changes:
+            for g in c.get("add", []):
+                sets[g].add(c["group"])
+            for g in c.get("remove", []):
+                sets[g].discard(c["group"])
+        cur.execute("UPDATE collections SET description = COALESCE(%s, description), "
+                    + ", ".join(f'"{g}" = %s' for g in COLLECTION_GRANTS) + " WHERE id = %s",
+                    (body.get("description"), *(sorted(sets[g]) for g in COLLECTION_GRANTS), cid))
+    app.logger.info("COLLECTION change %s (%s) %s", cid, subject, body)
+    return jsonify({"ok": True, **_collection_entries([cid])[cid]})
+
+
+def _member_kind(member):
+    """files | namespace | collection for a published folder, a published namespace or a
+    collection; None for anything else."""
+    with db() as cur:
+        if COLLECTION_RE.match(member):
+            cur.execute("SELECT 1 FROM collections WHERE id = %s", (member,))
+            return "collection" if cur.fetchone() else None
+        cur.execute("SELECT 1 FROM datasets WHERE id = %s AND published AND status <> 'moved'", (member,))
+        if cur.fetchone():
+            return "files"
+        cur.execute("SELECT 1 FROM namespaces WHERE id = %s AND published", (member,))
+        return "namespace" if cur.fetchone() else None
+
+
+@app.route("/collections/<cid>/members/<path:member>", methods=["POST", "DELETE"])
+def change_member(cid, member):
+    # Add (POST) a published dataset or a collection: `write` on the collection and `manage` on
+    # what is added, whose holders so consent to it joining (OPA's allow_add); a collection that
+    # would come to hold itself is refused. Remove (DELETE): `write` on the collection, or
+    # `manage` on the member (allow_remove). Additions take one lock, so two cannot make a cycle
+    # between them.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    kind = _member_kind(member)
+    inp = {"subject": subject, "collection": cid, "member": member, "kind": kind,
+           "platform_admin": platform_admin(claims)}
+    with db(commit=True) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (COLLECTIONS_LOCK_KEY,))
+        cur.execute("SELECT 1 FROM collections WHERE id = %s", (cid,))
+        if cur.fetchone() is None or kind is None:
+            return jsonify({"error": "forbidden"}), 403
+        if request.method == "DELETE":
+            if opa("allow_remove", inp, package="collections") is not True:
+                return jsonify({"error": "forbidden"}), 403
+            cur.execute("DELETE FROM collection_members WHERE collection = %s AND member = %s", (cid, member))
+        else:
+            if opa("allow_add", inp, package="collections") is not True:
+                return jsonify({"error": "forbidden"}), 403
+            if kind == "collection":
+                cur.execute("WITH RECURSIVE down(id) AS (SELECT %s::text UNION SELECT cm.member FROM down "
+                            "JOIN collection_members cm ON cm.collection = down.id) "
+                            "SELECT 1 FROM down WHERE id = %s", (member, cid))
+                if cur.fetchone():
+                    return jsonify({"error": f"{member} holds {cid}: adding it would make a cycle"}), 409
+            cur.execute("INSERT INTO collection_members (collection, member, member_kind, added_by) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (cid, member, kind, subject))
+    app.logger.info("COLLECTION %s %s %s (%s)", "add" if request.method == "POST" else "remove", cid, member, subject)
+    return jsonify({"ok": True, **_collection_entries([cid])[cid]})
+
+
+@app.delete("/collections/<cid>")
+def delete_collection(cid):
+    # Its `delete` holders (the owning group's admins by default); its members are untouched.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    with db(commit=True) as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (COLLECTIONS_LOCK_KEY,))
+        if opa("allow_delete", {"subject": subject, "collection": cid}, package="collections") is not True:
+            return jsonify({"error": "forbidden"}), 403
+        cur.execute("DELETE FROM collection_members WHERE member = %s", (cid,))
+        cur.execute("DELETE FROM collections WHERE id = %s", (cid,))
+    app.logger.info("COLLECTION delete %s (%s)", cid, subject)
+    return jsonify({"ok": True, "id": cid})
+
+
+@app.get("/collections/<cid>")
+def get_collection(cid):
+    # For those who may describe it: its description, grants, and the members they may
+    # describe, with a count of the others.
+    subject, err = authed_user()
+    if err:
+        return err
+    c = opa("discover", {"subject": subject, "collections": [cid]}, package="collections") or {}
+    if cid not in c.get("visible", []):
+        return jsonify({"error": "not found"}), 404
+    e = _collection_entries([cid])[cid]
+    shown = _describable(subject, [m["id"] for m in e["members"] if m["kind"] != "collection"])
+    shown |= set((opa("discover", {"subject": subject, "collections": [m["id"] for m in e["members"]
+                                                                       if m["kind"] == "collection"]},
+                      package="collections") or {}).get("visible", []))
+    return jsonify({**{k: v for k, v in e.items() if k != "members"}, "can_read": cid in c.get("readable", []),
+                    "members": [m for m in e["members"] if m["id"] in shown],
+                    "hidden_members": len([m for m in e["members"] if m["id"] not in shown])})
+
+
 def _publish_body(body):
     """The description and own grants a publish names, or None when malformed."""
     if not isinstance(body, dict) or not set(body) <= {"description", *GRANTS}:
@@ -1705,6 +1960,8 @@ SELECT EXISTS (SELECT 1 FROM groups WHERE name = %(g)s)
     OR EXISTS (SELECT 1 FROM namespaces, unnest(describe || read || manage || write || "delete" || detach) n
                WHERE split_part(n, '#', 1) = %(g)s)
     OR EXISTS (SELECT 1 FROM namespaces WHERE split_part(id, '.', 2) = %(g)s)
+    OR EXISTS (SELECT 1 FROM collections, unnest(describe || read || manage || write || "delete") n
+               WHERE owner = %(g)s OR split_part(n, '#', 1) = %(g)s)
     -- A space with entries in it: the new group's defaults would reach them.
     OR EXISTS (SELECT 1 FROM datasets WHERE split_part(prefix, '/', 2) = %(g)s)
     OR EXISTS (SELECT 1 FROM table_entries WHERE split_part(id, '.', 2) = %(g)s) AS used
@@ -1977,6 +2234,8 @@ def _entry_view(kind, entry_id):
     if set(write_names) & set(grants["manage"]):
         out["revocations"] = [{"group": r["grp"], **{k: r[k] for k in ("added_by", "added_at", "removed_by",
                                                                     "removed_at")}} for r in revocations]
+        # Every collection it reaches, which its manage holders consented to (handoff section 5).
+        out["collections"] = sorted(w.split(" ", 1)[1] for w, _ in layers[entry_id] if w.startswith("collection "))
     if not readable:
         blocking = sorted(opa("blocking", {"subject": subject, key: entry_id}, package=package) or [])
         named = _describable(subject, blocking) if blocking else set()
@@ -2012,14 +2271,26 @@ def get_table(table_id):
 _INDEX_FILES_SQL = """
 SELECT id FROM datasets d WHERE status = 'live' AND (
     split_part(prefix, '/', 2) = ANY(%(groups)s) OR (describe || access) && %(names)s::text[]
+    OR id = ANY(%(held)s)
     OR EXISTS (SELECT 1 FROM folder_grants f WHERE starts_with(d.prefix, f.prefix) AND d.prefix <> f.prefix
                AND (f.describe || f.read) && %(names)s::text[]))
 """
 _INDEX_TABLES_SQL = """
 SELECT id FROM table_entries t WHERE status = 'live' AND (
     split_part(id, '.', 2) = ANY(%(groups)s)
+    OR EXISTS (SELECT 1 FROM unnest(%(held)s::text[]) h WHERE starts_with(t.id, h || '.'))
     OR EXISTS (SELECT 1 FROM namespaces n WHERE starts_with(t.id, n.id || '.')
                AND (n.describe || n.read || n.write) && %(names)s::text[]))
+"""
+# Every collection some of whose own describe or read names the person, and what they hold,
+# directly or through other collections.
+_HELD_SQL = """
+WITH RECURSIVE down(id, kind) AS (
+    SELECT id, 'collection' FROM collections WHERE (describe || read) && %(names)s::text[]
+    UNION
+    SELECT cm.member, cm.member_kind FROM down JOIN collection_members cm ON cm.collection = down.id
+)
+SELECT id, kind FROM down
 """
 
 
@@ -2035,7 +2306,10 @@ def _index_rows(subject):
     see rather than the catalog's size. seed/check-index-narrowing.py checks the two agree."""
     with db() as cur:
         names, _ = _group_names(cur, subject)
-        params = {"names": names, "groups": sorted({n.split("#")[0] for n in names})}
+        cur.execute(_HELD_SQL, {"names": names})
+        held = cur.fetchall()
+        params = {"names": names, "groups": sorted({n.split("#")[0] for n in names}),
+                  "held": [h["id"] for h in held if h["kind"] != "collection"]}
         cur.execute(_INDEX_FILES_SQL, params)
         files = [r["id"] for r in cur.fetchall()]
         cur.execute(_INDEX_TABLES_SQL, params)
@@ -2050,7 +2324,24 @@ def _index_rows(subject):
     shown, _ = _table_entries(t["tables"]) if t["tables"] else ({}, {})
     rows += [{"id": i, "kind": "table", "description": e["description"], "steward": e["steward"],
               "can_read": i in t["readable"], "published": e["published"]} for i, e in shown.items()]
+    collections = sorted({h["id"] for h in held if h["kind"] == "collection"})
+    c = (opa("discover", {"subject": subject, "collections": collections}, package="collections")
+         if collections else {"visible": [], "readable": []})
+    for i, e in _collection_entries(c["visible"]).items():
+        rows.append({"id": i, "kind": "collection", "description": e["description"], "steward": e["owner"],
+                     "can_read": i in c["readable"], "published": True})
     return sorted(rows, key=lambda r: (r["kind"], r["id"]))
+
+
+def _collection_member_rows(subject):
+    """governance.collection_members: for each collection the subject's index lists, the
+    members it lists too."""
+    seen = {r["id"]: r["kind"] for r in _index_rows(subject)}
+    collections = _collection_entries([i for i, k in seen.items() if k == "collection"])
+    tables = {i for i, k in seen.items() if k == "table"}
+    return [{"collection": c, "member": m["id"], "kind": m["kind"]}
+            for c, e in sorted(collections.items()) for m in e["members"]
+            if m["id"] in seen or (m["kind"] == "namespace" and any(t.startswith(m["id"] + ".") for t in tables))]
 
 
 def _session_rows(subject, sid):
@@ -2434,6 +2725,8 @@ def _grant_rows(subject):
     files = [r["id"] for r in seen if r["kind"] == "files"]
     tables = [r["id"] for r in seen if r["kind"] == "table"]
     layers = {**(_file_entries(files)[1] if files else {}), **(_table_entries(tables)[1] if tables else {})}
+    layers.update({i: [("own", {**{g: [] for g in GRANTS}, **{g: e[g] for g in COLLECTION_GRANTS}})]
+                   for i, e in _collection_entries([r["id"] for r in seen if r["kind"] == "collection"]).items()})
     kinds = {r["id"]: r["kind"] for r in seen}
     rows = {(i, g, n): None if where == "own" else where
             for i, ls in layers.items() for where, grants in reversed(ls) for g in GRANTS for n in grants[g]}
@@ -2537,6 +2830,8 @@ def index_load():
         rows = _release_rows(subject)
     elif name == "grants":
         rows = _grant_rows(subject)
+    elif name == "collection_members":
+        rows = _collection_member_rows(subject)
     else:
         return jsonify({"error": "no such table"}), 404
     table = index_table.build(subject, name, rows)

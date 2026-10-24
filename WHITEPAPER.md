@@ -108,7 +108,7 @@ service.
 | `published` | Whether a steward has published it: a folder, or a namespace at or above a table. A folder becomes an entry at its first credential, unpublished. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups, and `revoked` beside them (section 4.3, `PROVENANCE.md` 9). Each is a union of layers: a published folder's own, those of every folder or namespace above it, and its space's defaults; a table has none of its own. See 4.2. |
+| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups, and `revoked` beside them (section 4.3, `PROVENANCE.md` 9). Each is a union of layers: a published folder's own, those of every folder or namespace above it, its space's defaults, and the `describe` and `read` of every collection holding it (section 10); a table has none of its own. See 4.2. |
 | sources | Not stored in the entry: the datasets its stored files were built from, worked out from the access log and a listing of its folder. See 4.3. |
 | releases | Per source, the groups that source's `manage` holders let read this dataset although they may not read the source. See 4.3. |
 | `status` | `live`, `gone`, `moved` with `moved_to`. See section 9. |
@@ -252,6 +252,10 @@ grants OPA reads are the ones the write replaces.
   `governance`. A name any grant already uses, or whose space has entries, is refused, since
   the new group's owner would hold those grants.
 - Deleting a group: its owners, while its space holds no data.
+- A collection's `describe` and `read`: callers holding its `manage`; its `manage`, `write`
+  and `delete`: stewards of the group it belongs to. Its description and members: callers
+  holding its `write`, with `manage` on each member added; a member's `manage` holders may
+  also remove it from any collection holding it directly.
 - Moving a folder or a table into another group's space: the person whose personal space holds
   it, or an owner or admin of the plain group whose space does, into a group they are a member
   or above of, at a path that does not exist and is not inside a published dataset.
@@ -600,11 +604,12 @@ insert into `governance.sessions` or `POST /sessions`, `governance.lineage`, dec
 `governance.derivations` or `POST /declarations`, sources carried per stored file and stored
 per entry until what they come from changes, rule 3 in OPA for reading and writing files and
 tables, the personal-space exemption and `revoked`, detaching and putting back, releases
-(`POST /releases`, `governance.releases`), and `governance.grants`.
+(`POST /releases`, `governance.releases`), and `governance.grants`. Collections, nesting, whose
+`describe` and `read` reach their members and those members' rule 3 lookups, listed in
+`governance.datasets` and `governance.collection_members`.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files; there are no collections; events are checked as each delivery arrives rather than
-coalesced per folder.
+with files; events are checked as each delivery arrives rather than coalesced per folder.
 
 ## 14. Questions for the reviewer
 

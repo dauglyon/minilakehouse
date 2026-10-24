@@ -21,16 +21,20 @@ with app.db() as cur:
     files = [r["id"] for r in cur.fetchall()]
     cur.execute("SELECT id FROM table_entries WHERE status = 'live'")
     tables = [r["id"] for r in cur.fetchall()]
+    cur.execute("SELECT id FROM collections")
+    collections = [r["id"] for r in cur.fetchall()]
 
 bad = 0
 for s in subjects:
     full = {("files", i) for i in app.opa("discover", {"subject": s, "datasets": files})["visible"]}
     full |= {("table", i) for i in app.opa("decide", {"subject": s, "tables": tables,
                                                       "namespaces": []}, package="tables")["tables"]}
+    full |= {("collection", i) for i in app.opa("discover", {"subject": s, "collections": collections},
+                                                package="collections")["visible"]}
     narrowed = {(r["kind"], r["id"]) for r in app._index_rows(s)}
     if full != narrowed:
         bad += 1
         print(f"{s}: OPA alone shows {sorted(full - narrowed)}, narrowing adds {sorted(narrowed - full)}")
-print(f"{len(subjects)} people, {len(files)} file datasets, {len(tables)} tables: "
+print(f"{len(subjects)} people, {len(files)} file datasets, {len(tables)} tables, {len(collections)} collections: "
       f"{'narrowing matches OPA' if not bad else f'{bad} differ'}")
 sys.exit(1 if bad else 0)

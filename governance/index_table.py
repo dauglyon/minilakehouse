@@ -59,7 +59,7 @@ def _schema(*columns):
 
 
 TABLES = {
-    "datasets": _schema(("id", StringType), ("kind", StringType),   # kind: table | files
+    "datasets": _schema(("id", StringType), ("kind", StringType),   # kind: table | files | collection
                         ("description", StringType), ("steward", StringType),
                         ("can_read", BooleanType), ("published", BooleanType)),
     "sessions": _schema(("name", StringType), ("started", TimestamptzType),
@@ -79,6 +79,8 @@ TABLES = {
     "grants": _schema(("entry", StringType), ("kind", StringType),   # Unity Catalog's column names
                       ("privilege_type", StringType), ("grantee", StringType),
                       ("inherited_from", StringType)),   # a folder, a namespace, `space`; empty for its own
+    "collection_members": _schema(("collection", StringType), ("member", StringType),
+                                  ("kind", StringType)),   # files | namespace | collection
 }
 WRITABLE = {"derivations", "sessions"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine

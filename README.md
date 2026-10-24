@@ -24,6 +24,7 @@ vending broker) — with a real **metadata-visibility plane** (describe-but-not-
 - [Flow C — blob datasets](#flow-c--blob-datasets)
 - [Registry freshness & governed ingest](#registry-freshness--governed-ingest)
 - [Spaces and publishing](#spaces-and-publishing)
+- [Collections](#collections)
 - [Changing grants](#changing-grants)
 - [Changing groups](#changing-groups)
 - [Sessions and the access log](#sessions-and-the-access-log)
@@ -327,6 +328,42 @@ Its members write there with no step first, and a steward publishes what is to b
   dropped. The old entry stays, `moved` to the new one: data built from the old folder or table
   is checked against the new one's grants, and a credential for the old path is refused with the
   new path named to anyone who may describe it.
+
+## Collections
+
+A collection (`docs/HANDOFF-2026-10-22-groups.md` section 5) groups published datasets, folders
+and namespaces alike, and other collections, by reference; it holds no data and no credential
+is issued for it. It belongs to a group and is named `<group>:<name>`; it takes its group's
+space defaults. Its `describe` and `read` reach every member, through nested collections, still
+cut by each member's sources; its `manage`, `write` and `delete` are its own. Adding a member
+takes `write` on the collection and `manage` on the member, whose holders so consent; removing
+takes either, and a collection that would come to hold itself is refused.
+`POST /collections {"group", "name", "description"}`, `PATCH /collections/<id>` (description,
+and grant changes in the permissions API's shape), `POST` and `DELETE
+/collections/<id>/members/<member>`, `DELETE /collections/<id>` and `GET /collections/<id>`.
+`governance.datasets` lists collections (kind `collection`) and `governance.collection_members`
+their members, to those who may describe them.
+
+```bash
+docker compose exec -T governance python - <<'PY'
+import requests
+KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
+def h(u, aud): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
+    client_id="trino", client_secret="trino-secret", username=u, password=u,
+    scope=f"openid aud-{aud}")).json()["access_token"]}
+G, A = "http://governance:8000", h("alice", "governance")
+vend = lambda: requests.post("http://broker:9100/vend", headers=h("carol", "broker"),
+                             json={"folder": "jgi/public"}).status_code
+print("create :", requests.post(f"{G}/collections", headers=A, json={"group": "jgi", "name": "forprojw"}).status_code)
+requests.patch(f"{G}/collections/jgi:forprojw", headers=A, json={"changes": [{"group": "projw", "add": ["read"]}]})
+print("add    :", requests.post(f"{G}/collections/jgi:forprojw/members/jgi/public", headers=A).status_code, vend())
+print("remove :", requests.delete(f"{G}/collections/jgi:forprojw/members/jgi/public", headers=A).status_code, vend())
+requests.delete(f"{G}/collections/jgi:forprojw", headers=A)
+PY
+#  -> create : 201
+#     add    : 200 200        carol, in projw, reads jgi/public through the collection
+#     remove : 200 403
+```
 
 ## Changing grants
 

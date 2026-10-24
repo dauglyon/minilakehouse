@@ -93,7 +93,7 @@ files/blobs over S3) under the *same* governance model as tables.
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
-| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, makes a folder an entry at its first credential, accepts publishing and grant, group and steward changes, records transfers, answers the read routes (`GET /me`, `/groups/<name>`, `/datasets/<id>`, `/tables/<id>`), records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `lineage`, `derivations`), accepts declarations as commits to `governance.derivations` and signs them, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
+| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, makes a folder an entry at its first credential, accepts publishing and grant, group and steward changes, keeps collections, records transfers, answers the read routes (`GET /me`, `/groups/<name>`, `/datasets/<id>`, `/tables/<id>`), records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `lineage`, `derivations`), accepts declarations as commits to `governance.derivations` and signs them, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
 | **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata, cut to the current version without counts unless OPA's `tables.load` allows the rest, and cuts a view's responses the same way for someone who may only describe it; refuses a view that would run with its owner's rights; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance log each table credential it passes on and each table write it forwards, refusing the request when the log fails; has governance create a person's Polaris principal before their first request; answers for the `governance` namespace's tables itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
@@ -180,6 +180,11 @@ derivations.allowed     governance  {subject, target,          POST /internal/ta
                                      sources: [{id, direct}]}    POST /internal/datasets      marked unused
 derivations.may_release governance  {subject, sources: [{id}]} POST /internal/tables,       [id]: sources whose releases
                                                                  POST /internal/datasets      the subject decides
+collections.allow_create, allow_write, allow_change, allow_add, allow_remove, allow_delete
+                        governance  {subject, collection,      POST /internal/collections,  true | false
+                                     member, kind, grants,       and the member's entry
+                                     platform_admin}
+collections.discover    governance  {subject, collections}     POST /internal/collections   {visible: [id], readable: [id]}
 groups.allow_create     governance  {subject}                  —                            true | false
 groups.allow_change     governance  {subject, group, roles,    —                            true | false
                                      platform_admin}
@@ -192,8 +197,9 @@ Every rule also fetches `GET /internal/groups/<subject>`, except the shipped `ta
 
 An entry's grants are layers (`docs/HANDOFF-2026-10-22-groups.md` sections 1 to 3): a published
 folder's own, every folder's or namespace's above it, and its space's defaults; a table has none
-of its own. Governance serves their union, and answers for a folder no credential has named yet
-as for an entry, so its first credential is decided like any other.
+of its own; and the `describe` and `read` of every collection holding the dataset, directly or
+through other collections. Governance serves their union, and answers for a folder no
+credential has named yet as for an entry, so its first credential is decided like any other.
 
 One path for every caller because it is the only one Polaris can use: Polaris builds its own
 input and cannot attach an entry. Each decision makes at most one fetch; a failed fetch
