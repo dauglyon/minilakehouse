@@ -572,9 +572,12 @@ FILE_TIME_SLACK = 2
 # Whether a logged write counts toward dataset %(t)s at folder %(loc)s: it names no location (a
 # file credential, a commit to an existing table), or the table's folder, or a location a commit
 # the gate logged for the table names, which covers a table whose creation report was lost. A
-# staged create abandoned before its commit was logged names a folder nothing else does.
-_COUNTS_SQL = """(location IS NULL OR location = %(loc)s OR location IN (
-          SELECT c.location FROM accesses c WHERE c.dataset = %(t)s AND c.mode = 'write'
+# staged create abandoned before its commit was logged names a folder nothing else does. Every
+# table commit is logged before Polaris sees it and counts toward its own table, so a table
+# whose folder is unknown still carries its writers' reads. Trailing slashes are ignored: a
+# create's location comes from the client, the others from Polaris.
+_COUNTS_SQL = """(location IS NULL OR rtrim(location, '/') = rtrim(%(loc)s, '/') OR rtrim(location, '/') IN (
+          SELECT rtrim(c.location, '/') FROM accesses c WHERE c.dataset = %(t)s AND c.mode = 'write'
           AND c.expires IS NULL AND c.location IS NOT NULL))"""
 
 _CARRIED_SQL = """
@@ -1308,8 +1311,8 @@ WITH a AS (
            CASE WHEN kind = 'files' THEN COALESCE(expires, 'infinity') ELSE at END AS until
     FROM accesses a WHERE person = %(p)s
       AND (a.mode <> 'write' OR a.location IS NULL
-           OR a.location = (SELECT t.location FROM table_entries t WHERE t.id = a.dataset)
-           OR a.location IN (SELECT c.location FROM accesses c WHERE c.dataset = a.dataset
+           OR rtrim(a.location, '/') = (SELECT rtrim(t.location, '/') FROM table_entries t WHERE t.id = a.dataset)
+           OR rtrim(a.location, '/') IN (SELECT rtrim(c.location, '/') FROM accesses c WHERE c.dataset = a.dataset
                              AND c.mode = 'write' AND c.expires IS NULL AND c.location IS NOT NULL))
 ), reads AS (  -- each read once per source it brought in; direct for the dataset read
     SELECT a.id, a.session, a.sid, a.at, src.source, src.source = a.dataset AS direct
