@@ -85,7 +85,7 @@ and Spark Connect proxy have not been read; either may decide access itself.
 | Unity Catalog (open source) | A catalog holding tables and a file entity with vending for both. | Permission model is the product's; reachable only through the product's API. |
 | Apache Gravitino | A catalog holding tables and filesets, with grants over both. Its Iceberg REST server filters list responses per entry before paginating. Its Trino connector reads a per-user token from the Trino extra credential section 6 uses. | The permissions API grants and revokes; it has no "may U do X on O" query, so decisions happen only inside Gravitino's own API. Filesets are governed by GVFS, a client filesystem library for Hadoop and fsspec clients that resolves a fileset to its location; storage enforces nothing unless credential vending is turned on, and it is off by default. A client attaching the Trino token itself is untested with Gravitino. |
 | Immuta, Privacera | One policy, many platforms as enforcement points. The scope this design shares. | Immuta compiles policy into each platform's native controls; Privacera's Ranger lineage puts a plugin on the engine's query path. Both commercial. |
-| SQL views with `WITH GRANT OPTION` | Invoker-rights views give declared-intersect-underlying; grant option is the share right. | One database engine. |
+| SQL views with `WITH GRANT OPTION` | Invoker-rights views give declared-intersect-underlying; grant option is the `manage` right. | One database engine. |
 | Envoy `ext_authz` and `ext_proc` with the OPA Envoy plugin | The enforcement-point pattern the gate in section 5 follows. | A mechanism, not a model. |
 | Trino OPA system access control | Engine-side enforcement point over the same OPA data, with batched listing filters. | The Trino path only. |
 
@@ -106,7 +106,7 @@ service.
 | `kind` | `table` or `blob`. Views are `table`. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `describe`, `read`, `share`, `write`, `delete` | Five sets of groups. See 4.2. |
+| `describe`, `read`, `manage`, `write`, `delete` | Five sets of groups. See 4.2. |
 | `inputs` | Ids of datasets this one was built from. Set at registration, immutable. Every input must already exist and ids are never reused, so the input graph is acyclic. |
 | `releases` | Per grant, groups the dataset was released to past the inputs' intersection, each with the covering groups and inputs that justified it. See 4.3. |
 | `status` | `pending`, `live`, `gone`. See section 9. |
@@ -125,7 +125,7 @@ request, since every rule looks the person's groups up at decision time.
   metadata too; for a
   file dataset, a read credential for its folder. Listing a file dataset's objects is part of
   read.
-- **share**: this group may change who sees and reads this dataset, and may release
+- **manage**: this group may change who sees and reads this dataset, and may release
   datasets built from it to groups that may not read it (4.3).
 - **write**: for a file dataset, a write credential for its folder, which permits put and
   delete and not get; for a table, creating it and performing DDL and data writes on it.
@@ -166,28 +166,28 @@ This section is the earlier design, over declared `inputs`. The built design has
 with stored files and is in `PROVENANCE.md` 6, releases in 6.7; this section changes to match
 it, with the other statements `PROVENANCE.md` section 10 lists.
 
-An entry with a non-empty `inputs` list is derived. `read` and `share` are inherited; `describe`
+An entry with a non-empty `inputs` list is derived. `read` and `manage` are inherited; `describe`
 and `write` are declared only.
 
-    base(d, g)       = declared(d, g) ∩ ⋂ { effective(i, g) : i ∈ inputs(d) }    g ∈ {read, share}
+    base(d, g)       = declared(d, g) ∩ ⋂ { effective(i, g) : i ∈ inputs(d) }    g ∈ {read, manage}
     effective(d, g)  = base(d, g) ∪ { x ∈ releases(d, g) : covered(d, g, x) }
     covered(d, g, x) = ∀ i ∈ inputs(d) with x ∉ effective(i, g):
-                           ∃ c ∈ covers(d, g, x, i) : c ∈ effective(i, share)
+                           ∃ c ∈ covers(d, g, x, i) : c ∈ effective(i, manage)
     effective(d, g)  = declared(d, g)                                              g ∈ {describe, write}
 
 A release adds group `x` to grant `g` on `d` past what the inputs allow, with their owners'
-consent: data built from a source stays restricted by it, and the source's `share` holders
+consent: data built from a source stays restricted by it, and the source's `manage` holders
 approve an additional audience for a particular derived dataset. (US classified-information
 handling has the same step for originator-controlled material: a derivative product keeps the
 marking, and further dissemination needs the originator's permission.) To release `d` to `x`
-for `g`, the caller must hold `share` on every input whose effective `g` lacks `x`. For each such input the caller's groups holding `share` on it are
+for `g`, the caller must hold `manage` on every input whose effective `g` lacks `x`. For each such input the caller's groups holding `manage` on it are
 recorded as `covers(d, g, x, i)`. An input that granted `x` at release time has no cover
 recorded; if it later stops granting `x`, there is no cover for it and the release is
-uncovered until someone with `share` on that input re-adds it. That is the conservative
+uncovered until someone with `manage` on that input re-adds it. That is the conservative
 reading and it is the intended one.
 
-Direct inputs suffice: every group in `effective(i, share)` either inherited it from `i`'s
-own inputs or was placed there by a release that someone with `share` on those inputs made,
+Direct inputs suffice: every group in `effective(i, manage)` either inherited it from `i`'s
+own inputs or was placed there by a release that someone with `manage` on those inputs made,
 so authority over `i` is authority over everything upstream of `i`, by induction on the
 input graph.
 
@@ -197,16 +197,16 @@ OPA receives only effective sets and never sees `inputs` or `releases`.
 Consequences, stated so they are not surprises:
 
 - Narrowing `read` on a source narrows every derived dataset except where a release is
-  still covered. A share holder on the source can re-add the removed group downstream; that
-  is what `share` means.
+  still covered. A `manage` holder on the source can re-add the removed group downstream; that
+  is what `manage` means.
 - A dataset with many transitive inputs has a small effective `read`. The output's readers
   are allowed to read everything it was built from.
 - `describe` does not inherit. A derived dataset can be listed for people who cannot see its
   inputs. Its `inputs` field is shown only for inputs the viewer may see, and the count of
   hidden inputs is not shown.
 - A `gone` input still constrains its outputs. Grants are independent of status.
-- A group given `share` on a derived dataset by a release can release further downstream. This
-  is grant-option chaining, and it began with someone who held `share` on the inputs.
+- A group given `manage` on a derived dataset by a release can release further downstream. This
+  is grant-option chaining, and it began with someone who held `manage` on the inputs.
 - The `inputs` list is declared by the publisher and trusted. The control is who may register
   (section 8), not verification of content.
 
@@ -218,11 +218,11 @@ subject and groups, the dataset id, and the change, and on allow recomputes effe
 and writes. OPA fetches the entry from governance like any other rule; every writer of a
 row takes its lock, so the entry OPA reads is the one the write replaces.
 
-- `describe` and `read` of dataset d: callers holding effective `share` on d.
-- `share`, `write` and `delete` of d: callers in a group owning the folder root (a file
+- `describe` and `read` of dataset d: callers holding effective `manage` on d.
+- `manage`, `write` and `delete` of d: callers in a group owning the folder root (a file
   dataset) or namespace (a table) that d sits under.
-- Releasing d to group x for grant g: callers holding effective `share` on every
-  input of d whose effective g lacks x. Removing one: callers holding effective `share` on d.
+- Releasing d to group x for grant g: callers holding effective `manage` on every
+  input of d whose effective g lacks x. Removing one: callers holding effective `manage` on d.
 - `inputs`: never.
 - A group's members and owners: callers in one of the group's owners, decided under a lock
   on that group. A change leaving a group without an owner is refused.
@@ -375,7 +375,7 @@ denies every read.
    gate admits the creation because the entry exists and the caller is in its `write`, and
    reports the location back.
 7. **Publish a derived dataset.** As 6, plus `inputs` and any releases. Governance
-   additionally checks the person may read every input and holds `share` on every input they
+   additionally checks the person may read every input and holds `manage` on every input they
    release past. Build the output with any tool, as themselves.
 8. **Delete.** Delete the objects or drop the table. The delete events, or the gate's drop
    report, set `gone`.
@@ -529,7 +529,7 @@ their owners delegate below them; `read` implies `describe`.
 
 ## 13. Status against the repository
 
-Implemented today: the catalog with `describe`, `read` and `share` for file datasets; the file
+Implemented today: the catalog with `describe`, `read` and `manage` for file datasets; the file
 listing; the dataset index as a per-person table, `governance.datasets`, listing both kinds;
 the broker, scoping credentials to the folder in OPA's decision; Polaris delegating to OPA
 with per-table credentials, viewing a table gated on `describe` or `read` and read-write
@@ -541,7 +541,7 @@ Polaris, verifying the token, trimming listings (every upstream page, one filter
 page tokens), answering not-found for a refused name the person may not view, and repeating
 a refused credentialed load without the credential request, deciding table and namespace
 creation, and reporting table creates and drops; tables registered as entries with `describe`,
-`read`, `share`, `write` and `delete` by group; `write` for file datasets, a broker
+`read`, `manage`, `write` and `delete` by group; `write` for file datasets, a broker
 credential that puts and deletes in the folder; grant changes through governance, decided by
 OPA under the entry's row lock as in 4.4; group membership and owners, and root ownership,
 in governance, changed through it as in 4.4; each person's Polaris principal created on
@@ -551,7 +551,7 @@ callers; persistent storage events, each checking one folder with a listing capp
 object, and no sweep.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files; `share` is only the right to change grants, since there are no derived datasets
+with files; `manage` is only the right to change grants, since there are no derived datasets
 to release; no derived datasets, no releases; events are checked as each delivery arrives
 rather than coalesced per folder.
 

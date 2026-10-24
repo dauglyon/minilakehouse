@@ -291,23 +291,23 @@ and publishing add to:
 | `describe`, `read` | `<g>`: viewers and above |
 | `write` | `<g>`: members and above |
 | `delete` | `<g>#admin` |
-| `share` | `<g>#steward` |
+| `manage` | `<g>#steward` |
 | `detach` | empty |
 
-Changing `share`, `write`, `delete`, `detach` or `revoked` anywhere in a space takes a steward of
-its group; changing `describe` and `read` takes `share`, as now.
+Changing `manage`, `write`, `delete`, `detach` or `revoked` anywhere in a space takes a steward of
+its group; changing `describe` and `read` takes `manage`, as now.
 
 ## Why a plain group's space reaches no one outside the group
 
-- Nobody in it holds `share`, and changing its grants or publishing takes a steward.
+- Nobody in it holds `manage`, and changing its grants or publishing takes a steward.
 - Rule 3 limits anything built from it, wherever written, to people who can read the folder it
   came from: the group's viewers and above.
 - Who is in the group decides who reads it, and only owners and admins change that.
 - What remains is what every dataset has (`PROVENANCE.md` 7 and 8): a member can download, or
   declare a read of the space unused, which the shipped policy accepts for a direct read
-  (`PROVENANCE.md` 6.5). A declaration marking a source unused is shown to the source's `share`
+  (`PROVENANCE.md` 6.5). A declaration marking a source unused is shown to the source's `manage`
   holders and, for a folder or table in a space, to its group's admins: a plain group's space
-  has no `share` holders.
+  has no `manage` holders.
 
 ## Personal spaces
 
@@ -364,8 +364,8 @@ another group's space. Its old path stops working.
   group's space follows from its name.
 - Entries gain status `moved` and `moved_to`. `transfers (id, kind, from_id, to_id, by, at)`.
 - `revoked`: a per-source set of groups beside the six grants, changed by the source's
-  stewards, recorded and shown to its `share` holders as detaches are; governance's lookups
-  return it with each source's `read` and `share`.
+  stewards, recorded and shown to its `manage` holders as detaches are; governance's lookups
+  return it with each source's `read` and `manage`.
 
 ### OPA
 - `opa/governance.rego`: `/internal/groups/<subject>` returns the subject's groups with role
@@ -377,7 +377,7 @@ another group's space. Its old path stops working.
   change members and viewers; platform admins change stewards.
 - `opa/blob.rego`, `opa/tables.rego`: drop `allow_register`, `allow_change_root` and the
   `stewards` conjunct. The space defaults above join each entry's effective grants (sections 2,
-  3 and 5). `allow_change` for `share`, `write`, `delete`, `detach` and `revoked`: a steward of
+  3 and 5). `allow_change` for `manage`, `write`, `delete`, `detach` and `revoked`: a steward of
   the group whose space holds the entry. `allow_transfer {subject, from, to}` as above.
 - Personal-space exemption (`PROVENANCE.md` 9): in `_reads` and `vend_write` (`opa/blob.rego`)
   and `readable` and `writable` (`opa/tables.rego`), an entry in the subject's own personal
@@ -394,7 +394,7 @@ another group's space. Its old path stops working.
 - `POST /principals/me` also creates the personal group.
 - `POST /transfers {from, to}`.
 - `governance.derivations` shows a declaration marking a source unused to the admins of the
-  group whose space holds the source, besides its `share` holders.
+  group whose space holds the source, besides its `manage` holders.
 
 ### Read side (prerequisite for any UI)
 Governance has no `GET` routes. Add, each narrowed by the same predicates as the writes:
@@ -468,7 +468,7 @@ enumeration is added.
 ## Changes
 
 ### Schema (`governance/app.py`)
-- `namespace_grants (namespace TEXT PRIMARY KEY, describe, read, share, write, delete, detach
+- `namespace_grants (namespace TEXT PRIMARY KEY, describe, read, manage, write, delete, detach
   TEXT[])`, the same six sets as `table_entries` (`detach` was added after this section was
   first written). An empty `detach` lets any writer of a derived output detach the table
   (`PROVENANCE.md` 6.5), so inheriting it narrows: a namespace's `detach` restricts every table
@@ -481,7 +481,7 @@ enumeration is added.
   namespace's (`lakehouse.db.t1` gets `lakehouse.db` and `lakehouse`). Add `own` (the table's
   own sets) and `inherited_from` ({group: namespace} per set) beside them, for the read API
   and UI only; rules use the effective sets.
-- `_own_grants` (`governance/app.py`), which supplies each carried source's `read` and `share`
+- `_own_grants` (`governance/app.py`), which supplies each carried source's `read` and `manage`
   for provenance narrowing (`_with_sources`, `PROVENANCE.md` 6, rule 3), returns the same
   effective sets. Otherwise a source granted only through its namespace admits nobody to
   anything derived from it, though people can read the source itself.
@@ -492,7 +492,7 @@ enumeration is added.
 
 ### API
 - `PATCH /permissions/namespace/<id>`: new kind. `describe`/`read` change for a group holding
-  the namespace's `share`; `share`/`write`/`delete`/`detach` for a steward of the group whose
+  the namespace's `manage`; `manage`/`write`/`delete`/`detach` for a steward of the group whose
   space holds the namespace (section 1).
 - `POST /tables`: accept a list of entries in one request, all under one namespace, in one
   transaction. Grants on each are optional and default to empty (inherit only). Registering
@@ -833,16 +833,16 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
 ## Grants
 
 - A collection has `describe` (see it, its description, and the members the viewer may
-  describe), `read` (read every member through it), `share` (change who may describe or read
+  describe), `read` (read every member through it), `manage` (change who may describe or read
   it), `write` (curate it: its description, adding and removing members) and `delete` (delete
   it; its members are untouched).
 - `describe` and `read` flow down to members, through nested collections: `read` on
-  `kbase-reference` reads `pangenome`'s namespace and folder. `share`, `write` and `delete` on a
+  `kbase-reference` reads `pangenome`'s namespace and folder. `manage`, `write` and `delete` on a
   collection give no rights over its members.
 - A dataset's effective `describe` and `read` are its own, those of the folders or namespaces
   above it, and those of every collection containing it directly or through other collections.
   Governance serves these effective sets, as section 2 does for namespaces, both for the entry
-  and for each carried source's `read` and `share` in rule 3's lookups.
+  and for each carried source's `read` and `manage` in rule 3's lookups.
 - Sources still apply. Reading a member through a collection is restricted by that member's
   sources as reading it directly is; only a release (`PROVENANCE.md` 6.7) gets past a source.
 - The access log records the dataset read, never the collection, so lineage and declarations
@@ -850,28 +850,28 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
 
 ## Membership
 
-- Adding a dataset or a collection takes `write` on the receiving collection and `share` on what
-  is added: its `share` holders decide whether it joins.
-- Consent reaches through nesting: joining a collection trusts its `share` holders, including to
+- Adding a dataset or a collection takes `write` on the receiving collection and `manage` on what
+  is added: its `manage` holders decide whether it joins.
+- Consent reaches through nesting: joining a collection trusts its `manage` holders, including to
   place it inside larger collections, as the old design's chain of grants did. A dataset's
-  `share` holders see every collection it reaches and can remove it from any collection that
+  `manage` holders see every collection it reaches and can remove it from any collection that
   holds it directly.
-- Removing takes `write` on the collection, or `share` on the member.
+- Removing takes `write` on the collection, or `manage` on the member.
 
 ## Ownership
 
-- A collection belongs to a group; that group's stewards hold `share` and its admins `delete`
+- A collection belongs to a group; that group's stewards hold `manage` and its admins `delete`
   on it, as for datasets in its space (section 1). A collection can hold datasets from other
-  groups' spaces when their `share` holders agree, which shares across tenants.
+  groups' spaces when their `manage` holders agree, which shares across tenants.
 
 ## Changes
 
-- Governance: `collections (id, owner, description, describe, read, share, write, delete)` and
+- Governance: `collections (id, owner, description, describe, read, manage, write, delete)` and
   `collection_members (collection, member, member_kind, added_by, added_at)`, with a cycle check
   on adding; `POST /collections`, `PATCH /collections/<id>` (description and grants),
   `POST` and `DELETE /collections/<id>/members/<member>`; `GET /collections/<id>` in the read API.
-- OPA: `collections.allow_change` (`describe` and `read` by `share` holders; `share`, `write`
-  and `delete` by the owning group's stewards), `allow_add` (`write` on the collection and `share`
+- OPA: `collections.allow_change` (`describe` and `read` by `manage` holders; `manage`, `write`
+  and `delete` by the owning group's stewards), `allow_add` (`write` on the collection and `manage`
   on the member) and `allow_remove`.
 - Lookups: effective sets include collections, as above.
 - Index: `governance.datasets` lists collections (kind `collection`) to their `describe`

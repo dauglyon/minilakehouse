@@ -279,7 +279,7 @@ tenants, and neither can see the other's.
 
 `PATCH /permissions/<dataset|table>/<id>` adds and removes groups from an entry's grants, in
 the shape of Unity Catalog's permissions API. OPA decides each change (`allow_change`):
-`describe` and `read` change only for someone in a group holding the entry's `share`; `share`, and
+`describe` and `read` change only for someone in a group holding the entry's `manage`; `manage`, and
 a table's `write` and `delete`, only for someone whose group owns the root the entry sits
 under (the prefix root or namespace that registration checks). A change applies at the next
 decision.
@@ -304,7 +304,7 @@ PY
 #     revoke read: [] 403
 ```
 
-alice may change `read` on `projx/private` because `jgi-writers` holds its `share`; bob gets
+alice may change `read` on `projx/private` because `jgi-writers` holds its `manage`; bob gets
 403 for any change, the same answer as for an id that does not exist.
 
 ## Changing groups
@@ -339,7 +339,7 @@ PY
 ## Assigning roots
 
 A group owning a prefix root (`datasets/projx/`) or a namespace (`lakehouse.db`) owns
-everything under it: its members may change `share`, `write` and `delete` on what is
+everything under it: its members may change `manage`, `write` and `delete` on what is
 registered there, and those who are also in `stewards` may register there.
 `PATCH /roots/<dataset|namespace>/<id>` adds and removes a root's owners (a dataset root is
 named like a dataset id: `projx/sub` is `datasets/projx/sub/`). OPA decides
@@ -422,18 +422,18 @@ each file carries the datasets its writer had read before writing it, minus thos
 unused, and a dataset's `read` is cut down to groups that may also read every one of them. A
 source that arrived through a read, such as `t1` in a copy of a table made from it, can be
 detached by naming it unused once its data is gone; its `detach` grant says who may, and
-holders of its `share` see every detach and can put the source back. A write needs no
+holders of its `manage` see every detach and can put the source back. A write needs no
 declaration: until the writer declares, everything that could be in the data limits who may
 read it, and declaring widens that. The same declaration can be posted to governance as
 `POST /declarations` with `{"rows": [{source, source_type, target, used}]}`, for a client with
 no Iceberg engine; it is checked, stored and signed by the same code.
 
 A release (`PROVENANCE.md` 6.7) lets a group read a dataset built from a source the group may
-not read, with the source's owners' approval. A `share` holder of the target asks, once the
-group is in the target's `read` and the target's declarations mark the source used; a `share`
+not read, with the source's owners' approval. A `manage` holder of the target asks, once the
+group is in the target's `read` and the target's declarations mark the source used; a `manage`
 holder of the source approves or declines, and any of them can withdraw it. What the group
 builds from the target stays readable to it; data that took the source by another path does
-not. Run in-network, as alice, who holds `share` on both `rel1` and `t1`, once she has built
+not. Run in-network, as alice, who holds `manage` on both `rel1` and `t1`, once she has built
 `lakehouse.db.rel1` from `t1`, registered with `read` for `jgi-writers` and `projw-team`, and
 declared it with `t1` used:
 
@@ -470,8 +470,8 @@ support grants on tables").
   dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `vend`
   (read) / `vend_write` (write) / `vend_delete` (delete) / `visible` (describe or read) /
   `allow_register` (ingest). Grant changes (`allow_change` in
-  both): `describe` and `read` by `share` holders of the entry itself, sources being the
-  business of releases; `share`, `write`, `delete` and `detach` by root owners.
+  both): `describe` and `read` by `manage` holders of the entry itself, sources being the
+  business of releases; `manage`, `write`, `delete` and `detach` by root owners.
   Group changes (`opa/groups.rego`): a group's owners change its members and owners;
   `group-admins` create groups. Root ownership (`allow_change_root` in `blob.rego` and
   `tables.rego`): `group-admins` for top-level roots, owners of a root or one above it below. Group membership and every grant

@@ -251,7 +251,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 - **Grant changes are decided like access.** `PATCH /permissions/<dataset|table>/<id>` adds
   or removes groups from an entry's grants. OPA's `allow_change` decides it while
   governance holds the entry's row lock, so the entry OPA fetches is the one the write
-  replaces: `describe` and `read` change only for a group holding the entry's `share`; `share`,
+  replaces: `describe` and `read` change only for a group holding the entry's `manage`; `manage`,
   and a table's `write` and `delete`, only for a group owning the root (the prefix root or
   namespace registration checks). An unknown id is refused exactly as a denied change.
 - **Groups are administered by their owners.** A group's owners are groups (`group_owners`);
@@ -348,10 +348,10 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   time, and attributes each file to the write credentials and commits valid at that time,
   so a file carries what its writers had read before writing it, minus what they declared
   unused. The lookups OPA makes return each dataset's own grants and the sources its files
-  carry, with each source's own `read` and `share` and whether a declaration says it was used;
+  carry, with each source's own `read` and `manage` and whether a declaration says it was used;
   OPA's rules let a person read or write only if they may also read every
   source or a release covers them (`PROVENANCE.md` 6.7), and change `describe` and `read` with
-  `share` on the entry itself; a source's own `share` holders decide releases past it.
+  `manage` on the entry itself; a source's own `manage` holders decide releases past it.
   `describe` and `delete` are not cut. How undeclared data is treated is a rule a deployment
   can change. A commit counts before a listing can see its files.
 - **A table's history comes with a credential.** A table load that hands out no storage
@@ -493,7 +493,7 @@ reference (the sections above are current-state).
   table without a credential and Trino stops there. A refused create's first line is Trino's
   own ("Failed to create transaction", "Failed to create namespace"); the gate's reason is
   the error's cause, which the CLI prints with `--debug`.
-- `share` carries only its change right, since derived datasets (its release right) are
+- `manage` carries only its change right, since derived datasets (its release right) are
   not built.
 - A person who may describe a table but not read it still sees, in the cut metadata, the
   current version's write time and sequence number and the metadata file's name, whose

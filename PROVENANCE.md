@@ -200,7 +200,7 @@ column. An insert names the four columns it fills; governance fills in the other
 | `declared_at` | when, filled in by governance |
 
 A person sees their own declarations, every detach and every putting back of a source whose
-own `share` names one of their groups, and every putting back on a target they declared
+own `manage` names one of their groups, and every putting back on a target they declared
 (6.5).
 
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
@@ -338,7 +338,7 @@ the commit, so the person's error names the table rather than a failed file writ
 
 Agreed 2026-10-22 and built (section 10, items 11 to 13): rules 1 to 3, declarations naming an
 arrived-through source, the `detach` grant and OPA's rules (`opa/derivations.rego`), detaches
-shown to the source's `share` holders, and putting a source back. A *source* of some data is a dataset whose own `read` grant
+shown to the source's `manage` holders, and putting a source back. A *source* of some data is a dataset whose own `read` grant
 limits who may read that data. Sources are tracked per stored file, the way Apache Atlas
 propagates a classification to everything derived from a dataset and Palantir Foundry's
 markings follow data along lineage. Three rules:
@@ -353,7 +353,7 @@ markings follow data along lineage. Three rules:
    the file marked unused (6.3).
 3. **Who may read a dataset**: a person in its own `read` grant who is also in the own `read`
    grant of every source carried by any file in its folder, through any of their groups.
-   `share` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit, and so does
+   `manage` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit, and so does
    `write`, for files as for tables (decided 2026-10-23): a file write credential cannot get
    or list, so without the cut someone who may not read a source would overwrite or delete
    files they cannot see and could not read back their own. A release past a source (6.7)
@@ -365,7 +365,7 @@ source's own grant at decision time, and a grant change takes effect at the next
 with nothing to recompute.
 
 OPA applies rule 3, not governance (decided 2026-10-22). Governance's lookups return a
-dataset's own grants and its carried sources, each with that source's own `read` and `share`
+dataset's own grants and its carried sources, each with that source's own `read` and `manage`
 and whether a declaration says it was used (`declared`) or it is there because a writer has
 not declared yet. The rules in `opa/tables.rego` (`readable`, `writable`, `shares`) and
 `opa/blob.rego` (`_reads`) do the cut, so how undeclared data is treated is policy: the shipped
@@ -474,20 +474,20 @@ a record, not by approval each time.
   detached by anyone who wrote the data while the source's `detach` is empty, and by its
   members once the source's owners fill it. A deployment tightens this by editing the rule,
   with no change to governance: strict everywhere, only a `curators` group, never for sources
-  under a given root, or the declarer also holding `share` on the target.
+  under a given root, or the declarer also holding `manage` on the target.
 - **Recorded and visible.** A detach is stored with its declarer and signed, as every
-  declaration is, and everyone holding `share` on the source sees, in
+  declaration is, and everyone holding `manage` on the source sees, in
   `governance.derivations`, every declaration by anyone that detaches it, including the
   target's id.
-- **Reversible.** A `share` holder of the source can put it back by inserting a row that marks
+- **Reversible.** A `manage` holder of the source can put it back by inserting a row that marks
   it used for that target; governance accepts that from them for a target the source was
-  detached from, OPA deciding who holds `share` (`may_reattach`), and from then on the
+  detached from, OPA deciding who holds `manage` (`may_reattach`), and from then on the
   target's files carry it again. A putting back overrides every detach of that source from
   that target made before it; a detach made after it overrides it in turn, so a source's
   owners who want it to stay attached fill its `detach` grant. Data read in between has
   gone out, and the record names who said the data was clean.
 
-Rejected: holding each detach until someone with `share` on the source approves it. The
+Rejected: holding each detach until someone with `manage` on the source approves it. The
 approver cannot check the claim, which is about data they may not be allowed to read; the
 data stays restricted until people outside the work respond; and a dataset carrying many
 sources needs as many approvals. Authority given ahead of time is how Palantir Foundry handles
@@ -514,22 +514,22 @@ Decided 2026-10-22: a write needs no declaration, and status does not wait for o
 ### 6.7 Releasing a dataset past a source
 
 Decided 2026-10-23. A release lets a group read a dataset built from a source although the
-group may not read the source: the source's `share` holders approve that audience for that
+group may not read the source: the source's `manage` holders approve that audience for that
 dataset. Detaching says the source's data is not in the dataset; a release says it is, and the
 source's owners consent. US handling of originator-controlled material has the same step: a
 derivative product keeps the marking, and further dissemination needs the originator's
-permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
+permission. A release is the second half of `manage` (`WHITEPAPER.md` 4.2).
 
-- **Two decisions, by different people.** The target's `share` holders choose who may see
-  and read it, holding `share` on the target alone. A group they add that may not read a
-  source stays blocked by rule 3 until that source's `share` holders release the target to
+- **Two decisions, by different people.** The target's `manage` holders choose who may see
+  and read it, holding `manage` on the target alone. A group they add that may not read a
+  source stays blocked by rule 3 until that source's `manage` holders release the target to
   it. This replaces the rule under which changing a dataset's `describe` or `read` also took
-  `share` on every source.
-- **Asking.** A release is requested for a target, a source and a group, by a `share` holder
+  `manage` on every source.
+- **Asking.** A release is requested for a target, a source and a group, by a `manage` holder
   of the target, once the group is in the target's `read`, and only for a source the target's
   declarations mark used. Until its writers declare, a dataset carries everything they read,
   and owners of sources it never used would be asked.
-- **Approving.** A `share` holder of the source approves or declines, shown the target's
+- **Approving.** A `manage` holder of the source approves or declines, shown the target's
   description, declared sources and writers. Each source consents separately: a target built
   from two sources the group may not read needs a release from each.
 - **What it covers.** Under rule 3 the group passes that source's check on the target.
@@ -542,8 +542,8 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   can write their own table built from the target although it carries the source. The group
   cannot release the target further.
 - **Recorded, visible, withdrawable.** A release is stored with who requested and approved it
-  and when, shown to the source's `share` holders, and withdrawn by any of them. A release
-  stays when its approver later loses `share` on the source.
+  and when, shown to the source's `manage` holders, and withdrawn by any of them. A release
+  stays when its approver later loses `manage` on the source.
 - **Withdrawing** works as losing `read` on the source does. At the next decision the target
   closes to the group, and so does everything built from it that people read only through
   the release, except a person's own copies in their personal space (section 9), which stay
@@ -558,7 +558,7 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   `POST /releases/<id>/approve` or `/decline` decides, `DELETE /releases/<id>` withdraws (a
   pending request also by whoever asked); grant changes are HTTP too (`PATCH /permissions`),
   as Trino's Iceberg connector refuses `GRANT`. `governance.releases` shows a person the
-  releases they asked for and those on targets or past sources whose `share` they hold, and
+  releases they asked for and those on targets or past sources whose `manage` they hold, and
   `governance.grants` the grants on every entry `governance.datasets` shows them, in Unity
   Catalog's column names. A declaration can also be posted as `POST /declarations`, checked by
   the same code as the insert.
@@ -642,7 +642,7 @@ handoff's section 1).
 - A source's stewards can take a person's own copies back. Each source has `revoked`, a set of
   groups; for anyone in one of them the exemption does not apply to anything carrying that
   source, personal space included. One person is named through their group of one. Additions
-  are recorded with who made them and when, shown to the source's `share` holders, and
+  are recorded with who made them and when, shown to the source's `manage` holders, and
   reversible, as detaches are (6.5). Credentials already handed out last until they expire,
   and files the person downloaded are out of reach (section 8).
 - The exemption is a rule in OPA. A deployment that wants losing `read` on a source to reach
@@ -729,10 +729,10 @@ attribution (4.2).
     detach it: lakehouse.db.t1") and accepted once it also named `jgi-writers`, and before
     that while it was empty. With alice's write credentials for `c1` marked expired (the test
     shortcut), `c1` carried only `r1` and carol read it, while `r1` still carried `t1` and
-    stayed hidden from her. `detach` is changed by root owners, as `share` is.
+    stayed hidden from her. `detach` is changed by root owners, as `manage` is.
 13. Showing and putting back detaches, run on the stack. alice copied `t1` into `x2`, then in
     another session `x2` into `y2`, and declared `y2` with `x2` used and `t1` detached.
-    carol, given `share` on `t1`, saw that row in `governance.derivations` with
+    carol, given `manage` on `t1`, saw that row in `governance.derivations` with
     `declared_by` alice; bob's putting back was refused ("you have not written it"), carol's
     was accepted, alice then saw carol's row on `y2`, and `y2` carried `t1` again. An insert
     naming `declared_by` was refused. The run found that listings round last-modified times
@@ -750,10 +750,10 @@ attribution (4.2).
 15. Releases, run on the stack 2026-10-24. alice built `rel1` from `t1`, readable by
     `jgi-writers` and `projw-team`; carol (`projw-team`) was refused it. A release request
     before declaring was refused ("declare lakehouse.db.rel1's sources first"); alice declared
-    over `POST /declarations` and asked; carol could not decide it (no `share` on `t1`), alice
+    over `POST /declarations` and asked; carol could not decide it (no `manage` on `t1`), alice
     approved, and carol read `rel1`. In a fresh session carol built `rel4` from `rel1` and read
     it. `rel3`, built by alice from `rel1` and from `t1` directly, stayed closed to carol, and
-    the lookup showed `t1` on two paths, one released and one not. Holding `share` on `rel1`
+    the lookup showed `t1` on two paths, one released and one not. Holding `manage` on `rel1`
     alone, carol added a group to its `read` and asked for a release for it. alice withdrew
     the release; carol lost `rel1` and `rel4`, alice kept `rel1`. carol could drop `rel4`,
     whose `delete` she held, only after giving her group `describe` on it, since Trino loads a
@@ -791,12 +791,12 @@ Build order, each step usable on its own:
    brings in kept with it; writer table credentials logged as writes; files attributed by a
    listing; who may read from rule 3 in governance's lookups for OPA; declarations covering
    only undeclared files and naming arrived-through sources; the `detach` grant, OPA's rule for
-   sources marked unused, detaches shown to the source's `share` holders and their putting a
+   sources marked unused, detaches shown to the source's `manage` holders and their putting a
    source back (6.5); `lineage`'s `direct` rows. All built: the sources each read brings in, writer credentials flagged by
    the gate, files attributed by listing, rule 3 in governance's lookups, notifications and
    listing extended to table folders, the `detach` grant and OPA's rule, declarations naming
    arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
-   columns with detaches shown to the source's `share` holders, and putting a source back.
+   columns with detaches shown to the source's `manage` holders, and putting a source back.
 3. The `sessions` lever as an insert.
 4. Releases (6.7). Built 2026-10-24.
 

@@ -13,7 +13,7 @@ package lakehouse.blob
 #                                                      governance: may change these grants
 #   allow_change_root  input {subject, prefix}         governance: may change who owns this root
 #
-# An entry is {id, prefix, describe, access, share, write, detach, delete: [group], sources}. A dataset can be
+# An entry is {id, prefix, describe, access, manage, write, detach, delete: [group], sources}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
 # so it is denied exactly as a dataset the caller has no grant on.
 
@@ -90,11 +90,11 @@ allow_register if {
 	_owns_root(input.prefix)
 }
 
-# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `manage` on the dataset
 # itself, sources being the business of releases (PROVENANCE.md 6.7);
-# `share`, `write`, `detach` and `delete` by a group owning a root above its prefix, the
+# `manage`, `write`, `detach` and `delete` by a group owning a root above its prefix, the
 # ownership registration checks: `detach` decides how far the dataset's protection follows its
-# data (PROVENANCE.md 6.5), as `share` does.
+# data (PROVENANCE.md 6.5), as `manage` does.
 default allow_change := false
 
 allow_change if {
@@ -107,11 +107,11 @@ allow_change if {
 
 _may_change(e, g) if {
 	g in {"describe", "read"}
-	_holds(e.share)
+	_holds(e.manage)
 }
 
 _may_change(e, g) if {
-	g in {"share", "write", "detach", "delete"}
+	g in {"manage", "write", "detach", "delete"}
 	_owns_root(e.prefix)
 }
 

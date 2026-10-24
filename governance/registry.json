@@ -21,7 +21,7 @@
       "steward": "alice",
       "describe": [],
       "read": ["jgi-writers"],
-      "share": ["jgi-writers"],
+      "manage": ["jgi-writers"],
       "write": ["jgi-writers"],
       "delete": ["jgi-writers"]
     }
@@ -37,7 +37,7 @@
       "steward": "alice",
       "describe": ["jgi-writers"],
       "access": ["jgi-writers"],
-      "share": ["jgi-writers"]
+      "manage": ["jgi-writers"]
     },
     {
       "prefix": "datasets/projx/private/",
@@ -45,7 +45,7 @@
       "steward": "alice",
       "describe": ["jgi-writers"],
       "access": [],
-      "share": ["jgi-writers"]
+      "manage": ["jgi-writers"]
     },
     {
       "prefix": "datasets/projy/secret/",

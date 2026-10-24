@@ -118,11 +118,11 @@ allow_register if {
 	namespace_owned(gs, namespace(_parent(input.id)))
 }
 
-# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the table
+# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `manage` on the table
 # itself; a group added that may not read a source stays blocked by rule 3 until the source's
-# share holders release the table to it (PROVENANCE.md 6.7). `share`, `write`, `delete` and
+# `manage` holders release the table to it (PROVENANCE.md 6.7). `manage`, `write`, `delete` and
 # `detach` by a group owning its namespace, the ownership registration checks: `detach` decides
-# how far the table's protection follows its data (6.5), as `share` does.
+# how far the table's protection follows its data (6.5), as `manage` does.
 default allow_change := false
 
 allow_change if {
@@ -136,11 +136,11 @@ allow_change if {
 
 _may_change(gs, e, g) if {
 	g in {"describe", "read"}
-	_holds(gs, e.share)
+	_holds(gs, e.manage)
 }
 
 _may_change(gs, _, g) if {
-	g in {"share", "write", "delete", "detach"}
+	g in {"manage", "write", "delete", "detach"}
 	namespace_owned(gs, namespace(_parent(input.id)))
 }
 
@@ -162,7 +162,7 @@ _parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
 }
 
 # A table's grants, and the sources its files carry (PROVENANCE.md 6, rule 3). Governance's
-# entry lists each source with its own `read` and `share` grants, whether a declaration says it
+# entry lists each source with its own `read` and `manage` grants, whether a declaration says it
 # was used (`declared`) or it is there because a writer has not declared yet, and `released`:
 # for each path the source arrived by, the groups a release lets past it (6.7). The shipped
 # rules treat declared and undeclared alike: a person may read or write the table only if, for

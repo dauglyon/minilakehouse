@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     steward         TEXT,
     describe        TEXT[] NOT NULL DEFAULT '{}',
     access          TEXT[] NOT NULL DEFAULT '{}',
-    share           TEXT[] NOT NULL DEFAULT '{}',
+    manage          TEXT[] NOT NULL DEFAULT '{}',
     write           TEXT[] NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
     last_reconciled TIMESTAMPTZ
@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS table_entries (
     steward     TEXT,
     describe    TEXT[] NOT NULL DEFAULT '{}',
     read        TEXT[] NOT NULL DEFAULT '{}',
-    share       TEXT[] NOT NULL DEFAULT '{}',
+    manage      TEXT[] NOT NULL DEFAULT '{}',
     write       TEXT[] NOT NULL DEFAULT '{}',
     "delete"    TEXT[] NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'pending',   -- pending | live | gone
@@ -170,7 +170,18 @@ CREATE TABLE IF NOT EXISTS register_grants (
     grp      TEXT PRIMARY KEY,
     prefixes TEXT[] NOT NULL DEFAULT '{}'   -- prefix roots this group may register under
 );
-ALTER TABLE datasets ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
+-- `manage` was called `share`; a volume made before the rename keeps that column.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'datasets' AND column_name = 'share') THEN
+        ALTER TABLE datasets RENAME COLUMN share TO manage;
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'table_entries' AND column_name = 'share') THEN
+        ALTER TABLE table_entries RENAME COLUMN share TO manage;
+    END IF;
+END $$;
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS manage TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS write TEXT[] NOT NULL DEFAULT '{}';
 -- The dataset index narrows its candidates to entries whose viewing grants name one of the
 -- person's groups (_index_rows); these keep that query proportional to the matches.
@@ -196,7 +207,7 @@ ALTER TABLE datasets ADD COLUMN IF NOT EXISTS "delete" TEXT[] NOT NULL DEFAULT '
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS detach TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((describe || access));
 CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((describe || read || write));
-ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS share TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS manage TEXT[] NOT NULL DEFAULT '{}';
 -- Provenance (PROVENANCE.md 3, 4.1). A session is a unit of work a person names; each login
 -- points at one of the person's sessions, and every access is stamped with the session its
 -- login pointed at when the access was logged.
@@ -240,8 +251,8 @@ ALTER TABLE accesses ADD COLUMN IF NOT EXISTS marks JSONB;
 -- location a staged create's commit sets. A write counts toward a table only if it names no
 -- location or the table's current one (6.2), so an abandoned staged create counts for nothing.
 ALTER TABLE accesses ADD COLUMN IF NOT EXISTS location TEXT;
--- Releases (PROVENANCE.md 6.7): a target's share holder asks for a source's share holders to
--- let a group read the target although the group may not read the source.
+-- Releases (PROVENANCE.md 6.7): a holder of the target's `manage` asks the source's `manage`
+-- holders to let a group read the target although the group may not read the source.
 CREATE TABLE IF NOT EXISTS releases (
     id           BIGSERIAL PRIMARY KEY,
     target       TEXT NOT NULL,
@@ -285,7 +296,7 @@ CREATE TABLE IF NOT EXISTS declared_sources (
 );
 CREATE INDEX IF NOT EXISTS declarations_person ON declarations (person, target);
 -- A detach is a source that arrived through a read, marked unused; a declaration that puts
--- detached sources back is made by a holder of their `share` (PROVENANCE.md 6.5).
+-- detached sources back is made by a holder of their `manage` (PROVENANCE.md 6.5).
 ALTER TABLE declared_sources ADD COLUMN IF NOT EXISTS detached BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE declarations ADD COLUMN IF NOT EXISTS reattach BOOLEAN NOT NULL DEFAULT false;
 """
@@ -352,10 +363,10 @@ def init_db():
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
                 raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                'INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, "delete") '
+                'INSERT INTO datasets (id, prefix, description, steward, describe, access, manage, write, detach, "delete") '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
-                 d.get("describe", []), d.get("access", []), d.get("share", []), d.get("write", []),
+                 d.get("describe", []), d.get("access", []), d.get("manage", []), d.get("write", []),
                  d.get("detach", []), d.get("delete", [])),
             )
         for grp, members in reg.get("groups", {}).items():
@@ -370,10 +381,10 @@ def init_db():
             if not TABLE_ID_RE.match(t["id"]):
                 raise ValueError(f"registry.json: bad table id {t['id']!r}")
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete", detach) '
+                'INSERT INTO table_entries (id, description, steward, describe, read, manage, write, "delete", detach) '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (t["id"], t.get("description"), t.get("steward"), t.get("describe", []),
-                 t.get("read", []), t.get("share", []), t.get("write", []), t.get("delete", []),
+                 t.get("read", []), t.get("manage", []), t.get("write", []), t.get("delete", []),
                  t.get("detach", [])),
             )
         for grp, namespaces in reg.get("namespace_owners", {}).items():
@@ -393,7 +404,7 @@ def init_db():
 def _entry(row):
     """The meaning/grants half of a datasets row — what OPA decides over."""
     return {"id": row["id"], "prefix": row["prefix"],
-            "describe": row["describe"], "access": row["access"], "share": row["share"],
+            "describe": row["describe"], "access": row["access"], "manage": row["manage"],
             "detach": row["detach"], "delete": row["delete"],
             "write": row["write"]}
 
@@ -558,7 +569,7 @@ FILE_TIME_SLACK = 2
 # credential and commit for the dataset that was valid when the file was last modified; it
 # carries what each such writer had brought in before that time, through their session's reads
 # and, from the credential's issue on, their login's reads, minus what that writer's latest
-# declaration of the dataset made after the file marked unused, unless a `share` holder of the
+# declaration of the dataset made after the file marked unused, unless a `manage` holder of the
 # source has put it back since (6.5). A dataset is not its own source.
 # A commit or create the gate logged since the last listing counts as having written a file at
 # its time, since the gate logs it before Polaris sees it. A credential that can write counts
@@ -652,13 +663,13 @@ def carried(ds_id):
 
 
 def _own_grants(ids):
-    """{id: {read, share}} by each dataset's own grants, as groups: a table's write implies read."""
+    """{id: {read, manage}} by each dataset's own grants, as groups: a table's write implies read."""
     with db() as cur:
-        cur.execute("SELECT id, access AS read, share FROM datasets WHERE id = ANY(%s)", (ids,))
-        own = {r["id"]: {"read": sorted(r["read"]), "share": sorted(r["share"])} for r in cur.fetchall()}
-        cur.execute("SELECT id, ARRAY(SELECT DISTINCT unnest(read || write)) AS read, share "
+        cur.execute("SELECT id, access AS read, manage FROM datasets WHERE id = ANY(%s)", (ids,))
+        own = {r["id"]: {"read": sorted(r["read"]), "manage": sorted(r["manage"])} for r in cur.fetchall()}
+        cur.execute("SELECT id, ARRAY(SELECT DISTINCT unnest(read || write)) AS read, manage "
                     "FROM table_entries WHERE id = ANY(%s)", (ids,))
-        own.update({r["id"]: {"read": sorted(r["read"]), "share": sorted(r["share"])} for r in cur.fetchall()})
+        own.update({r["id"]: {"read": sorted(r["read"]), "manage": sorted(r["manage"])} for r in cur.fetchall()})
     return own
 
 
@@ -678,15 +689,15 @@ def _released(target, sources):
 
 
 def _with_sources(ds_id, entry):
-    """The entry as stored, with the sources its files carry: each source's own read and share
-    grants, whether a declaration says it was used, and the groups released past it on each path
-    it arrived by. OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no
+    """The entry as stored, with the sources its files carry: each source's own `read` and
+    `manage` grants, whether a declaration says it was used, and the groups released past it on
+    each path it arrived by. OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no
     entry has no grants, so it admits no one."""
     sources = carried(ds_id)
     own = _own_grants([c["id"] for c in sources])
     released = _released(ds_id, sources)
     return {**entry, "sources": [{"id": c["id"], "declared": c["declared"], "released": released[c["id"]],
-                                  **own.get(c["id"], {"read": [], "share": []})} for c in sources]}
+                                  **own.get(c["id"], {"read": [], "manage": []})} for c in sources]}
 
 
 def reconcile(ds_id):
@@ -725,7 +736,7 @@ def internal_datasets():
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
-        cur.execute('SELECT id, prefix, describe, access, share, write, detach, "delete" FROM datasets WHERE id = ANY(%s)',
+        cur.execute('SELECT id, prefix, describe, access, manage, write, detach, "delete" FROM datasets WHERE id = ANY(%s)',
                     (ids,))
         rows = cur.fetchall()
     return jsonify({"entries": {r["id"]: _with_sources(r["id"], _entry(r)) for r in rows}})
@@ -753,7 +764,7 @@ def internal_group_owners(grp):
         return jsonify({"owners": [r["owner"] for r in cur.fetchall()]})
 
 
-_TABLE_COLS = 'id, describe, read, share, write, "delete", detach, status'
+_TABLE_COLS = 'id, describe, read, manage, write, "delete", detach, status'
 
 
 def _ids_from_body():
@@ -954,9 +965,9 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
-    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write", "detach", "delete")}
+    grants = {g: body.get(g, []) for g in ("describe", "access", "manage", "write", "detach", "delete")}
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "describe, access, share, write, detach and delete must be lists of groups"}), 400
+        return jsonify({"error": "describe, access, manage, write, detach and delete must be lists of groups"}), 400
 
     if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
@@ -972,10 +983,10 @@ def register_dataset():
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
                 return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                'INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, "delete", status) '
+                'INSERT INTO datasets (id, prefix, description, steward, describe, access, manage, write, detach, "delete", status) '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
                 (ds_id, prefix, body.get("description"), subject,
-                 grants["describe"], grants["access"], grants["share"], grants["write"], grants["detach"],
+                 grants["describe"], grants["access"], grants["manage"], grants["write"], grants["detach"],
                  grants["delete"]),
             )
     except psycopg2.errors.UniqueViolation:
@@ -1028,21 +1039,21 @@ def register_table():
         return err
     body = request.get_json(silent=True) or {}
     table_id = body.get("id")
-    grants = {g: body.get(g, []) for g in ("describe", "read", "share", "write", "delete", "detach")}
+    grants = {g: body.get(g, []) for g in ("describe", "read", "manage", "write", "delete", "detach")}
     if not isinstance(table_id, str) or not TABLE_ID_RE.match(table_id):
         return jsonify({"error": "id must be <catalog>.<namespace...>.<table>"}), 400
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "describe, read, share, write, delete and detach must be lists of groups"}), 400
+        return jsonify({"error": "describe, read, manage, write, delete and detach must be lists of groups"}), 400
     if opa("allow_register", {"subject": subject, "id": table_id}, package="tables") is not True:
         app.logger.info("DENY register-table subject=%s id=%s", subject, table_id)
         return jsonify({"error": "forbidden"}), 403
     try:
         with db(commit=True) as cur:
             cur.execute(
-                'INSERT INTO table_entries (id, description, steward, describe, read, share, write, "delete", detach) '
+                'INSERT INTO table_entries (id, description, steward, describe, read, manage, write, "delete", detach) '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (table_id, body.get("description"), subject, grants["describe"], grants["read"],
-                 grants["share"], grants["write"], grants["delete"], grants["detach"]))
+                 grants["manage"], grants["write"], grants["delete"], grants["detach"]))
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "table unavailable"}), 409
     app.logger.info("REGISTER-TABLE subject=%s id=%s", subject, table_id)
@@ -1051,9 +1062,9 @@ def register_table():
 
 # The grants a change may name, per kind, and the column each is stored in. A file dataset has
 # no delete: its write credential deletes objects (WHITEPAPER 4.2).
-_GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "share": "share", "write": "write",
+_GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "manage": "manage", "write": "write",
                            "detach": "detach", "delete": "delete"},
-               "table": {g: g for g in ("describe", "read", "share", "write", "delete", "detach")}}
+               "table": {g: g for g in ("describe", "read", "manage", "write", "delete", "detach")}}
 
 
 @app.patch("/permissions/<kind>/<path:entry_id>")
@@ -1120,8 +1131,8 @@ def _names(v, pattern):
 _NAME_IN_USE_SQL = """
 SELECT EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM group_owners WHERE grp = %(g)s OR owner = %(g)s)
-    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write || detach || "delete"))
-    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || share || write || "delete" || detach))
+    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || manage || write || detach || "delete"))
+    OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || manage || write || "delete" || detach))
     OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) AS used
 """
@@ -1349,12 +1360,12 @@ def _lineage_rows(subject):
 
 
 # What governance.derivations shows a person (PROVENANCE.md 5.3, 6.5): their own declarations;
-# every detach, and every putting back, of a source whose own `share` names one of their
+# every detach, and every putting back, of a source whose own `manage` names one of their
 # groups; and every putting back on a target they have declared.
 _DERIVATIONS_SQL = """
 WITH owned AS (
-    SELECT id FROM datasets WHERE share && %(groups)s::text[]
-    UNION SELECT id FROM table_entries WHERE share && %(groups)s::text[]
+    SELECT id FROM datasets WHERE manage && %(groups)s::text[]
+    UNION SELECT id FROM table_entries WHERE manage && %(groups)s::text[]
 )
 SELECT s.source, s.source_type, d.target, s.used, d.person AS declared_by, d.declared_at
 FROM declarations d JOIN declared_sources s ON s.declaration = d.id
@@ -1430,7 +1441,7 @@ def _check_target(subject, target, rows, lineage):
 
 def _check_reattach(subject, target, rows):
     """A declaration by someone who did not write the target: allowed only to put back sources
-    detached from it, by a holder of each one's `share` (PROVENANCE.md 6.5)."""
+    detached from it, by a holder of each one's `manage` (PROVENANCE.md 6.5)."""
     named = [r for r in rows if r.get("source") is not None]
     sources = sorted({r["source"] for r in named})
     refused = index_table.Refused(403, "ForbiddenException", f"{target}: you have not written it")
@@ -1542,7 +1553,7 @@ def _own_read(entry_id):
 
 @app.post("/releases")
 def request_release():
-    # Ask a source's share holders to let a group read a target built from it (PROVENANCE.md
+    # Ask a source's `manage` holders to let a group read a target built from it (PROVENANCE.md
     # 6.7): {target, source, group}, by someone who may change who reads the target, once the
     # group is in its read grant and its declarations mark the source used.
     subject, err = authed_user()
@@ -1581,7 +1592,7 @@ def request_release():
 
 def _may_release(subject, source):
     """Whether the subject may approve, decline or withdraw releases past this source: a holder
-    of its share, as opa/derivations.rego may_release decides."""
+    of its `manage`, as opa/derivations.rego may_release decides."""
     return source in (opa("may_release", {"subject": subject, "sources": [{"id": source}]},
                           package="derivations") or [])
 
@@ -1607,7 +1618,7 @@ def decide_release(rid, decision):
 
 @app.delete("/releases/<int:rid>")
 def withdraw_release(rid):
-    # Withdrawn by a share holder of the source, or, while pending, by whoever asked.
+    # Withdrawn by a `manage` holder of the source, or, while pending, by whoever asked.
     subject, err = authed_user()
     if err:
         return err
@@ -1625,7 +1636,7 @@ def withdraw_release(rid):
 
 
 # governance.releases: the releases a person asked for, and those on targets or past sources
-# whose share one of their groups holds.
+# whose `manage` one of their groups holds.
 _RELEASES_SQL = """
 SELECT r.id::text AS id, r.target, r.source, r.grp AS grantee,
        CASE WHEN r.withdrawn_at IS NOT NULL THEN 'withdrawn' WHEN r.approved THEN 'approved'
@@ -1633,8 +1644,8 @@ SELECT r.id::text AS id, r.target, r.source, r.grp AS grantee,
        r.requested_by, r.requested_at, r.decided_by, r.decided_at, r.withdrawn_by, r.withdrawn_at
 FROM releases r
 WHERE r.requested_by = %(p)s
-   OR EXISTS (SELECT 1 FROM datasets d WHERE d.id IN (r.target, r.source) AND d.share && %(g)s::text[])
-   OR EXISTS (SELECT 1 FROM table_entries t WHERE t.id IN (r.target, r.source) AND t.share && %(g)s::text[])
+   OR EXISTS (SELECT 1 FROM datasets d WHERE d.id IN (r.target, r.source) AND d.manage && %(g)s::text[])
+   OR EXISTS (SELECT 1 FROM table_entries t WHERE t.id IN (r.target, r.source) AND t.manage && %(g)s::text[])
 ORDER BY r.id
 """
 
@@ -1655,16 +1666,16 @@ def _grant_rows(subject):
     tables = [r["id"] for r in seen if r["kind"] == "table"]
     rows = []
     with db() as cur:
-        cur.execute('SELECT id, describe, access AS read, share, write, detach, "delete" FROM datasets '
+        cur.execute('SELECT id, describe, access AS read, manage, write, detach, "delete" FROM datasets '
                     "WHERE id = ANY(%s)", (files,))
         for r in cur.fetchall():
             rows += [{"entry": r["id"], "kind": "files", "privilege_type": g, "grantee": grp}
-                     for g in ("describe", "read", "share", "write", "detach", "delete") for grp in r[g]]
-        cur.execute('SELECT id, describe, read, share, write, "delete", detach FROM table_entries '
+                     for g in ("describe", "read", "manage", "write", "detach", "delete") for grp in r[g]]
+        cur.execute('SELECT id, describe, read, manage, write, "delete", detach FROM table_entries '
                     "WHERE id = ANY(%s)", (tables,))
         for r in cur.fetchall():
             rows += [{"entry": r["id"], "kind": "table", "privilege_type": g, "grantee": grp}
-                     for g in ("describe", "read", "share", "write", "delete", "detach") for grp in r[g]]
+                     for g in ("describe", "read", "manage", "write", "delete", "detach") for grp in r[g]]
     return sorted(rows, key=lambda r: (r["entry"], r["privilege_type"], r["grantee"]))
 
 
