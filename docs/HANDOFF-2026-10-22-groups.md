@@ -7,6 +7,225 @@ real tenant code, then implement. Work is on `main` (fast-forwarded from
 `docs/HANDOFF-2026-10-20.md` (what is built and running), root `HANDOFF.md` (the BERDL/Gravitino
 review).
 
+## Findings (checked 2026-10-24 against minio_manager_service@d9ba718, trino_access_control@5f2af94, berdl_docs@2bae4d8, spark_notebook@e4741cd)
+
+The `BERDataLakehouse` GitHub organization holds these repositories (this file called it
+`KBaseDataLakehouse`). Citation roots: `MMS` = minio_manager_service, the governance service;
+`TAC` = trino_access_control; `DOCS` = berdl_docs; `SN` = spark_notebook at origin/main e4741cd.
+MMS at d9ba718 uses the MinIO-backed managers in `src/minio/managers/` (MMS
+src/service/app_state.py:19-23); the Ceph copies in `src/s3/managers/` hold the same tenant
+logic.
+
+Polaris terms: a **catalog role** is a named set of privileges on one catalog; a **principal
+role** is what a user is bound to and carries catalog roles; **CATALOG_MANAGE_CONTENT** is the
+privilege MMS gives tenant writers, described in the BERDL docs as "create namespaces and
+tables, write and delete data" (DOCS user_guides/requesting-tenant-access.md:121-126).
+
+### 1. Tenant = one catalog + one prefix; members read the whole catalog — corrected in part
+
+**What a tenant is.** Two storage groups, `<t>` (read-write) and `<t>ro` (read-only), created
+together with the creating admin in both (MMS src/minio/managers/group_manager.py:358-378); one
+Polaris catalog `tenant_<t>` (MMS src/polaris/constants.py:52-54); one Trino catalog `<t>` (MMS
+src/routes/management.py:526-532); a metadata row and steward rows in the MMS database (MMS
+migrations/versions/002_tenant_metadata.py:29-51).
+
+**Two prefixes, not one.** Files under `tenant-general-warehouse/<t>/`; table data under
+`tenant-sql-warehouse/<t>/iceberg/`, the catalog's storage location (MMS
+src/polaris/managers/group_manager.py:42-46). Legacy Delta paths `tenant-sql-warehouse/<t>/<t>_*`
+are read-only (MMS src/s3/core/policy_creator.py:72-79, 435-481; DOCS user_guides/s3_guide.md:153-155).
+
+**Members read the whole catalog — confirmed.** The reader role `<t>_reader` holds
+TABLE_READ_DATA, TABLE_LIST and NAMESPACE_LIST; the writer role `<t>_writer` holds
+CATALOG_MANAGE_CONTENT; both are catalog-scoped (MMS src/polaris/polaris_service.py:491,
+608-631). MMS makes no namespace- or table-scoped grant anywhere; the only callers of the grant
+functions are polaris_service.py:611-629, src/polaris/managers/user_manager.py:79-97 and
+src/polaris/managers/group_manager.py:127. On storage, `<t>ro` gets READ and `<t>` WRITE on the
+whole general prefix (policy_creator.py:445-479). Trino lets every tenant in a user's
+membership be read in full, whatever the access level (TAC
+src/main/java/us/kbase/trino/BerdlSystemAccessControl.java:722-724, 889-896).
+
+**Automatic membership.** Every user joins the read-write group `globalusers` when their
+storage user is created, on their first `GET /credentials/` (MMS
+src/minio/managers/user_manager.py:204-206; src/credentials/s3_service.py:87-93). There is no
+`refdata` in the code: tenants joined because of a KBase role are set per deployment in
+`MMS_ROLE_TENANTS` (MMS src/service/config.py:111-121), joined only on `GET /credentials/`
+(src/routes/credentials.py:72-84, 116-118; src/minio/managers/tenant_manager.py:394-450).
+Whether refdata is configured, and at which level, is unverified (deployment config).
+
+### 2. Tenant-admin role decided by the governance service — corrected
+
+**The per-tenant role is "steward", not "admin".** Stewards are rows in MMS's
+`tenant_stewards`, keyed by (tenant, user) (002_tenant_metadata.py:42-51), checked against its
+primary database (MMS src/service/dependencies.py:29-50).
+
+**"Admin" is platform-wide only:** a user whose KBase token carries a role listed in
+`KBASE_ADMIN_ROLES` (MMS src/service/kb_auth.py:153-158, 181-184); code default `KBASE_ADMIN`
+(src/service/app_state.py:133), local compose `CDM_JUPYTERHUB_ADMIN` (MMS docker-compose.yml:56),
+production unverified. Assigned in the KBase auth server by KBase sysadmins, not through MMS
+(DOCS user_guides/admin_user_management_guide.md:213-220).
+
+**Who may create a tenant:** platform admins only, `POST /management/groups/{name}`
+(management.py:491-553). One call makes both groups, the catalog and its roles, the Trino
+catalog and the metadata row; no steward is assigned. `POST /tenants/{name}` only adds metadata
+to an existing group, also admin only (src/routes/tenants.py:374-390).
+
+**Who may make someone a steward:** platform admins only (tenants.py:221-259). It also adds them
+to the read-write group (tenant_manager.py:627-633). The docs and the notebook client say the
+user must already be a member (DOCS admin_user_management_guide.md:190; SN
+notebook_utils/berdl_notebook_utils/governance/tenant_management.py:374); the service does not
+require it.
+
+**How many:** any number of stewards, zero allowed; creation assigns none and removal has no
+last-steward check (tenant_manager.py:648-657).
+
+**What a steward can do:** edit the tenant's metadata; add members at `read_write` or
+`read_only`; remove members other than themselves and other stewards (tenants.py:95, 153, 185;
+tenant_manager.py:340-350). Their data access is a read-write member's, plus `root/` in tenants
+with per-user write areas (item 4). They cannot assign stewards, create or delete tenants, or
+switch the per-user write area (tenants.py:265-288).
+
+**Joining:** a steward or platform admin adds the user; or the user asks through Slack and an
+admin approves (DOCS user_guides/requesting-tenant-access.md:13, 44;
+services/tenant-access-request-service.md:15-23); or by KBase role (item 1).
+
+**Visibility:** any signed-in user can list every tenant with its metadata and stewards; member
+lists go only to members, stewards and admins (tenants.py:40-52; tenant_manager.py:174-195).
+
+### 3. Personal space `my.u_<user>__<dataset>` plus a per-user prefix — corrected
+
+**Tables:** the personal catalog is Polaris `user_<u>` (MMS src/polaris/constants.py:39-41),
+named `my` and `<u>` in Spark (SN notebook_utils/berdl_notebook_utils/setup_spark_session.py:57,
+206-218) and `<u>` in Trino (TAC BerdlSystemAccessControl.java:110-118).
+`create_namespace_if_not_exists` creates `my.<namespace>` (or `<tenant>.<namespace>`) with no
+prefix, and `iceberg=False` raises (SN notebook_utils/berdl_notebook_utils/spark/database.py:42-77).
+So personal tables are `my.<namespace>.<table>`. `u_<u>__` is the retired Delta/Hive database
+prefix, read-only (policy_creator.py:72-79, 388-396; DOCS user_guides/data_sharing_guide.md:212),
+though MMS still returns it from `GET /workspaces/me/namespace-prefix` (MMS
+src/routes/workspaces.py:362-426; src/s3/utils/governance.py:16-35).
+
+**Files:** `users-general-warehouse/<u>/` with read, write and delete; table data under
+`users-sql-warehouse/<u>/iceberg/` (policy_creator.py:398-417).
+
+**Personal space is not a group.** It is the user's own storage policies plus a catalog whose
+only role, `catalog_admin` (CATALOG_MANAGE_CONTENT), is bound to the principal role `<u>_role`,
+held by that user alone (MMS src/polaris/managers/user_manager.py:50-99).
+
+**Who else can read it.** Tables: no one; MMS has no call granting another user anything on
+`user_<u>`, and Trino shows a personal catalog only to its user (TAC
+BerdlSystemAccessControl.java:116-118, 690-695). Files: the owner (the user whose home prefix
+contains the path, MMS src/minio/managers/user_manager.py:344-359, 403-416) can still share them
+through deprecated routes still served: `POST /sharing/share` gives named users or groups read
+or write on a path (MMS src/routes/sharing.py:201-271; src/minio/managers/sharing_manager.py:151-199),
+`/sharing/make-public` adds it to `globalusers`' policy (sharing.py:342-383;
+sharing_manager.py:341-357); Delta paths are refused (sharing_manager.py:187-194); sharing the
+`iceberg/` path gives the files, not the catalog. DOCS data_sharing_guide.md:163 says "There is
+no per-table or per-path sharing".
+
+### 4. A role between admin and member — found
+
+Inside a tenant, below platform admins: steward, then member at one of two levels.
+- **read_write:** group `<t>`, principal role `<t>_member`, catalog role `<t>_writer`:
+  CATALOG_MANAGE_CONTENT on the whole catalog and WRITE on the general prefix.
+- **read_only:** group `<t>ro`, principal role `<t>ro_member`, catalog role `<t>_reader`
+  (MMS src/polaris/constants.py:57-74; polaris_service.py:608-631; policy_creator.py:445-479).
+
+A per-tenant "per-user write area" flag, switched by platform admins (tenants.py:265-288):
+with it on, the read-write group can no longer write the general prefix; each read-write member
+writes `users/<self>/`, and `log/<self>/` while `TENANT_LOG_MEMBER_DIRECT_WRITE` is on; stewards
+also write `root/` (MMS src/s3/core/tenant_write_area.py:82-146; src/tenant_write_area/manager.py:1-17).
+Table writes are unaffected (tenant_write_area.py:128-131). In Trino both member levels are
+read-only (TAC README.md:14).
+
+### 5. Names actually used
+
+- **tenant:** the `/tenants` routes and the docs; underneath, a pair of "groups" `<t>` and
+  `<t>ro` (`/management/groups`). Names: lowercase letters and digits, starting with a letter,
+  2-64 characters, no underscore or hyphen, not ending in `ro`; reserved: admin, root, system,
+  all, everyone, public, default, minio, service, backup, warehouse (MMS
+  src/s3/utils/validators.py:117-179, 182-205).
+- **steward** ("data steward", MMS README.md:29-32): the per-tenant role.
+- **admin:** platform-wide only; no per-tenant admin.
+- **member:** `access_level` `read_write` or `read_only`; API flags `is_member`, `is_steward`
+  (MMS src/s3/models/tenant.py:90-99, 124-136); the docs say "Read-only access" and "Read-write
+  access" (DOCS requesting-tenant-access.md:10-11).
+- **owner:** no tenant owner; the word appears only for the user whose home path is shared
+  (sharing.py:209). Tenant metadata records `created_by` (002_tenant_metadata.py:35).
+- **Display fields:** display_name, description, website, organization (s3/models/tenant.py:22-30).
+- **Polaris role names:** `<t>_writer`, `<t>_reader`, `<t>_member`, `<t>ro_member`,
+  `catalog_admin`, `<u>_role` (polaris/constants.py:33-74).
+
+### Contradictions with sections 1-4
+
+**Section 1.**
+- Self-serve creation: only platform admins create tenants (management.py:491-501).
+- "One role, admin, at least one": BERDL has 0..n stewards assigned only by platform admins,
+  plus two member levels (items 2 and 4).
+- Steward duties as written (register datasets, change grants on them, hand sub-roots to other
+  groups): no BERDL code does these. MMS has no dataset object (the only "datasets" in its source
+  is a marker folder, group_manager.py:718, 741), no per-dataset or per-namespace grants, and no
+  route giving one tenant part of another's catalog or prefix.
+- "A group that owns no root is a plain consumer group": every group made through MMS gets a
+  catalog and prefixes (management.py:509-537); the `<t>ro` companions have none of their own
+  (MMS src/polaris/managers/group_manager.py:80-97). Grants to other groups exist only in the
+  deprecated path sharing.
+- Personal space as a group of one, and `my.u_<user>`: neither matches (item 3).
+- The "Decide" item: creating a tenant always provisions its catalog and prefixes in the same
+  call, one step after another rather than as a transaction, with repair routes
+  `/management/migrate/ensure-polaris-resources` and `/management/migrate/reconcile-trino-catalogs`
+  (management.py:526-531, 1048-1063, 1204-1212).
+- Reserved names: BERDL does not reserve `kbase`, `my`, `governance` or `datasets`; `kbase` is a
+  tenant throughout the docs (DOCS data_sharing_guide.md:5, 156). `u_*` can never be a tenant
+  name, since underscores are refused, and this repository's seed names (`jgi-writers`,
+  `projw-team`, `no-access`, `group-admins`) would be refused for their hyphens
+  (validators.py:145-158).
+- `group-admins`: BERDL's platform admins are a KBase auth role, not a group (item 2).
+
+**Section 2.**
+- "Per tenant (whole catalog)": confirmed (item 1).
+- "One dataset = one namespace": data-lakehouse-ingest at 543ad45 creates a namespace named
+  after the config's `dataset` in the tenant's catalog
+  (src/data_lakehouse_ingest/orchestrator/init_utils.py:82-117); whether that checkout is
+  current was not confirmed.
+- Namespace grants: the Trino plugin parses a `namespace_acl_tenants` field from
+  `GET /polaris/effective-access/me` and allows exactly the named schema in that catalog, no
+  other (TAC BerdlSystemAccessControl.java:198-227, 714-730, 885-924; TAC README.md:18-24), but
+  MMS's response has no such field (MMS src/routes/polaris.py:74-81, 250-270): something reads
+  them, nothing writes them.
+
+**Section 3.**
+- Who writes tenant data: every read-write member, anywhere in the tenant's prefix and catalog,
+  not stewards only (policy_creator.py:445-479; polaris_service.py:608-619). The only
+  steward-only write is `root/` in per-user-write tenants (tenant_write_area.py:100-106).
+- "A key directly under a root is never writable": the read-write group can put objects directly
+  under `tenant-general-warehouse/<t>/` (MMS src/s3/core/policy_builder.py:379-388;
+  tenant_write_area.py:149-172), and MMS itself writes `README.txt` there (group_manager.py:747-748).
+- How folders and tables come to exist: at tenant creation MMS writes `.s3keep` markers for the
+  SQL root and for `shared/`, `datasets/` and `projects/`, plus a README (group_manager.py:710-748).
+  Nothing else in MMS creates or records folders, and it has no bucket-event code; files appear
+  by direct storage writes. In flagged tenants the first level is `users/`, `log/` and `root/`
+  (tenant_write_area.py:100-106). Namespaces and tables are created through Spark with
+  `CREATE NAMESPACE IF NOT EXISTS <catalog>.<ns>` (SN spark/database.py:70-73), the Polaris writer
+  role being the only check; Trino refuses all creation (TAC BerdlSystemAccessControl.java:573-592).
+
+**Section 4.**
+- Trino in BERDL is read-only: it refuses INSERT, DELETE, CREATE TABLE (so CREATE TABLE AS) and
+  views (TAC BerdlSystemAccessControl.java:72-80, 484-492, 584-592; TAC README.md:14). No BERDL
+  Trino query writes a table; table writes go through Spark.
+- BERDL already ships a Trino event listener, `berdl-query-log`, which reads `ioMetadata` inputs
+  and output and writes JSON lines to stdout; it is off unless configured (TAC
+  src/main/java/us/kbase/trino/querylog/QueryLogListener.java:115-117; TAC README.md:72-88).
+
+### Not checked
+
+- The tenant access request service's code is not on disk; who approves requests and which MMS
+  route it calls come from docs only. SN's client docstring says approvers hold
+  `CDM_JUPYTERHUB_ADMIN` (SN governance/operations.py:873-876).
+- Production settings: `KBASE_ADMIN_ROLES`, `MMS_ROLE_TENANTS` (refdata, kind), which tenants
+  have the per-user write area, whether the deprecated `/sharing` routes are used.
+- Polaris's own definition of CATALOG_MANAGE_CONTENT (taken from BERDL docs).
+- UI labels in tenant-data-browser and berdl_access_request_extension.
+- No tests or code were run.
+
 ## Goal
 
 Make the group model match how the platform's **tenants** already work, and make it
