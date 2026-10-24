@@ -453,6 +453,11 @@ comes after.
 - **Before publishing, a folder is reached through its space's grants** (the root's, section
   1; by default the owning group), and rule 3 restricts it by what its files were made from,
   as for any entry. Publishing gives it a description and grants of its own.
+- **Grants on folders** (decided 2026-10-24). Grants can be set on any folder in a space and
+  are inherited by every entry under it, published or not, as namespace grants are in section
+  2: an entry's grants are its own, every folder's above it, and its space's. The space's admins
+  change them (section 1's role model), and an inherited `detach` narrows as section 2 says.
+  Section 2's "later, same shape" grants on file roots become grants on any folder.
 - **Tables** are already single units. Publishing a table gives it a description and grants of
   its own. Whether a namespace can be published as one dataset of its tables is open (below).
 
@@ -462,22 +467,26 @@ Agreed and tried against Ceph on 2026-10-24. No credential reaches into a publis
 except that dataset's own; the broker keeps this by choosing what each credential covers,
 not by moving data.
 
+- **Recursive unless asked otherwise.** A request for a folder covers everything under it
+  unless it says `"recursive": false`, the split the S3 tools make (`aws s3 ls` and
+  `ls --recursive`, `cp -r`, `rm -r`); S3 itself lists non-recursively with `Delimiter=/`.
 - **A folder with no published dataset under it:** one credential for the whole folder, as for
   a dataset now. Recursive commands (`aws s3 sync`, `cp --recursive`, `ls --recursive`) work.
 - **A published dataset:** its own credential, under its own grants.
-- **A folder with a published dataset under it:** no credential covers it whole, since one
-  would reach the dataset. Asked for, the broker refuses with a short message, the same for
+- **A folder with a published dataset under it:** no recursive credential covers it, since one
+  would reach the dataset. Asked for one, the broker refuses with a short message, the same for
   any folder and naming nothing inside it:
 
-      datasets/projw/ contains published datasets, so one credential can't cover it.
-      Ask for its own files with "own_files": true, or open its subfolders and datasets separately.
+      datasets/projw/ contains published datasets, so it can't be opened recursively.
+      Open it with "recursive": false for the files directly in it, or open its subfolders
+      and datasets separately.
 
-  With `own_files`, the credential covers the folder's own files and nothing in its
-  subfolders: it allows `<folder>*` and denies `<folder>*/*`, and lists only `<folder>` one
-  level at a time (`s3:prefix` exactly the folder, `s3:delimiter` `/`). Its size is the same
-  for every folder and every person. Tried: it read and wrote a file directly in the folder,
-  was refused reading or writing inside a subfolder and listing below the folder, and listed
-  the folder's own files and its subfolders' names.
+- **A non-recursive credential**, for any folder, covers the files directly in it and nothing
+  in its subfolders: it allows `<folder>*` and denies `<folder>*/*`, and lists only `<folder>`
+  one level at a time (`s3:prefix` exactly the folder, `s3:delimiter` `/`). Its size is the
+  same for every folder and every person. Tried: it read and wrote a file directly in the
+  folder, was refused reading or writing inside a subfolder and listing below the folder, and
+  listed the files directly in it and its subfolders' names.
 - **Logged against what it covers.** A credential is logged against the entry of the folder
   or dataset it covers, so file attribution (`PROVENANCE.md` 6.2) works as it does now.
 - **Rejected on the way:** a folder credential denying each published dataset inside it, with
@@ -501,11 +510,12 @@ not for every file. No storage listing is needed for browsing.
 
 ### Files
 - `opa/blob.rego`: drop `allow_register`. `vend` and `vend_write` take `{subject, folder,
-  own_files}`: a folder in a space, allowed by the space's grants or, for a published dataset,
-  its own, restricted by sources as now; refused for a folder with a published dataset under
-  it unless `own_files`.
-- `broker/app.py`: `POST /vend` takes `folder` and `own_files` instead of `dataset`, returns the
-  message above when refused for that reason, and builds the own-files policy. A write
+  recursive}`: a folder in a space, allowed by its effective grants (its own if it is an
+  entry, every folder's above it, its space's), restricted by sources as now; a recursive
+  request is refused for a folder with a published dataset under it.
+- `broker/app.py`: `POST /vend` takes `folder` and `recursive` (default true) instead of
+  `dataset`, returns the message above when refused for that reason, and builds the
+  non-recursive policy. A write
   credential for a folder with no entry creates its entry (id from its path, as `derive_id`
   does now) before the credential is logged.
 - `governance/app.py` `/events`: a key under a tracked folder is recorded for it; any other key
@@ -551,16 +561,16 @@ description; declaring sources sits beside it, prefilled from the lineage candid
 - A folder becomes a dataset when published; published datasets do not contain or sit inside
   one another; nothing is copied.
 - No credential reaches into a published dataset except its own; a folder with one under it is
-  opened as its own files plus its parts.
-- Unpublished data is readable only through the space's grants, never wider.
+  opened non-recursively (`"recursive": false`) plus its parts.
+- Grants can be set on any folder and are inherited by every entry under it.
+- Unpublished data is readable only through its space's grants and those of the folders above
+  it, never grants of its own.
 - `pending` is removed; `published` is a flag on a live entry.
 - "Publish" is the user-facing word (decided 2026-10-24).
 
 ## Open
 - Tables: publish only tables, or also a namespace as one dataset of its tables (with
   inheritance as Polaris and Unity Catalog grant, or under the no-nesting rule of files).
-- Grants set on any folder and inherited by the entries under it, as namespace grants are in
-  section 2.
 
 ---
 
