@@ -461,7 +461,7 @@ exception. Match that.
 
 The rego stays almost untouched: every rule in `tables.rego` reads `e.read`, `e.describe`,
 etc. off the entry governance hands it, so governance returns *effective* grants (the table's
-own ∪ each ancestor namespace's) and `readable`, `viewable`, `writable`, `shares` and the
+own ∪ each ancestor namespace's) and `readable`, `viewable`, `writable` and the
 provenance narrowing work as they are. OPA still decides on one named resource; no
 enumeration is added.
 

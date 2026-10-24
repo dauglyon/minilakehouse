@@ -13,11 +13,11 @@ copies drift.
 
 This design holds one grant model, in one catalog, for every dataset of every kind, and makes
 every tool either ask one policy engine about it or obey a credential that engine gated. The
-model is small: five grants per dataset, and a rule that a dataset built from other datasets
-inherits read permission from its inputs. Because the model is outside any one tool, it can
-say things no single tool can: that a table and a folder of files have the same audience,
-that narrowing a source narrows everything derived from it across both kinds, and that a
-dataset exists without being readable.
+model is small: six grants per dataset, and a rule that data built from other datasets may be
+read only by people who may read those datasets too. Because the model is outside any one tool,
+it can say things no single tool can: that a table and a folder of files have the same
+audience, that narrowing a source narrows everything derived from it across both kinds, and
+that a dataset exists without being readable.
 
 The two consumers built so far are an Iceberg catalog, Polaris, and a credential broker for
 folders of files. They are the first two, not the design. The design is the model and the
@@ -106,12 +106,12 @@ service.
 | `kind` | `table` or `blob`. Views are `table`. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `describe`, `read`, `manage`, `write`, `delete` | Five sets of groups. See 4.2. |
-| `inputs` | Ids of datasets this one was built from. Set at registration, immutable. Every input must already exist and ids are never reused, so the input graph is acyclic. |
-| `releases` | Per grant, groups the dataset was released to past the inputs' intersection, each with the covering groups and inputs that justified it. See 4.3. |
+| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups. See 4.2. |
+| sources | Not stored in the entry: the datasets its stored files were built from, worked out from the access log and a listing of its folder. See 4.3. |
+| releases | Per source, the groups that source's `manage` holders let read this dataset although they may not read the source. See 4.3. |
 | `status` | `pending`, `live`, `gone`. See section 9. |
 
-### 4.2 Five grants
+### 4.2 Six grants
 
 Each grant is a set of groups. Governance holds the groups and who belongs to each, beside the
 grants; Keycloak only proves who a person is. Each group has owners, which are groups, and
@@ -137,6 +137,9 @@ request, since every rule looks the person's groups up at decision time.
   listing shows file names, sizes, times and ETags, which for a single-part upload are an MD5
   of its contents. Neither kind is narrowed by what a dataset was built from, so data nobody
   may read can still be removed.
+- **detach**: this group's members may declare that data built from this dataset no longer
+  holds its data, so this dataset stops counting as a source of that data (4.3). While the
+  grant is empty, anyone who wrote that data may.
 
 Two grants imply others, and no more: `read` implies `describe`, so a dataset a group may read is
 listed for it; and for tables, `write` implies `read`, because writing an Iceberg table
@@ -162,68 +165,74 @@ reading data through it still takes `read` on the tables it uses.
 
 ### 4.3 Derived datasets
 
-This section is the earlier design, over declared `inputs`. The built design has sources travel
-with stored files and is in `PROVENANCE.md` 6, releases in 6.7; this section changes to match
-it, with the other statements `PROVENANCE.md` section 10 lists.
+Data built from other datasets carries them as sources, and only people who may read every
+source may read it. `PROVENANCE.md` 6 holds the design and what was run to test it; this
+section states the rule.
 
-An entry with a non-empty `inputs` list is derived. `read` and `manage` are inherited; `describe`
-and `write` are declared only.
+A **source** of some data is a dataset whose own `read` limits who may read that data. Sources
+are tracked per stored file, the way Apache Atlas propagates a classification to everything
+derived from a dataset and Palantir Foundry's markings follow data along lineage.
 
-    base(d, g)       = declared(d, g) ∩ ⋂ { effective(i, g) : i ∈ inputs(d) }    g ∈ {read, manage}
-    effective(d, g)  = base(d, g) ∪ { x ∈ releases(d, g) : covered(d, g, x) }
-    covered(d, g, x) = ∀ i ∈ inputs(d) with x ∉ effective(i, g):
-                           ∃ c ∈ covers(d, g, x, i) : c ∈ effective(i, manage)
-    effective(d, g)  = declared(d, g)                                              g ∈ {describe, write}
+1. **Reading brings sources in.** A read of a dataset brings in the dataset and every source
+   its files carry. Every credential is logged before it is handed out, so this holds for
+   every read made through the platform.
+2. **A file carries what its writers brought in.** A stored file is matched by its time to
+   the write credentials valid for its folder, and carries everything their holders had
+   brought in by then, minus what a declaration of theirs marks unused.
+3. **Who may read**: a person in the dataset's `read` who, for every source its files carry,
+   is in that source's `read` or in a group a release lets past it. `write` is narrowed the
+   same way, so no one writes into a dataset they could not read back. `describe` and `delete`
+   are not narrowed: a derived dataset can be listed for people who cannot read its sources,
+   and data nobody may read can still be removed. Nor is `manage`: changing who may see and
+   read a dataset takes `manage` on that dataset alone, and rule 3 still applies to whoever is
+   added.
 
-A release adds group `x` to grant `g` on `d` past what the inputs allow, with their owners'
-consent: data built from a source stays restricted by it, and the source's `manage` holders
-approve an additional audience for a particular derived dataset. (US classified-information
-handling has the same step for originator-controlled material: a derivative product keeps the
-marking, and further dissemination needs the originator's permission.) To release `d` to `x`
-for `g`, the caller must hold `manage` on every input whose effective `g` lacks `x`. For each such input the caller's groups holding `manage` on it are
-recorded as `covers(d, g, x, i)`. An input that granted `x` at release time has no cover
-recorded; if it later stops granting `x`, there is no cover for it and the release is
-uncovered until someone with `manage` on that input re-adds it. That is the conservative
-reading and it is the intended one.
+Governance returns each dataset's sources with their grants, and OPA applies rule 3 at
+decision time, so a grant change on a source reaches everything built from it at the next
+decision with nothing recomputed.
 
-Direct inputs suffice: every group in `effective(i, manage)` either inherited it from `i`'s
-own inputs or was placed there by a release that someone with `manage` on those inputs made,
-so authority over `i` is authority over everything upstream of `i`, by induction on the
-input graph.
+Two acts change what a dataset carries:
 
-Governance recomputes effective sets on every grant change and stores them in the entry.
-OPA receives only effective sets and never sees `inputs` or `releases`.
+- **Declaring.** A writer names which of the datasets they read were used. Until they do,
+  everything they read counts.
+- **Detaching.** Marking unused a source that arrived through another dataset states that the
+  data no longer holds it. Nobody can check that, so the source's `detach` grant says who may,
+  and each detach is recorded where the source's `manage` holders see it and can put the source
+  back (`PROVENANCE.md` 6.5).
+
+A **release** lets a group read a dataset built from a source although the group may not read
+the source. A `manage` holder of the dataset asks, once the group is in its `read`; a
+`manage` holder of each such source approves. Data built from the released dataset carries the
+release. Withdrawing it closes the dataset to the group again at the next decision
+(`PROVENANCE.md` 6.7). US classified-information handling has the same step for
+originator-controlled material: a derivative product keeps the marking, and further
+dissemination needs the originator's permission.
 
 Consequences, stated so they are not surprises:
 
-- Narrowing `read` on a source narrows every derived dataset except where a release is
-  still covered. A `manage` holder on the source can re-add the removed group downstream; that
-  is what `manage` means.
-- A dataset with many transitive inputs has a small effective `read`. The output's readers
-  are allowed to read everything it was built from.
-- `describe` does not inherit. A derived dataset can be listed for people who cannot see its
-  inputs. Its `inputs` field is shown only for inputs the viewer may see, and the count of
-  hidden inputs is not shown.
-- A `gone` input still constrains its outputs. Grants are independent of status.
-- A group given `manage` on a derived dataset by a release can release further downstream. This
-  is grant-option chaining, and it began with someone who held `manage` on the inputs.
-- The `inputs` list is declared by the publisher and trusted. The control is who may register
-  (section 8), not verification of content.
+- Narrowing `read` on a source narrows every dataset built from it, except for groups a
+  release covers.
+- A dataset built from many sources has a small audience: its readers may read everything it
+  was built from.
+- A `gone` source still constrains data built from it. Grants are independent of status.
+- Which of a writer's reads were used is declared and trusted; that the list of candidates is
+  complete is enforced, for data that came through the platform (section 11).
 
 ### 4.4 Changing grants
 
-Changes to the grant model are governance operations, decided by OPA like every other
-request. For each change governance locks the dataset's row, asks OPA with the caller's
-subject and groups, the dataset id, and the change, and on allow recomputes effective sets
-and writes. OPA fetches the entry from governance like any other rule; every writer of a
-row takes its lock, so the entry OPA reads is the one the write replaces.
+Changes to the grant model are governance operations, decided by OPA like every other request.
+For each change governance locks the dataset's row, asks OPA with the caller's subject and
+groups, the dataset id, and the change, and on allow writes. OPA fetches the entry from
+governance like any other rule; every writer of a row takes its lock, so the entry OPA reads is
+the one the write replaces.
 
-- `describe` and `read` of dataset d: callers holding effective `manage` on d.
-- `manage`, `write` and `delete` of d: callers in a group owning the folder root (a file
-  dataset) or namespace (a table) that d sits under.
-- Releasing d to group x for grant g: callers holding effective `manage` on every
-  input of d whose effective g lacks x. Removing one: callers holding effective `manage` on d.
-- `inputs`: never.
+- `describe` and `read` of dataset d: callers holding `manage` on d.
+- `manage`, `write`, `delete` and `detach` of d: callers in a group owning the folder root (a
+  file dataset) or namespace (a table) that d sits under.
+- Releasing d past source s to group x: asked by callers holding `manage` on d, once x is in
+  d's `read` and d's declarations mark s used; approved, declined or withdrawn by callers
+  holding `manage` on s.
+- Putting back a source detached from d: callers holding `manage` on the source.
 - A group's members and owners: callers in one of the group's owners, decided under a lock
   on that group. A change leaving a group without an owner is refused.
 - Creating a group: callers in `group-admins`, who name its first owners. A name any grant or
@@ -353,11 +362,12 @@ account, which holds no grants.
 1. **Find tables in SQL.** Any SQL tool lists namespaces and tables through the gate and sees
    only what its person may see.
 2. **Find datasets.** Query the table `governance.datasets` from any engine connected to the
-   catalog. It returns every dataset, table or file, whose effective `describe` includes one of the person's groups, with name and
-   description and whether the person may read it. The table's files are built by governance
-   for the person reading them and served by governance; no copy of the list is stored.
-3. **Read a table in Trino.** Log in. Connect to Trino with the token, attach it as the
-   extra credential. Query.
+   catalog. It returns every dataset, table or file, that the person may describe or read (4.2,
+   4.3), with name and description and whether the person may read it. The table's files are
+   built by governance for the person reading them and served by governance; no copy of the
+   list is stored.
+3. **Read a table in Trino.** Log in. Connect to Trino with the token, attach it as the extra
+   credential. Query.
 4. **Read a table elsewhere.** Log in. Point the client at the gate with the token as bearer.
 5. **Read files.** Log in. Ask the broker for a credential naming the dataset. Read the folder
    with any S3 client.
@@ -374,13 +384,14 @@ denies every read.
    upload; storage events do the rest. For tables, create the table through Polaris; the
    gate admits the creation because the entry exists and the caller is in its `write`, and
    reports the location back.
-7. **Publish a derived dataset.** As 6, plus `inputs` and any releases. Governance
-   additionally checks the person may read every input and holds `manage` on every input they
-   release past. Build the output with any tool, as themselves.
+7. **Publish a derived dataset.** As 6. Build the output with any tool, as themselves; its
+   files carry everything they read (4.3). Declare which reads were used, in
+   `governance.derivations`, and ask for a release past any source some intended readers may
+   not read.
 8. **Delete.** Delete the objects or drop the table. The delete events, or the gate's drop
    report, set `gone`.
 9. **Change grants.** Log in. Call governance naming the dataset and the change. Governance
-   applies 4.4 and recomputes.
+   applies 4.4.
 
 ### Operator
 
@@ -400,9 +411,13 @@ everyone but root.
 
 | Rule | Caller | Input | Decision |
 |---|---|---|---|
-| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in effective `describe` or `read` |
-| `vend` (read) | broker | dataset id | allow, plus the entry's folder for the read session policy |
-| `vend_write` | broker | dataset id | allow, plus the entry's folder for the write session policy |
+| `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in `describe`, or the caller may read (4.3) |
+| `vend` (read) | broker | dataset id | the caller may read it (4.3); allow, plus the entry's folder for the read session policy |
+| `vend_write` | broker | dataset id | the caller may write it (4.3); allow, plus the entry's folder for the write session policy |
+| `vend_delete` | broker | dataset id | a caller group in `delete`; allow, plus the entry's folder for the delete session policy |
+| `load` | gate, once Polaris has answered a table or view load | table id, kind, whether a credential was handed out, property keys | whether that credential can write; whether a load without one keeps every version; which properties it keeps (4.2) |
+| `derivations.allowed` | governance, for a declaration | target and the sources it marks unused | which may be marked unused: a direct read always, a detach by `detach` (4.3) |
+| `derivations.may_release`, `may_reattach` | governance | source ids | which sources' releases and putting back the caller decides: a caller group in the source's `manage` |
 | `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
 | `allow_register` | governance | requested folder | the caller is a steward and a caller group owns a root above the folder |
 | `allow_change` | governance | dataset id and the requested change | the rules of 4.4 |
@@ -412,10 +427,10 @@ everyone but root.
 | Polaris: list namespaces, list tables, list views | Polaris | namespace | allowed for any authenticated person; the gate trims the response by `visible` |
 | Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group owns the namespace or one above it, or any table in it is visible to the caller |
 | Polaris: create table, create view, commit a staged create | Polaris | namespace | the caller may view the namespace; the gate has already decided per table with `allow_create`, since Polaris names only the namespace |
-| Polaris: table exists, view exists, load table or view metadata | Polaris | table id | group in effective `describe` or `read` |
-| Polaris: load with a read credential | Polaris | table id | group in effective `read`; `write` implies `read` for tables |
-| Polaris: load with a read-write credential | Polaris | table id | group in effective `write`. Trino asks for this on every load; when denied, Polaris checks for a read credential instead |
-| Polaris: update, commit table or view | Polaris | table id | group in effective `write` |
+| Polaris: table exists, view exists, load table or view metadata | Polaris | table id | group in `describe`, or the caller may read it |
+| Polaris: load with a read credential | Polaris | table id | the caller may read it (4.3); `write` implies `read` for tables |
+| Polaris: load with a read-write credential | Polaris | table id | the caller may write it (4.3). Trino asks for this on every load; when denied, Polaris checks for a read credential instead |
+| Polaris: update, commit table or view | Polaris | table id | the caller may write it |
 | Polaris: drop table or view, with or without purging its files | Polaris | table id | group in `delete` |
 | Polaris: rename table or view, register table, set table location | Polaris | | root only. Rename would orphan the entry's id; register and set-location would let a table alias another table's folder |
 | Polaris: create or drop namespace, update namespace properties | Polaris | namespace | a caller group owns the namespace or one above it |
@@ -456,9 +471,11 @@ that entry, and the event triggers a check of that one entry:
 
 - Registration creates `pending` and checks the folder once.
 - Files: a creation or deletion event under the folder, delivered by Ceph bucket
-  notifications, triggers an existence check of that folder, a listing capped at one object.
-  Non-empty sets `live`; empty after having been `live` sets `gone`. Events are coalesced per
-  folder so a bulk upload costs one check. Events under table folders are ignored.
+  notifications, triggers a listing of that folder, which also records each file's time for
+  attributing it to its writers (`PROVENANCE.md` 6.2). Non-empty sets `live`; empty after
+  having been `live` sets `gone`. Events are coalesced per folder so a bulk upload costs one
+  check. An event under a table's folder triggers the same listing; a table's status comes
+  from the gate.
 - Tables: the gate reports table creation, with its location, and table drop. Creation sets
   `live`; drop sets `gone`. A drop report for an unknown id is logged and ignored; a create
   for an unknown id cannot occur because the gate refuses it.
@@ -495,9 +512,10 @@ Grants are independent of status. Listings show `live` entries only.
   reaches data when outstanding credentials expire.
 - **No request workflow.** A person can see a dataset they cannot read and has no in-system
   way to ask for it. Listings return a contact.
-- **Inputs are trusted.** A publisher who omits an input defeats the derivation rule. The
-  control is who may register. Verifying inputs would require engine lineage, which requires
-  trusting the engine, which this design does not.
+- **Declarations are trusted.** Every read through the platform is recorded, so the list of
+  candidate sources is complete; which of them were used is the writer's declaration, and
+  data brought in from outside the platform is invisible to it (`PROVENANCE.md` 7, 8). Content
+  is never checked.
 - **Registration reveals names within a tenant.** Registering an id that exists fails, so
   co-owners of a root can learn each other's names. Accepted: they share a root.
 - **The gate is a component you run** in front of a catalog you do not control. A Polaris
@@ -512,10 +530,14 @@ folder, never by the client.
 **Enforced by the gate.** What appears in a Polaris listing, and that a table is created only
 under a registered entry by someone in its `write`.
 
-**Decided by OPA.** Every decision in section 8, including registration and changes to the
-grants, over the entry governance holds at the time of the decision.
+**Enforced by governance.** Every credential is logged before the broker or the gate hands it
+out, so the candidate sources of anything written through the platform are complete.
 
-**Declared and trusted.** The `inputs` list of a derived dataset. The content of any dataset.
+**Decided by OPA.** Every decision in section 8, including registration, changes to the
+grants and rule 3 (4.3), over the entry governance holds at the time of the decision.
+
+**Declared and trusted.** Which candidates were used. Data from outside the platform. The
+content of any dataset.
 
 ## 12. Decisions
 
@@ -529,31 +551,34 @@ their owners delegate below them; `read` implies `describe`.
 
 ## 13. Status against the repository
 
-Implemented today: the catalog with `describe`, `read` and `manage` for file datasets; the file
-listing; the dataset index as a per-person table, `governance.datasets`, listing both kinds;
-the broker, scoping credentials to the folder in OPA's decision; Polaris delegating to OPA
-with per-table credentials, viewing a table gated on `describe` or `read` and read-write
-credentials on `write`, drops on `delete`; registration gated by `stewards` and root
-ownership; OPA holding policy and no grants, every rule fetching what it needs from
-governance with `http.send`; Trino authenticating people by their Keycloak token over HTTPS
-and forwarding it to Polaris as the `token` extra credential; the gate as the only way to
-Polaris, verifying the token, trimming listings (every upstream page, one filter, its own
-page tokens), answering not-found for a refused name the person may not view, and repeating
-a refused credentialed load without the credential request, deciding table and namespace
-creation, and reporting table creates and drops; tables registered as entries with `describe`,
-`read`, `manage`, `write` and `delete` by group; `write` for file datasets, a broker
-credential that puts and deletes in the folder; grant changes through governance, decided by
-OPA under the entry's row lock as in 4.4; group membership and owners, and root ownership,
-in governance, changed through it as in 4.4; each person's Polaris principal created on
-first use; a login proxy that keeps a client session past the token's 5-minute life by
-holding the refresh token and forwarding a fresh token to Trino; OPA reachable only by its
-callers; persistent storage events, each checking one folder with a listing capped at one
-object, and no sweep.
+Implemented today: the catalog with `describe`, `read`, `manage`, `write`, `delete` and
+`detach` for file datasets; the file listing; the dataset index as a per-person table,
+`governance.datasets`, listing both kinds; the broker, scoping read, write and delete
+credentials to the folder in OPA's decision; Polaris delegating to OPA with per-table
+credentials, viewing a table gated on `describe` or `read` and read-write credentials on
+`write`, drops on `delete`; registration gated by `stewards` and root ownership; OPA holding
+policy and no grants, every rule fetching what it needs from governance with `http.send`;
+Trino authenticating people by their Keycloak token over HTTPS and forwarding it to Polaris as
+the `token` extra credential; the gate as the only way to Polaris, verifying the token,
+trimming listings (every upstream page, one filter, its own page tokens), answering not-found
+for a refused name the person may not view, repeating a refused credentialed load without the
+credential request and cutting that load to the current version, refusing views that would run
+with their owner's rights, deciding table and namespace creation, and reporting table creates
+and drops; tables registered as entries with the same six grants by group; grant changes
+through governance, decided by OPA under the entry's row lock as in 4.4; group membership and
+owners, and root ownership, in governance, changed through it as in 4.4; each person's Polaris
+principal created on first use; a login proxy that keeps a client session past the token's
+5-minute life by holding the refresh token and forwarding a fresh token to Trino; OPA
+reachable only by its callers; persistent storage events, each checking one folder, and no
+sweep. Derivation as in 4.3 (`PROVENANCE.md` sections 6 and 10): the access log and sessions,
+`governance.lineage`, declarations in `governance.derivations` or `POST /declarations`, sources
+carried per stored file, rule 3 in OPA for reading and writing files and tables, detaching and
+putting back, releases (`POST /releases`, `governance.releases`), and `governance.grants`.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files; `manage` is only the right to change grants, since there are no derived datasets
-to release; no derived datasets, no releases; events are checked as each delivery arrives
-rather than coalesced per folder.
+with files; a dataset is registered before anything is written in it rather than published
+afterwards, and a single table has grants of its own (section 10); there are no collections;
+events are checked as each delivery arrives rather than coalesced per folder.
 
 ## 14. Questions for the reviewer
 

@@ -227,7 +227,8 @@ The registry is the **mutable single source of truth**, so it lives in a real da
 not merged: storage owns *existence*, the registry owns *meaning/grants*.
 
 - **Freshness.** Each object created or deleted under a dataset's folder makes RGW notify
-  governance, which checks that one folder (a listing capped at one object) and sets `status`:
+  governance, which lists that folder, recording each file's time for attribution
+  (`PROVENANCE.md` 6.2), and sets `status`:
   non-empty → `live`; emptied-after-being-live → `gone`. The dataset index lists only `live`
   datasets. The notification topic is persistent: RGW queues each event and retries it until
   governance accepts it, so an event sent while governance is down arrives once it is back.

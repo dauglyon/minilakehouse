@@ -1,16 +1,17 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-Build steps 1 and 2 (section 10) are implemented; step 3 is design.
+Build steps 1, 2 and 4 (section 10) are implemented; step 3 is design.
 Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
-document extends `WHITEPAPER.md` and replaces its derivation rule (section 4.3), which limits a
-dataset by a list of `inputs`, with sources that travel with the stored data (section 6).
+document extends `WHITEPAPER.md`; its derivation rule, sources that travel with the stored data
+(section 6), replaced the whitepaper's earlier rule over a list of `inputs` per dataset, and
+`WHITEPAPER.md` 4.3 now summarizes it.
 
 ## 1. Purpose
 
-The whitepaper takes a derived dataset's `inputs` from the publisher and trusts them
-(`WHITEPAPER.md` 4.3, 10, 11). A publisher who omits an input defeats the derivation rule, and
-the only control is who may register. Section 10 rejects verifying inputs because that would
-require engine lineage, which requires trusting the engine.
+The whitepaper's earlier design took a derived dataset's `inputs` from the publisher and
+trusted them. A publisher who omitted an input defeated the derivation rule, and the only
+control was who may register. It rejected verifying inputs because that would require engine
+lineage, which requires trusting the engine.
 
 This design is the third option. The server records every dataset a person's work obtained a
 credential for, and until the publisher declares, per candidate, whether it was used, everything
@@ -353,13 +354,14 @@ markings follow data along lineage. Three rules:
    the file marked unused (6.3).
 3. **Who may read a dataset**: a person in its own `read` grant who is also in the own `read`
    grant of every source carried by any file in its folder, through any of their groups.
-   `manage` follows the same rule, as `WHITEPAPER.md` 4.3 has both inherit, and so does
-   `write`, for files as for tables (decided 2026-10-23): a file write credential cannot get
-   or list, so without the cut someone who may not read a source would overwrite or delete
-   files they cannot see and could not read back their own. A release past a source (6.7)
-   counts as its `read` here.
+   `write` follows the same rule, for files as for tables (decided 2026-10-23): a file write
+   credential cannot get or list, so without the cut someone who may not read a source would
+   overwrite or delete files they cannot see and could not read back their own. `manage` does
+   not (6.7): changing who may see and read a dataset takes `manage` on it alone, and the rule
+   still applies to whoever is added. A release past a source (6.7) counts as its `read`
+   here.
 
-This replaces `WHITEPAPER.md` 4.3's per-dataset `inputs`. A file's sources already include
+This replaced the whitepaper's per-dataset `inputs`. A file's sources already include
 everything upstream of it, so rule 3 needs no chain of inputs-of-inputs: it looks up each
 source's own grant at decision time, and a grant change takes effect at the next decision
 with nothing to recompute.
@@ -367,11 +369,11 @@ with nothing to recompute.
 OPA applies rule 3, not governance (decided 2026-10-22). Governance's lookups return a
 dataset's own grants and its carried sources, each with that source's own `read` and `manage`
 and whether a declaration says it was used (`declared`) or it is there because a writer has
-not declared yet. The rules in `opa/tables.rego` (`readable`, `writable`, `shares`) and
-`opa/blob.rego` (`_reads`) do the cut, so how undeclared data is treated is policy: the shipped
+not declared yet. The rules in `opa/tables.rego` (`readable`, `writable`) and
+`opa/blob.rego` (`_reads`, `vend_write`) do the cut, so how undeclared data is treated is policy: the shipped
 rules treat an undeclared source like a declared one, and a deployment can, for example,
 require `declared` for someone who may describe a table but not read it. This reverses
-`WHITEPAPER.md` 4.3's "OPA receives only effective sets", whose reason, keeping the chain of
+the earlier design's "OPA receives only effective sets", whose reason, keeping the chain of
 inputs out of Rego, is gone. The rule checks people, not groups: the whitepaper's formula
 intersects group sets, which would refuse someone who reaches the dataset and a source
 through different groups.
@@ -502,8 +504,8 @@ Decided 2026-10-22: a write needs no declaration, and status does not wait for o
   table whose caller is in its `write`; a file dataset gets a write credential on `write`.
 - `live` when it exists, as before: a table once the gate reports its creation, a file
   dataset once its folder holds a file. Listed under its `describe` grant, which no source
-  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot see
-  its inputs.
+  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot
+  read its sources.
 - Readable under rule 3 from its first write: until each writer declares, everything that
   writer brought in limits who may read it, so declaring is how a writer widens its readers.
 - Rejected: holding an output `pending` until every writer has declared. Status decides only
@@ -800,5 +802,3 @@ Build order, each step usable on its own:
 3. The `sessions` lever as an insert.
 4. Releases (6.7). Built 2026-10-24.
 
-Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
-and 11, and its section 4.2's list of grants, which gains `detach`, change when step 2 lands.
