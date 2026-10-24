@@ -17,6 +17,7 @@ package lakehouse.blob
 #                                                      published dataset
 #   allow_change_folder  input {subject, folder: id, grants: [grant], platform_admin}
 #                                                      governance: may change these grants of a folder
+#   allow_transfer  input {subject, from: id, to: id}  broker: may move this folder there
 #   blocking        input {subject, dataset: id}       governance's read API: the sources that
 #                                                      refuse the subject this dataset
 #   effective_read  input {dataset: id, holders: {name: [name]}}
@@ -57,6 +58,15 @@ vend := {"allow": false, "recursive_refused": true} if {
 	e := _entries[input.dataset]
 	_only_recursion_refused(e)
 	_reads(e)
+}
+
+# A folder that moved gets no credential (docs/HANDOFF-2026-10-22-groups.md section 1); the
+# refusal names where it went to anyone who may describe the new entry, and is the ordinary
+# refusal for everyone else.
+vend := {"allow": false, "moved_to": e.moved_to} if {
+	e := _entries[input.dataset]
+	e.status == "moved"
+	_describes(governance.post("/internal/datasets", {"ids": [e.moved_to]}).entries[e.moved_to])
 }
 
 # Writing (WHITEPAPER 4.2): put and delete in the folder, granted by `write`; it implies neither
@@ -104,19 +114,28 @@ vend_delete := {"allow": false, "recursive_refused": true} if {
 _recursive := object.get(input, "recursive", true)
 
 _reaches_no_other(e) if {
+	_not_moved(e)
 	count(e.inside_published) == 0
 	not _recursive
 }
 
 _reaches_no_other(e) if {
+	_not_moved(e)
 	count(e.inside_published) == 0
 	count(e.contains_published) == 0
 }
 
 _only_recursion_refused(e) if {
+	_not_moved(e)
 	count(e.inside_published) == 0
 	_recursive
 	count(e.contains_published) > 0
+}
+
+# A moved folder's old path, and every folder under it, stop working.
+_not_moved(e) if {
+	e.status != "moved"
+	count(e.inside_moved) == 0
 }
 
 discover := {"visible": visible, "readable": readable}
@@ -128,25 +147,53 @@ discover := {"visible": visible, "readable": readable}
 # (governance/app.py _index_rows); a change to what makes a dataset visible changes that too.
 visible contains id if {
 	some id, e in _entries
+	_describes(e)
+}
+
+_describes(e) if {
 	e.published
 	_holds(_holder.read, e.describe)
 }
 
-visible contains id if {
-	some id, e in _entries
+_describes(e) if {
 	not e.published
 	_holds(_holder.read, e.access)
 }
 
-visible contains id if {
-	some id, e in _entries
-	_reads(e)
-}
+_describes(e) if _reads(e)
 
 readable contains id if {
 	some id, e in _entries
 	_reads(e)
 }
+
+# Moving a folder (docs/HANDOFF-2026-10-22-groups.md section 1): out of the subject's own
+# personal space, or out of a plain group's space by one of its owners or admins, into the
+# space of a group the subject is a member or above of, other than a personal one, and not
+# inside a published dataset. Governance checks that the destination holds nothing yet.
+default allow_transfer := false
+
+allow_transfer if {
+	f := _pair[input.from]
+	t := _pair[input.to]
+	f.tracked
+	_not_moved(f)
+	count(f.contains_published) == 0
+	_may_send(f)
+	t.space != f.space
+	not startswith(t.space, "u_")
+	concat("#", [t.space, "member"]) in _holder.write
+	count(t.inside_published) == 0
+}
+
+_may_send(f) if f.space == _holder.personal
+
+_may_send(f) if {
+	not f.tenant
+	concat("#", [f.space, "admin"]) in _holder.write
+}
+
+_pair := governance.post("/internal/datasets", {"ids": [input.from, input.to]}).entries
 
 # Publishing a folder: a steward of the group whose space holds it.
 default allow_publish := false

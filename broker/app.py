@@ -25,6 +25,10 @@ Flow:
 
 OPA denies an unknown folder exactly as a denied one, so the broker reveals nothing about
 which folders exist.
+
+It also moves folders (POST /transfers, docs/HANDOFF-2026-10-22-groups.md section 1): from a
+personal space or a plain group's space into another group's space, by server-side copy and
+then deleting the originals, under a credential naming only the two folders.
 """
 import json
 import os
@@ -34,6 +38,7 @@ import boto3
 import jwt
 import requests
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from flask import Flask, jsonify, request
 
 KEYCLOAK_JWKS = os.environ["KEYCLOAK_JWKS"]
@@ -46,6 +51,7 @@ RGW_ENDPOINT = os.environ["RGW_ENDPOINT"]
 BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
 BLOB_WRITE_ROLE_ARN = os.environ["BLOB_WRITE_ROLE_ARN"]
 BLOB_DELETE_ROLE_ARN = os.environ["BLOB_DELETE_ROLE_ARN"]
+BLOB_MOVE_ROLE_ARN = os.environ["BLOB_MOVE_ROLE_ARN"]
 BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
@@ -195,6 +201,8 @@ def vend():
         app.logger.info("DENY %s subject=%s folder=%s recursive=%s", mode, subject, folder, recursive)
         if decision.get("recursive_refused") is True:
             return jsonify({"error": RECURSIVE_REFUSED.format(prefix=f"datasets/{folder}/")}), 403
+        if isinstance(decision.get("moved_to"), str):
+            return jsonify({"error": f"{folder} has moved to {decision['moved_to']}"}), 403
         return jsonify({"error": "forbidden"}), 403
 
     # Governance confines every folder; the prefix becomes an STS ARN below, so re-check rather
@@ -227,6 +235,69 @@ def vend():
         "mode": mode,
         "recursive": recursive,
     })
+
+
+def _internal(path, body):
+    r = _http.post(f"{GOVERNANCE_INTERNAL}{path}", timeout=30, json=body,
+                   cert=(f"{PKI}/client.crt", f"{PKI}/client.key"), verify=f"{PKI}/ca.crt")
+    return r.status_code, (r.json() if r.content else {})
+
+
+@app.post("/transfers")
+def transfer():
+    # Move a folder, {"from", "to"}: OPA's allow_transfer decides (the person whose personal space
+    # it is, or an owner or admin of the plain group whose space holds it; a member or above of
+    # the receiving group). Governance then checks the destination is empty and logs the move as
+    # a read of the old folder and a write of the new one in a session of its own, so the copies
+    # carry what the old folder carried (PROVENANCE.md 6, rule 2). The broker copies every object
+    # server-side, deletes the originals once all are copied, and has governance record the old
+    # entry as moved to the new one. A failure before that leaves the old folder whole.
+    claims, err = authed_user()
+    if err:
+        return err
+    subject = subject_of(claims)
+    body = request.get_json(silent=True) or {}
+    src, dst = body.get("from"), body.get("to")
+    if not all(isinstance(f, str) and len(f) <= 200 and ID_RE.match(f) for f in (src, dst)) or src == dst:
+        return jsonify({"error": "from and to must be two folders"}), 400
+    r = _http.post(f"{OPA_BLOB}/allow_transfer", json={"input": {"subject": subject, "from": src, "to": dst}},
+                   timeout=5)
+    r.raise_for_status()
+    if r.json().get("result") is not True:
+        app.logger.info("DENY transfer subject=%s from=%s to=%s", subject, src, dst)
+        return jsonify({"error": "forbidden"}), 403
+    old, new = f"datasets/{src}/", f"datasets/{dst}/"
+    cr = _sts.assume_role(RoleArn=BLOB_MOVE_ROLE_ARN, RoleSessionName=f"move-{subject}"[:32], DurationSeconds=TTL,
+                          Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+                              {"Effect": "Allow", "Action": ["s3:GetObject", "s3:DeleteObject"],
+                               "Resource": [f"arn:aws:s3:::{BUCKET}/{old}*"]},
+                              {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": [f"arn:aws:s3:::{BUCKET}"],
+                               "Condition": {"StringLike": {"s3:prefix": [f"{old}*"]}}},
+                              {"Effect": "Allow", "Action": ["s3:PutObject"],
+                               "Resource": [f"arn:aws:s3:::{BUCKET}/{new}*"]}]}))["Credentials"]
+    try:
+        status, begun = _internal("/internal/transfers", {
+            "phase": "begin", "person": subject, "sub": claims.get("sub") or "", "sid": claims.get("sid") or "",
+            "from": src, "to": dst, "expires": int(cr["Expiration"].timestamp() * 1000)})
+        if status != 200:
+            return jsonify({"error": begun.get("error", "transfer refused")}), status
+        s3 = boto3.client("s3", endpoint_url=RGW_ENDPOINT, aws_access_key_id=cr["AccessKeyId"],
+                          aws_secret_access_key=cr["SecretAccessKey"], aws_session_token=cr["SessionToken"],
+                          region_name="us-east-1", config=Config(signature_version="s3v4"))
+        keys = [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=old)
+                for o in page.get("Contents", [])]
+        for k in keys:
+            s3.copy_object(Bucket=BUCKET, Key=new + k[len(old):], CopySource={"Bucket": BUCKET, "Key": k})
+        for k in keys:
+            s3.delete_object(Bucket=BUCKET, Key=k)
+        status, done = _internal("/internal/transfers", {"phase": "done", "transfer": begun["transfer"]})
+        if status != 200:
+            raise requests.RequestException(f"record refused: {done}")
+    except (requests.RequestException, boto3.exceptions.Boto3Error, ClientError) as e:
+        app.logger.warning("transfer %s -> %s failed: %s", src, dst, e)
+        return jsonify({"error": "transfer failed"}), 503
+    app.logger.info("TRANSFER subject=%s from=%s to=%s objects=%d", subject, src, dst, len(keys))
+    return jsonify({"ok": True, "from": src, "to": dst, "objects": len(keys), "transfer": begun["transfer"]})
 
 
 if __name__ == "__main__":

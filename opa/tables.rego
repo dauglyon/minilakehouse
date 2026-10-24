@@ -28,6 +28,7 @@ package lakehouse.tables
 #                    {write, history, properties: [key]}
 #   allow_namespace  input {subject, id}   gate: may create this namespace
 #   allow_publish    input {subject, id, platform_admin}   governance: may publish this namespace
+#   allow_transfer   input {subject, from: id, to: id}  governance: may record this table's move
 #   allow_change     input {subject, id, grants: [grant], platform_admin}
 #                                          governance: may change these grants on this namespace
 #   blocking         input {subject, id}   governance's read API: the sources that refuse the
@@ -115,6 +116,31 @@ _load_properties contains k if some k, _ in input.properties
 default allow_namespace := false
 
 allow_namespace if _holds(governance.holder(input.subject).write, namespace(input.id).write)
+
+# Recording a table's move, as blob.rego's allow_transfer for folders: out of the subject's
+# own personal space, or a plain group's space by its owners and admins, into the space of a
+# group they are a member or above of, outside every published namespace.
+default allow_transfer := false
+
+allow_transfer if {
+	h := governance.holder(input.subject)
+	f := table(input.from)
+	t := table(input.to)
+	f.status == "live"
+	t.status == "live"
+	_may_send(h, f)
+	t.space != f.space
+	not startswith(t.space, "u_")
+	concat("#", [t.space, "member"]) in h.write
+	not t.published
+}
+
+_may_send(h, f) if f.space == h.personal
+
+_may_send(h, f) if {
+	not f.tenant
+	concat("#", [f.space, "admin"]) in h.write
+}
 
 # Publishing a namespace: a steward of the group whose space holds it.
 default allow_publish := false
@@ -220,10 +246,16 @@ writable(h, e) if {
 # Rule 3, and the personal-space exemption (PROVENANCE.md 9): a person's own reads and writes in
 # their personal space are not cut by the sources its data carries, as their own downloads would
 # not be, unless one of their groups is in a carried source's `revoked`. A deployment that wants
-# losing `read` on a source to reach every copy derived from it drops the second clause.
-sources_ok(h, e) if sources_allow(h.read, e)
+# losing `read` on a source to reach every copy derived from it drops the second clause. An
+# entry that moved passes neither: it is read and written at its new id, and stays viewable and
+# droppable, so the original of a moved table can be dropped.
+sources_ok(h, e) if {
+	object.get(e, "status", "") != "moved"
+	sources_allow(h.read, e)
+}
 
 sources_ok(h, e) if {
+	object.get(e, "status", "") != "moved"
 	h.personal != ""
 	e.space == h.personal
 	not revoked(h, e)

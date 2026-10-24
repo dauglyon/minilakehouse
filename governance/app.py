@@ -380,6 +380,20 @@ CREATE TABLE IF NOT EXISTS revocations (
     removed_by TEXT,
     removed_at TIMESTAMPTZ
 );
+-- Transfers (docs/HANDOFF-2026-10-22-groups.md section 1): a folder or table moved into another
+-- group's space keeps its old entry, with status `moved` and the new one in `moved_to`.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS moved_to TEXT;
+ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS moved_to TEXT;
+CREATE TABLE IF NOT EXISTS transfers (
+    id      BIGSERIAL PRIMARY KEY,
+    kind    TEXT NOT NULL,                    -- files | table
+    from_id TEXT NOT NULL,
+    to_id   TEXT NOT NULL,
+    by      TEXT NOT NULL,
+    at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    session BIGINT REFERENCES sessions (id),  -- a folder's: the session its copies were logged in
+    done_at TIMESTAMPTZ
+);
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -569,7 +583,8 @@ def opa(rule, inp, package="blob"):
 internal_app = Flask("internal")
 # The certificate names that may call each internal route; every other route is a grant lookup,
 # OPA's alone.
-INTERNAL_CALLERS = {"/internal/table-events": {"gate"}, "/internal/accesses": {"gate", "broker"}}
+INTERNAL_CALLERS = {"/internal/table-events": {"gate"}, "/internal/accesses": {"gate", "broker"},
+                    "/internal/transfers": {"broker"}}
 
 
 @internal_app.before_request
@@ -597,11 +612,12 @@ def _confined_prefix(prefix):
             and ".." not in prefix and "//" not in prefix)
 
 
-# Status follows the folder: non-empty => live, empty => gone. Set under the row lock, so two
-# checks of one dataset at once leave the later listing's answer.
+# Status follows the folder: non-empty => live, empty => gone; a moved entry stays moved. Set
+# under the row lock, so two checks of one dataset at once leave the later listing's answer.
 _RECONCILE_SQL = """
 WITH prev AS (SELECT status AS old FROM datasets WHERE id = %(n)s FOR UPDATE)
-UPDATE datasets d SET status = CASE WHEN %(nonempty)s THEN 'live' ELSE 'gone' END,
+UPDATE datasets d SET status = CASE WHEN d.status = 'moved' THEN 'moved' WHEN %(nonempty)s THEN 'live'
+                                    ELSE 'gone' END,
     last_reconciled = now()
 FROM prev WHERE d.id = %(n)s
 RETURNING prev.old AS old, d.status AS new
@@ -886,8 +902,14 @@ def _namespace_layers(cur, names):
     return out
 
 
-_DATASET_SQL = (f"SELECT id, prefix, description, steward, published, status, {_DATASET_GRANT_SQL} "
+_DATASET_SQL = (f"SELECT id, prefix, description, steward, published, status, moved_to, {_DATASET_GRANT_SQL} "
                 "FROM datasets WHERE id = ANY(%s)")
+
+
+def _tenants(cur, names):
+    """The names among these that are groups with a steward."""
+    cur.execute("SELECT DISTINCT grp FROM group_members WHERE steward AND grp = ANY(%s)", (sorted(n for n in names if n),))
+    return {r["grp"] for r in cur.fetchall()}
 
 
 def _file_entries(ids, would_be=False):
@@ -906,6 +928,9 @@ def _file_entries(ids, would_be=False):
         layers = _folder_layers(cur, items)
         cur.execute("SELECT id, prefix FROM datasets WHERE published")
         published = cur.fetchall()
+        cur.execute("SELECT id, prefix FROM datasets WHERE status = 'moved'")
+        moved = cur.fetchall()
+        tenants = _tenants(cur, {_file_space(p) for _, p, _ in items})
     entries = {}
     for i, prefix, _ in items:
         if i not in rows and not any(where == "space" for where, _ in layers[i]):
@@ -913,6 +938,11 @@ def _file_entries(ids, would_be=False):
         eff = _union(layers[i])
         entries[i] = {"id": i, "prefix": prefix, "tracked": i in rows,
                       "published": i in rows and rows[i]["published"], "space": _file_space(prefix),
+                      "tenant": _file_space(prefix) in tenants,
+                      "status": rows[i]["status"] if i in rows else None,
+                      "moved_to": rows[i]["moved_to"] if i in rows else None,
+                      "inside_moved": sorted(m["id"] for m in moved
+                                             if prefix.startswith(m["prefix"]) and prefix != m["prefix"]),
                       **{("access" if g == "read" else g): eff[g] for g in GRANTS},
                       "inside_published": sorted(p["id"] for p in published
                                                  if prefix.startswith(p["prefix"]) and prefix != p["prefix"]),
@@ -927,16 +957,19 @@ def _table_entries(ids, would_be=False):
     None). A table has no grants of its own: its effective grants are its namespaces' and its
     space's, and it is published when a namespace at or above it is. Without sources."""
     with db() as cur:
-        cur.execute("SELECT id, status, location FROM table_entries WHERE id = ANY(%s)", (ids,))
+        cur.execute("SELECT id, status, location, moved_to FROM table_entries WHERE id = ANY(%s)", (ids,))
         rows = {r["id"]: r for r in cur.fetchall()}
         wanted = [i for i in ids if i in rows or (would_be and TABLE_ID_RE.match(i))]
         ns = _namespace_layers(cur, [_parent(i) for i in wanted]) if wanted else {}
+        tenants = _tenants(cur, {_table_space(i) for i in wanted})
     entries, layers = {}, {}
     for i in wanted:
         layers[i], pub = ns[_parent(i)]
         if i not in rows and not layers[i]:
             continue
         entries[i] = {"id": i, "status": rows[i]["status"] if i in rows else None, "space": _table_space(i),
+                      "tenant": _table_space(i) in tenants,
+                      "moved_to": rows[i]["moved_to"] if i in rows else None,
                       "published": pub is not None, "namespace": _parent(i),
                       "description": pub["description"] if pub else None,
                       "steward": pub["published_by"] if pub else None, **_union(layers[i])}
@@ -957,11 +990,23 @@ def _effective(ids):
 
 def _source_read(ids):
     """{id: {read, revoked}}: each source's effective `read`, a table's `write` included, as rule
-    3 checks it (PROVENANCE.md 6), and its effective `revoked`. A source with no entry is absent
-    and admits no one."""
+    3 checks it (PROVENANCE.md 6), and its effective `revoked`. A source that moved is looked up
+    as the entry it moved to, so data built from the old folder or table is checked against the
+    new one's grants (docs/HANDOFF-2026-10-22-groups.md section 1). A source with no entry is
+    absent and admits no one."""
+    found = _effective(ids)
+    final = {}
+    for i in list(found):
+        j, seen = i, set()
+        while found.get(j, {}).get("status") == "moved" and found[j].get("moved_to") and j not in seen:
+            seen.add(j)
+            j = found[j]["moved_to"]
+            if j not in found:
+                found.update(_effective([j]))
+        final[i] = found.get(j)
     return {i: {"read": sorted(set(e["read"]) | (set(e["write"]) if TABLE_ID_RE.match(i) else set())),
                 "revoked": e["revoked"]}
-            for i, e in _effective(ids).items()}
+            for i, e in final.items() if e is not None}
 
 
 def _released(target, sources):
@@ -1121,14 +1166,86 @@ def table_events():
     with db(commit=True) as cur:
         if event == "created":
             cur.execute("INSERT INTO table_entries (id, status, location) VALUES (%s, 'live', %s) "
-                        "ON CONFLICT (id) DO UPDATE SET status = 'live', "
+                        "ON CONFLICT (id) DO UPDATE SET status = 'live', moved_to = NULL, "
                         "location = COALESCE(EXCLUDED.location, table_entries.location) RETURNING id",
                         (table_id, body.get("location")))
-        else:
-            cur.execute("UPDATE table_entries SET status = 'gone' WHERE id = %s RETURNING id", (table_id,))
+        else:   # a table moved and then dropped keeps the record of its move
+            cur.execute("UPDATE table_entries SET status = CASE WHEN status = 'moved' THEN 'moved' "
+                        "ELSE 'gone' END WHERE id = %s RETURNING id", (table_id,))
         changed = cur.fetchone() is not None
     app.logger.info("TABLE %s %s%s", event, table_id, "" if changed else " (no entry; ignored)")
     return jsonify({"ok": True, "changed": changed})
+
+
+def _brought(ds_id, direct=False):
+    """What a read of this dataset brings in (PROVENANCE.md 6, rule 1): the dataset and what its
+    files carry, and for each carried source the datasets it arrived through on each path, this
+    one and those the path had passed (6.7), as (sources, marks)."""
+    sources = carried(ds_id, direct)
+    return ([ds_id, *(c["id"] for c in sources)],
+            json.dumps({c["id"]: [list(p) for p in sorted({tuple(sorted({*path, ds_id})) for path in c["paths"]})]
+                        for c in sources}))
+
+
+@internal_app.post("/internal/transfers")
+def internal_transfers():
+    # The broker's move of a folder into another group's space (docs/HANDOFF-2026-10-22-groups.md
+    # section 1), once OPA's allow_transfer has decided, in two phases.
+    #   begin {person, sub, sid, from, to, expires}: the destination must have no entry or an empty
+    #     one, hold nothing in storage, and sit in no published dataset; the old folder must not
+    #     have moved. Governance records the transfer, makes the destination's entry, and logs, in a
+    #     session of the person's own for this transfer, a read of the old folder and a write of
+    #     the new one until expires, under a login id of the transfer's, so the copies carry what
+    #     the old folder carried (rule 2) and nothing else the person read. Answers {transfer}.
+    #   done {transfer}: the old entry is moved to the new one, and the write ends now.
+    body = request.get_json(silent=True) or {}
+    if body.get("phase") == "done":
+        with db(commit=True) as cur:
+            cur.execute("UPDATE transfers SET done_at = now() WHERE id = %s AND kind = 'files' AND done_at IS NULL "
+                        "RETURNING from_id, to_id, session", (body.get("transfer"),))
+            t = cur.fetchone()
+            if t is None:
+                return jsonify({"error": "no such transfer under way"}), 404
+            cur.execute("UPDATE datasets SET status = 'moved', moved_to = %s WHERE id = %s", (t["to_id"], t["from_id"]))
+            cur.execute("UPDATE accesses SET expires = now() WHERE session = %s AND mode = 'write'", (t["session"],))
+        reconcile(t["to_id"])
+        list_folder(t["from_id"])
+        app.logger.info("TRANSFER done %s -> %s", t["from_id"], t["to_id"])
+        return jsonify({"ok": True})
+    src, dst = body.get("from"), body.get("to")
+    if (body.get("phase") != "begin" or not all(isinstance(body.get(k), str) for k in ("person", "sub", "sid"))
+            or not all(isinstance(f, str) and _confined_prefix(f"datasets/{f}/") for f in (src, dst))
+            or not isinstance(body.get("expires"), int)):
+        return jsonify({"error": "begin {person, sub, sid, from, to, expires} or done {transfer}"}), 400
+    entries, _ = _file_entries([src, dst], would_be=True)
+    if src not in entries or not entries[src]["tracked"] or entries[src]["status"] == "moved":
+        return jsonify({"error": f"{src} cannot be moved"}), 409
+    if dst in entries and (entries[dst]["tracked"] and entries[dst]["status"] != "gone"
+                           or entries[dst]["inside_published"] or entries[dst]["inside_moved"]):
+        return jsonify({"error": f"{dst} exists or sits in a published dataset"}), 409
+    if _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"datasets/{dst}/", MaxKeys=1).get("KeyCount"):
+        return jsonify({"error": f"{dst} exists or sits in a published dataset"}), 409
+    # Listed now, so the copies carry what every file in it carries, a file written moments ago
+    # included.
+    list_folder(src)
+    brought, marks = _brought(src)
+    with db(commit=True) as cur:
+        cur.execute("INSERT INTO transfers (kind, from_id, to_id, by) VALUES ('files', %s, %s, %s) RETURNING id",
+                    (src, dst, body["person"]))
+        tid = cur.fetchone()["id"]
+        cur.execute("INSERT INTO sessions (person, name) VALUES (%s, %s) RETURNING id",
+                    (body["person"], f"transfer {tid}: {src} -> {dst}"))
+        session = cur.fetchone()["id"]
+        cur.execute("UPDATE transfers SET session = %s WHERE id = %s", (session, tid))
+        cur.execute("INSERT INTO datasets (id, prefix, created_by) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                    (dst, f"datasets/{dst}/", body["person"]))
+        for dataset, mode, sources, m in ((src, "read", brought, marks), (dst, "write", None, None)):
+            cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires, sources, marks) "
+                        "VALUES (%s, %s, %s, %s, %s, 'files', %s, to_timestamp(%s / 1000.0), %s, %s)",
+                        (body["person"], body["sub"], f"transfer:{tid}", session, dataset, mode, body["expires"],
+                         sources, m))
+    app.logger.info("TRANSFER begin %s %s -> %s (%s)", tid, src, dst, body["person"])
+    return jsonify({"transfer": tid})
 
 
 def _pointer(cur, person, sid, create=False):
@@ -1199,14 +1316,8 @@ def record_accesses():
     # those the path had passed (6.7).
     brought, marks = {}, {}
     for i, e in enumerate(body["entries"]):
-        if e["mode"] != "read":
-            brought[i] = marks[i] = None
-            continue
-        sources = carried(e["dataset"], direct=not e.get("recursive", True))
-        brought[i] = [e["dataset"], *(c["id"] for c in sources)]
-        marks[i] = json.dumps({c["id"]: [list(p) for p in sorted({tuple(sorted({*path, e["dataset"]}))
-                                                                   for path in c["paths"]})]
-                               for c in sources})
+        brought[i], marks[i] = (_brought(e["dataset"], direct=not e.get("recursive", True))
+                                if e["mode"] == "read" else (None, None))
     with db(commit=True) as cur:
         session = _pointer(cur, body["person"], body["sid"], create=True)
         for i, e in enumerate(body["entries"]):
@@ -1377,6 +1488,38 @@ def change_permissions(kind, entry_id):
                             "AND entry = %s AND grp = %s AND removed_at IS NULL", (subject, kind, key, c["group"]))
     app.logger.info("CHANGE subject=%s %s=%s changes=%s", subject, kind, entry_id, changes)
     return jsonify({"ok": True, "id": entry_id, "grants": {g: sorted(v) for g, v in sets.items()}})
+
+
+@app.post("/transfers")
+def transfer_table():
+    # Record a table's move into another group's space (docs/HANDOFF-2026-10-22-groups.md section
+    # 1), {"from", "to"}: the caller has copied it (CREATE TABLE <to> AS SELECT * FROM <from>), and
+    # drops the original after. authZ = OPA's tables.allow_transfer, as for folders, which the
+    # broker moves (POST /transfers there). The copy must carry the original as a source: then the
+    # record lets its readers past it, the original being looked up as the copy.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject = subject_of(claims)
+    body = request.get_json(silent=True) or {}
+    src, dst = body.get("from"), body.get("to")
+    if not all(isinstance(t, str) and TABLE_ID_RE.match(t) for t in (src, dst)) or src == dst:
+        return jsonify({"error": "from and to must be two table ids; a folder moves through the broker"}), 400
+    if opa("allow_transfer", {"subject": subject, "from": src, "to": dst}, package="tables") is not True:
+        app.logger.info("DENY transfer subject=%s from=%s to=%s", subject, src, dst)
+        return jsonify({"error": "forbidden"}), 403
+    if src not in [c["id"] for c in carried(dst)]:
+        return jsonify({"error": f"copy it first: CREATE TABLE {dst} AS SELECT * FROM {src}"}), 409
+    with db(commit=True) as cur:
+        cur.execute("UPDATE table_entries SET status = 'moved', moved_to = %s WHERE id = %s AND status = 'live' "
+                    "RETURNING id", (dst, src))
+        if cur.fetchone() is None:
+            return jsonify({"error": f"{src} cannot be moved"}), 409
+        cur.execute("INSERT INTO transfers (kind, from_id, to_id, by, done_at) VALUES ('table', %s, %s, %s, now()) "
+                    "RETURNING id", (src, dst, subject))
+        tid = cur.fetchone()["id"]
+    app.logger.info("TRANSFER table %s -> %s (%s)", src, dst, subject)
+    return jsonify({"ok": True, "from": src, "to": dst, "transfer": tid})
 
 
 def _publish_body(body):

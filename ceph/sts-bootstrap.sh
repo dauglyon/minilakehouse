@@ -126,6 +126,22 @@ JSON
 echo ">>> ensuring role ${BLOB_DELETE_ROLE}"
 ensure_role "$BLOB_DELETE_ROLE" "$BLOB_TRUST" blobdelete "$BLOB_DELETE_PERM"
 
+# The role the broker assumes to move a folder into another group's space
+# (docs/HANDOFF-2026-10-22-groups.md section 1, transfers): get, list and delete the old folder
+# and put the new one, each narrowed per transfer by a session policy naming the two folders. A
+# server-side copy needs get on its source and put on its destination.
+BLOB_MOVE_ROLE="${BLOB_MOVE_ROLE:-blob-mover}"
+BLOB_MOVE_PERM=$(cat <<JSON
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],
+   "Resource":["arn:aws:s3:::${BUCKET}/${BLOB_PREFIX}/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"],
+   "Condition":{"StringLike":{"s3:prefix":["${BLOB_PREFIX}/*"]}}}]}
+JSON
+)
+echo ">>> ensuring role ${BLOB_MOVE_ROLE}"
+ensure_role "$BLOB_MOVE_ROLE" "$BLOB_TRUST" blobmove "$BLOB_MOVE_PERM"
+
 # --- Governance reader: a least-privilege S3 user the governance service uses to LIST
 # dataset prefixes (reconcile). It holds no rights of its own; the rgw-setup one-shot grants
 # it ListBucket on datasets/* via a bucket policy. So governance never holds the admin key. ---

@@ -69,7 +69,7 @@ byte path.
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read; such a load carries only the current version, without row or file counts or the writer's name, and so does a view load by someone who may only describe the view. Refuses a view that would run with its owner's rights. Decides which tables and schemas may be created, and reports creates and drops to governance. Has governance log every table credential it passes on and every table write it forwards, and refuses the request when that fails. Answers for the `governance` namespace's tables itself. |
 | **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
 | **loginproxy** | Sits in front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client, holds the person's refresh token, and puts a fresh token on every forwarded request as the bearer and the `token` extra credential. |
-| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named dataset, vends a credential scoped to the prefix in OPA's decision: to read (get and list, on the dataset's `read`) to write (put and delete, no get, on its `write`, refused to anyone who may not read a source its files carry), or to delete (list and delete, no get or put, on its `delete`, which sources do not narrow). Has governance log each credential before returning it. |
+| **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named folder, vends a credential scoped to the prefix in OPA's decision: to read (get and list, on the dataset's `read`) to write (put and delete, no get, on its `write`, refused to anyone who may not read a source its files carry), or to delete (list and delete, no get or put, on its `delete`, which sources do not narrow). Has governance log each credential before returning it. Moves a folder into another group's space (`POST /transfers`) by server-side copy. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
 | **postgres** | Polaris metastore **and** the durable `governance` registry database. |
 
@@ -316,6 +316,17 @@ Its members write there with no step first, and a steward publishes what is to b
   who added whom in `GET /datasets/<id>`.
 - A declaration marking a folder or table of a space unused is shown in `governance.derivations`
   to the space's admins, as well as to its `manage` holders.
+- A folder or table moves from a personal space, or a plain group's space, into another group's
+  space: by its person, or an owner or admin of the plain group, into a group they are a member
+  or above of, at a path that does not exist and is not inside a published dataset. A folder
+  moves through the broker, `POST /transfers {"from": "u_alice/work", "to": "jgi/work"}`, which
+  copies each object server-side and deletes the originals; the copies are logged as written in
+  a session of the move's own after a read of the old folder, so they carry what it carried. A
+  table is copied by its mover (`CREATE TABLE iceberg.jgi.t AS SELECT * FROM iceberg.u_alice.t`),
+  the move recorded with governance's `POST /transfers` with the two table ids, and the original
+  dropped. The old entry stays, `moved` to the new one: data built from the old folder or table
+  is checked against the new one's grants, and a credential for the old path is refused with the
+  new path named to anyone who may describe it.
 
 ## Changing grants
 
