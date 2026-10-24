@@ -1048,7 +1048,7 @@ def _names(v, pattern):
 _NAME_IN_USE_SQL = """
 SELECT EXISTS (SELECT 1 FROM group_members WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM group_owners WHERE grp = %(g)s OR owner = %(g)s)
-    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write || detach))
+    OR EXISTS (SELECT 1 FROM datasets WHERE %(g)s = ANY(describe || access || share || write || detach || "delete"))
     OR EXISTS (SELECT 1 FROM table_entries WHERE %(g)s = ANY(describe || read || share || write || "delete" || detach))
     OR EXISTS (SELECT 1 FROM namespace_owners WHERE grp = %(g)s)
     OR EXISTS (SELECT 1 FROM register_grants WHERE grp = %(g)s) AS used
