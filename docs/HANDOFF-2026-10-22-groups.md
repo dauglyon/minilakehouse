@@ -255,7 +255,9 @@ can also be its steward.
 - A viewer never holds `write`. A grant naming a group gives `describe` and `read` to everyone
   in it, and every other grant to its members and above. Viewers are BERDL's read-only members.
 - **Platform admins** hold no role in any group. They appoint and remove stewards, act for a
-  tenant that has none, and act in emergencies. How a person is marked as one is open (below).
+  tenant that has none, and act in emergencies. A platform admin is a person whose login token
+  carries the Keycloak realm role `platform-admin`, as BERDL marks them with a KBase auth role
+  (findings, item 2); governance passes it to OPA from the verified token.
 
 ## Groups and tenants
 
@@ -272,6 +274,8 @@ can also be its steward.
 - A group with at least one steward is a **tenant**. A member asks; a platform admin appoints.
   Only stewards publish or change grants in a space, so a group without one cannot open its
   space to anyone outside it.
+- Deleting a group is refused while its space holds data; its owners delete or transfer what
+  is in it first.
 - When a tenant's last steward leaves, its published datasets stay published with their grants.
   Nothing is published and no grant changes until a platform admin appoints a steward or acts
   for the group. BERDL lets a tenant run with no steward the same way (tenant_manager.py:648-657).
@@ -386,7 +390,7 @@ another group's space. Its old path stops working.
 - `PATCH /groups/<name>`: `{owners, admins, members, viewers: {add, remove}}`. Refuse a change
   that leaves no owner.
 - `PUT` and `DELETE /groups/<name>/stewards/<person>`: platform admins.
-- `DELETE /groups/<name>`: owners.
+- `DELETE /groups/<name>`: owners; refused while the group's space holds data.
 - `POST /principals/me` also creates the personal group.
 - `POST /transfers {from, to}`.
 - `governance.derivations` shows a declaration marking a source unused to the admins of the
@@ -404,6 +408,8 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
   each named only if they may describe it, and any release of it to them that was withdrawn.
 
 ### Docs and seed
+- Keycloak: the realm role `platform-admin` in `keycloak/realm-lakehouse.json`, held by carol;
+  the `group-admins` group goes.
 - Seed: `jgi-writers` becomes `jgi` (alice owner and steward); `projw-team` becomes `projw`
   (carol owner and steward); `no-access` becomes `noaccess` (bob owner); `bob-only` becomes
   `bobonly`, with no members; `stewards` goes. Seed datasets and tables move into their group's
@@ -412,11 +418,6 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
   the registration demo; `DESIGN.md` 4.4 and `WHITEPAPER.md` 4.2-4.4 where they say "each group
   has owners, which are groups".
 - `seed/check-index-narrowing.py` and the README demos must still pass.
-
-## Open
-- How platform admins are marked: the seed group `group-admins`, renamed under the name rule,
-  or a Keycloak realm role, as BERDL uses a KBase auth role (findings, item 2).
-- Deleting a group whose space holds data.
 
 ## Out of scope
 - On-behalf-of tokens for the ingest pipeline (Keycloak token exchange). Pipelines act as
@@ -435,6 +436,8 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
   record from the old entry to the new; only members and above of the receiving group transfer
   in.
 - BERDL's name rule and reserved names, plus `governance`, without the `ro` rule.
+- Platform admins are a Keycloak realm role, not a group.
+- A group whose space holds data cannot be deleted.
 - The governance API takes a person's token only. No service lane.
 
 ---
