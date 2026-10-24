@@ -700,19 +700,25 @@ def _invalidate_writes_of(cur, person):
     _invalidate(cur, [r["dataset"] for r in cur.fetchall()])
 
 
-def list_folder(ds_id):
+def _listing(prefix):
+    """(key, last modified, ETag) for every object under the prefix."""
+    return [(o["Key"], o["LastModified"], o["ETag"])
+            for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix)
+            for o in page.get("Contents", [])]
+
+
+def list_folder(ds_id, found=None):
     """Record every file in the dataset's folder with its last-modified time, replacing what
-    the previous listing found; returns whether the folder holds anything. Storage decides
-    (PROVENANCE.md 6.2): a file stops counting only when a listing no longer shows it."""
+    the previous listing found, from a listing made now or the one given; returns whether the
+    folder holds anything. Storage decides (PROVENANCE.md 6.2): a file stops counting only when
+    a listing no longer shows it."""
     prefix = _folder(ds_id)
     if prefix is None:
         return False
-    found = []
-    for page in _s3.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        found += [(o["Key"], o["LastModified"]) for o in page.get("Contents", [])]
+    found = _listing(prefix) if found is None else found
     with db(commit=True) as cur:
         cur.execute("DELETE FROM files WHERE dataset = %s", (ds_id,))
-        for key, modified in found:
+        for key, modified, _ in found:
             cur.execute("INSERT INTO files (dataset, key, last_modified) VALUES (%s, %s, %s)",
                         (ds_id, key, modified))
         cur.execute("INSERT INTO folder_listings (dataset, listed_at) VALUES (%s, now()) "
@@ -1247,11 +1253,15 @@ def internal_transfers():
     # The broker's move of a folder into another group's space (docs/HANDOFF-2026-10-22-groups.md
     # section 1), once OPA's allow_transfer has decided, in two phases.
     #   begin {person, sub, sid, from, to, expires}: the destination must have no entry or an empty
-    #     one, hold nothing in storage, and sit in no published dataset; the old folder must not
-    #     have moved. Governance records the transfer, makes the destination's entry, and logs, in a
-    #     session of the person's own for this transfer, a read of the old folder and a write of
-    #     the new one until expires, under a login id of the transfer's, so the copies carry what
-    #     the old folder carried (rule 2) and nothing else the person read. Answers {transfer}.
+    #     unpublished one, hold nothing in storage, and neither sit in nor hold a published
+    #     dataset, or the move would publish without a steward; the old folder must not have
+    #     moved. Governance lists the old folder, records the transfer, makes the destination's
+    #     entry, and logs, in a session of the person's own for this transfer, a read of the old
+    #     folder and a write of the new one until expires, under a login id of the transfer's, so
+    #     the copies carry what the old folder carried (rule 2) and nothing else the person read.
+    #     Answers {transfer, files: [{key, etag}]}: the files that listing found, which are all the
+    #     broker copies, each only while its ETag still matches, so a file written into the old
+    #     folder after the listing is never copied with less than it carries.
     #   done {transfer}: the old entry is moved to the new one, and the write ends now.
     body = request.get_json(silent=True) or {}
     if body.get("phase") == "done":
@@ -1277,13 +1287,15 @@ def internal_transfers():
     if src not in entries or not entries[src]["tracked"] or entries[src]["status"] == "moved":
         return jsonify({"error": f"{src} cannot be moved"}), 409
     if dst in entries and (entries[dst]["tracked"] and entries[dst]["status"] != "gone"
-                           or entries[dst]["inside_published"] or entries[dst]["inside_moved"]):
-        return jsonify({"error": f"{dst} exists or sits in a published dataset"}), 409
+                           or entries[dst]["published"] or entries[dst]["inside_published"]
+                           or entries[dst]["contains_published"] or entries[dst]["inside_moved"]):
+        return jsonify({"error": f"{dst} exists, is published, or sits in or holds a published dataset"}), 409
     if _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=f"datasets/{dst}/", MaxKeys=1).get("KeyCount"):
-        return jsonify({"error": f"{dst} exists or sits in a published dataset"}), 409
+        return jsonify({"error": f"{dst} exists, is published, or sits in or holds a published dataset"}), 409
     # Listed now, so the copies carry what every file in it carries, a file written moments ago
-    # included.
-    list_folder(src)
+    # included; the broker copies these files and no others.
+    found = _listing(f"datasets/{src}/")
+    list_folder(src, found)
     brought, marks = _brought(src)
     with db(commit=True) as cur:
         cur.execute("INSERT INTO transfers (kind, from_id, to_id, by) VALUES ('files', %s, %s, %s) RETURNING id",
@@ -1302,7 +1314,7 @@ def internal_transfers():
                          sources, m))
         _invalidate(cur, [src, dst])
     app.logger.info("TRANSFER begin %s %s -> %s (%s)", tid, src, dst, body["person"])
-    return jsonify({"transfer": tid})
+    return jsonify({"transfer": tid, "files": [{"key": k, "etag": e} for k, _, e in found]})
 
 
 def _pointer(cur, person, sid, create=False):

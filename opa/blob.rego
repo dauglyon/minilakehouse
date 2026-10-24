@@ -169,8 +169,10 @@ readable contains id if {
 
 # Moving a folder (docs/HANDOFF-2026-10-22-groups.md section 1): out of the subject's own
 # personal space, or out of a plain group's space by one of its owners or admins, into the
-# space of a group the subject is a member or above of, other than a personal one, and not
-# inside a published dataset. Governance checks that the destination holds nothing yet.
+# space of a group the subject is a member or above of, other than a personal one, at a folder
+# that is not published and neither sits in nor holds a published dataset: a move reaches no one
+# beyond the receiving group, and publishing is a steward's act. Governance checks that the
+# destination holds nothing yet.
 default allow_transfer := false
 
 allow_transfer if {
@@ -183,7 +185,9 @@ allow_transfer if {
 	t.space != f.space
 	not startswith(t.space, "u_")
 	concat("#", [t.space, "member"]) in _holder.write
+	not t.published
 	count(t.inside_published) == 0
+	count(t.contains_published) == 0
 }
 
 _may_send(f) if f.space == _holder.personal

@@ -107,6 +107,15 @@ check("so carol, in G, may not read the report", vend("carol", report).status_co
 
 check("a tenant's folder is not moved", broker("/transfers", "alice", {"from": "jgi/public", "to": f"{g}/x"}).status_code == 403)
 check("nor into a folder that exists", broker("/transfers", "alice", {"from": work, "to": report}).status_code == 409)
+gov("PUT", f"/groups/{g}/stewards/alice", "carol")
+vend("alice", f"{g}/pubdest", "write")
+vend("alice", f"{g}/outer/pub", "write")
+for d in (f"{g}/pubdest", f"{g}/outer/pub"):
+    gov("PATCH", f"/datasets/{d}", "alice", {"description": "published, empty"})
+gov("DELETE", f"/groups/{g}/stewards/alice", "carol")
+check("nor into a published dataset, though it is empty",
+      broker("/transfers", "alice", {"from": work, "to": f"{g}/pubdest"}).status_code == 403)
+check("nor into a folder holding one", broker("/transfers", "alice", {"from": work, "to": f"{g}/outer"}).status_code == 403)
 r = broker("/transfers", "alice", {"from": work, "to": moved})
 check(f"alice moves her personal folder into G ({r.status_code})", r.status_code == 200 and r.json()["objects"] == 1)
 check("the moved folder keeps its sources", carries(moved, src))

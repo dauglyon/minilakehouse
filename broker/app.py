@@ -247,11 +247,14 @@ def _internal(path, body):
 def transfer():
     # Move a folder, {"from", "to"}: OPA's allow_transfer decides (the person whose personal space
     # it is, or an owner or admin of the plain group whose space holds it; a member or above of
-    # the receiving group). Governance then checks the destination is empty and logs the move as
-    # a read of the old folder and a write of the new one in a session of its own, so the copies
-    # carry what the old folder carried (PROVENANCE.md 6, rule 2). The broker copies every object
-    # server-side, deletes the originals once all are copied, and has governance record the old
-    # entry as moved to the new one. A failure before that leaves the old folder whole.
+    # the receiving group). Governance then checks the destination is empty, lists the old
+    # folder, and logs the move as a read of the old folder and a write of the new one in a
+    # session of its own, so the copies carry what the old folder carried (PROVENANCE.md 6, rule
+    # 2). The broker copies exactly the files governance listed, server-side and each only while
+    # its ETag matches, so a file written into the old folder since is left behind rather than
+    # copied without its sources; it deletes the originals once all are copied, and has governance
+    # record the old entry as moved to the new one. A failure before that leaves the old folder
+    # whole, and a changed file removes the copies made so far.
     claims, err = authed_user()
     if err:
         return err
@@ -273,7 +276,7 @@ def transfer():
                                "Resource": [f"arn:aws:s3:::{BUCKET}/{old}*"]},
                               {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": [f"arn:aws:s3:::{BUCKET}"],
                                "Condition": {"StringLike": {"s3:prefix": [f"{old}*"]}}},
-                              {"Effect": "Allow", "Action": ["s3:PutObject"],
+                              {"Effect": "Allow", "Action": ["s3:PutObject", "s3:DeleteObject"],
                                "Resource": [f"arn:aws:s3:::{BUCKET}/{new}*"]}]}))["Credentials"]
     try:
         status, begun = _internal("/internal/transfers", {
@@ -284,10 +287,17 @@ def transfer():
         s3 = boto3.client("s3", endpoint_url=RGW_ENDPOINT, aws_access_key_id=cr["AccessKeyId"],
                           aws_secret_access_key=cr["SecretAccessKey"], aws_session_token=cr["SessionToken"],
                           region_name="us-east-1", config=Config(signature_version="s3v4"))
-        keys = [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=old)
-                for o in page.get("Contents", [])]
-        for k in keys:
-            s3.copy_object(Bucket=BUCKET, Key=new + k[len(old):], CopySource={"Bucket": BUCKET, "Key": k})
+        keys, copied = [f["key"] for f in begun["files"]], []
+        try:
+            for f in begun["files"]:
+                s3.copy_object(Bucket=BUCKET, Key=new + f["key"][len(old):], CopySourceIfMatch=f["etag"],
+                               CopySource={"Bucket": BUCKET, "Key": f["key"]})
+                copied.append(new + f["key"][len(old):])
+        except ClientError as e:
+            for k in copied:
+                s3.delete_object(Bucket=BUCKET, Key=k)
+            app.logger.info("transfer %s -> %s stopped, a file changed: %s", src, dst, e)
+            return jsonify({"error": f"{src} changed during the move; nothing was moved"}), 409
         for k in keys:
             s3.delete_object(Bucket=BUCKET, Key=k)
         status, done = _internal("/internal/transfers", {"phase": "done", "transfer": begun["transfer"]})
