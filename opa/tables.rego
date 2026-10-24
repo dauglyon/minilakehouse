@@ -143,7 +143,7 @@ _may_change(h, e, g) if {
 }
 
 _may_change(_, e, g) if {
-	g in {"manage", "write", "delete", "detach"}
+	g in {"manage", "write", "delete", "detach", "revoked"}
 	_steward(e.space)
 }
 
@@ -156,7 +156,9 @@ _steward(space) if concat("#", [space, "steward"]) in governance.groups(input.su
 # and which names in its read and write pass every source with all their holders.
 blocking contains s.id if {
 	h := governance.holder(input.subject)
-	some s in object.get(table(input.id), "sources", [])
+	e := table(input.id)
+	not sources_ok(h, e)
+	some s in object.get(e, "sources", [])
 	not source_admits(h.read, s)
 }
 
@@ -180,12 +182,12 @@ effective_read contains n if {
 # so does not read through it. `h` is governance.holder: `read` and `write` name lists.
 readable(h, e) if {
 	_holds(h.read, e.read)
-	sources_allow(h.read, e)
+	sources_ok(h, e)
 }
 
 readable(h, e) if {
 	_holds(h.write, e.write)
-	sources_allow(h.read, e)
+	sources_ok(h, e)
 }
 
 # Governance's dataset index offers OPA only tables some layer of whose describe, read or write
@@ -212,7 +214,24 @@ viewable(h, e) if {
 
 writable(h, e) if {
 	_holds(h.write, e.write)
-	sources_allow(h.read, e)
+	sources_ok(h, e)
+}
+
+# Rule 3, and the personal-space exemption (PROVENANCE.md 9): a person's own reads and writes in
+# their personal space are not cut by the sources its data carries, as their own downloads would
+# not be, unless one of their groups is in a carried source's `revoked`. A deployment that wants
+# losing `read` on a source to reach every copy derived from it drops the second clause.
+sources_ok(h, e) if sources_allow(h.read, e)
+
+sources_ok(h, e) if {
+	h.personal != ""
+	e.space == h.personal
+	not revoked(h, e)
+}
+
+revoked(h, e) if {
+	some s in object.get(e, "sources", [])
+	_holds(h.read, object.get(s, "revoked", []))
 }
 
 sources_allow(groups, e) if {

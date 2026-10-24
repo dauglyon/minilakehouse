@@ -80,9 +80,7 @@ vend_write := {"allow": false, "recursive_refused": true} if {
 
 _writes(e) if {
 	_holds(_holder.write, e.write)
-	every s in object.get(e, "sources", []) {
-		tables.source_admits(_holder.read, s)
-	}
+	tables.sources_ok(_holder, e)
 }
 
 # Deleting (WHITEPAPER 4.2): list and delete in the folder, granted by `delete` and, like a
@@ -186,7 +184,7 @@ _may_change(e, g) if {
 }
 
 _may_change(e, g) if {
-	g in {"manage", "write", "detach", "delete"}
+	g in {"manage", "write", "detach", "delete", "revoked"}
 	_steward(e.space)
 }
 
@@ -198,7 +196,9 @@ _steward(space) if concat("#", [space, "steward"]) in _holder.read
 # The read API (governance GET /datasets/<id>): the sources that refuse the subject this
 # dataset, and which names in its read pass every source with all their holders.
 blocking contains s.id if {
-	some s in object.get(_entries[input.dataset], "sources", [])
+	e := _entries[input.dataset]
+	not tables.sources_ok(_holder, e)
+	some s in object.get(e, "sources", [])
 	not tables.source_admits(_holder.read, s)
 }
 
@@ -220,14 +220,13 @@ _entries := governance.post("/internal/datasets", {"ids": _ids, "recursive": _re
 _holder := governance.holder(input.subject)
 
 # A dataset's `read` (stored as access), and every source its files carry (PROVENANCE.md 6,
-# rule 3): governance lists each with its effective `read`, whether a declaration says it was
-# used, and the groups releases let past it on each path it arrived by; the shipped rule treats
-# an undeclared source like a declared one, as tables.rego does.
+# rule 3): governance lists each with its effective `read` and `revoked`, whether a declaration
+# says it was used, and the groups releases let past it on each path it arrived by; the shipped
+# rule treats an undeclared source like a declared one, and exempts the person's own personal
+# space, as tables.rego does (sources_ok).
 _reads(e) if {
 	_holds(_holder.read, e.access)
-	every s in object.get(e, "sources", []) {
-		tables.source_admits(_holder.read, s)
-	}
+	tables.sources_ok(_holder, e)
 }
 
 _holds(names, grant) if {

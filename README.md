@@ -307,6 +307,15 @@ Its members write there with no step first, and a steward publishes what is to b
   layer, and `governance.grants` names where each inherited grant comes from.
 - A group whose space holds data cannot be deleted, and a group cannot be created under a name
   whose space already has entries.
+- Each person has a personal space, that of the group `u_<user>`, made at their first
+  appearance with them its only owner. No one else joins it, nothing in it is published or
+  granted to anyone else, and a person's own reads and writes there are not cut by what their
+  data was made from (`PROVENANCE.md` 9): losing `read` on a source leaves them their own
+  copies, as a download would. A source's stewards close those copies by adding the person to
+  the source's `revoked` (`{"group": "u_alice", "add": ["revoked"]}`); its `manage` holders see
+  who added whom in `GET /datasets/<id>`.
+- A declaration marking a folder or table of a space unused is shown in `governance.derivations`
+  to the space's admins, as well as to its `manage` holders.
 
 ## Changing grants
 

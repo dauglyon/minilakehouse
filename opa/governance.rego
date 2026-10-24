@@ -17,8 +17,9 @@ get(path) := _send({"method": "GET", "url": _url(path)})
 # The names a person (subject or Polaris principal name) holds grants through: each group they
 # are in, `<g>`, and their roles in it, `<g>#member`, `<g>#admin`, `<g>#owner`, `<g>#steward`
 # (governance/app.py _group_names). `read` holds every name, for `describe` and `read`; `write`
-# holds those of the groups they are more than a viewer in, for every other grant.
-holder(subject) := {"read": r.groups, "write": r.write_groups} if {
+# holds those of the groups they are more than a viewer in, for every other grant. `personal`
+# is the person's own space, u_<user> (PROVENANCE.md 9), or "".
+holder(subject) := {"read": r.groups, "write": r.write_groups, "personal": r.personal} if {
 	r := get(concat("/", ["/internal/groups", urlquery.encode(subject)]))
 }
 

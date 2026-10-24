@@ -81,7 +81,7 @@ CATALOG_AUDIENCE = os.environ.get("CATALOG_AUDIENCE", "polaris")
 # A prefix becomes an STS resource ARN; it's from an authenticated steward but still
 # untrusted. Confine it: datasets/<bounded, safe-charset>/ — capped so it can't blow the STS
 # policy-size limit and restricted so no control/space/unicode reaches the ARN.
-PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/-]{0,200}/$")
+PREFIX_RE = re.compile(r"^datasets/[A-Za-z0-9][A-Za-z0-9._/_-]{0,200}/$")
 # A new group's name: BERDL's rule (minio_manager_service src/s3/utils/validators.py), 2 to 64
 # lowercase letters and digits starting with a letter, and not one of its reserved names or
 # `governance`, the namespace the gate answers itself.
@@ -107,7 +107,15 @@ EXTERNAL_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Governance signs each declaration it accepts with this key (pki.py), as a DSSE envelope.
 SIGNING_KEY = os.environ.get("SIGNING_KEY", f"{os.environ.get('PKI_DIR', '/pki')}/signing.key")
 DECLARATION_TYPE = "application/vnd.minilakehouse.derivation+json"
-GRANTS = ("describe", "read", "manage", "write", "delete", "detach")
+# The grants of an entry, a folder and a namespace, and `revoked`: the groups whose own copies,
+# in their personal space, carrying this as a source close to them (PROVENANCE.md 9).
+GRANTS = ("describe", "read", "manage", "write", "delete", "detach", "revoked")
+# The columns holding them: a file dataset stores `read` as `access`.
+_GRANT_SQL = ", ".join(f'"{g}"' for g in GRANTS)
+_DATASET_GRANT_SQL = ", ".join(f'"{"access" if g == "read" else g}"' for g in GRANTS)
+# A person's personal group, and so the name of their space: u_<user>, for a user name that can
+# name a folder and a namespace level.
+PERSONAL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,61}$")
 
 
 def derive_id(prefix):
@@ -358,6 +366,20 @@ CREATE TABLE IF NOT EXISTS namespaces (
 -- A file credential covers everything under its folder unless it was asked for the files
 -- directly in the folder alone (docs/HANDOFF-2026-10-22-groups.md section 3).
 ALTER TABLE accesses ADD COLUMN IF NOT EXISTS recursive BOOLEAN NOT NULL DEFAULT true;
+-- `revoked` beside the six grants (PROVENANCE.md 9), and who added and removed each group.
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS revoked TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE folder_grants ADD COLUMN IF NOT EXISTS revoked TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE namespaces ADD COLUMN IF NOT EXISTS revoked TEXT[] NOT NULL DEFAULT '{}';
+CREATE TABLE IF NOT EXISTS revocations (
+    id         BIGSERIAL PRIMARY KEY,
+    kind       TEXT NOT NULL,                 -- dataset | folder | namespace
+    entry      TEXT NOT NULL,                 -- its id, or a folder's prefix
+    grp        TEXT NOT NULL,
+    added_by   TEXT NOT NULL,
+    added_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    removed_by TEXT,
+    removed_at TIMESTAMPTZ
+);
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -444,9 +466,8 @@ def init_db():
             if not NAMESPACE_RE.match(n["id"]):
                 raise ValueError(f"registry.json: bad namespace id {n['id']!r}")
             cur.execute(
-                'INSERT INTO namespaces (id, description, published, published_by, published_at, '
-                'describe, read, manage, write, "delete", detach) '
-                "VALUES (%s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s, %s, %s, %s, %s) "
+                f"INSERT INTO namespaces (id, description, published, published_by, published_at, {_GRANT_SQL}) "
+                f"VALUES (%s, %s, %s, %s, CASE WHEN %s THEN now() END{', %s' * len(GRANTS)}) "
                 "ON CONFLICT (id) DO NOTHING",
                 (n["id"], n.get("description"), n.get("published", False), n.get("steward"),
                  n.get("published", False), *(n.get(g, []) for g in GRANTS)))
@@ -494,6 +515,32 @@ def authed_user(audience=AUDIENCE):
 def platform_admin(claims):
     """Whether the verified token carries the Keycloak realm role marking a platform admin."""
     return PLATFORM_ADMIN_ROLE in ((claims.get("realm_access") or {}).get("roles") or [])
+
+
+def _personal(subject):
+    """The name of a person's personal group and space, u_<user>, or None for a user name that
+    cannot name a folder and a namespace level."""
+    return f"u_{subject}" if PERSONAL_RE.match(subject) else None
+
+
+def _ensure_personal(subject):
+    """Create the person's personal group, with them as its only owner, if it does not exist yet
+    (docs/HANDOFF-2026-10-22-groups.md section 1). No other group can take the name: the name
+    rule refuses underscores."""
+    name = _personal(subject)
+    if name is None:
+        return
+    with db(commit=True) as cur:
+        cur.execute("INSERT INTO groups (name, created_by) VALUES (%s, %s) ON CONFLICT DO NOTHING RETURNING name",
+                    (name, subject))
+        if cur.fetchone():
+            cur.execute("INSERT INTO group_members (grp, member, role) VALUES (%s, %s, 'owner') "
+                        "ON CONFLICT DO NOTHING", (name, subject))
+            app.logger.info("PERSONAL group=%s", name)
+
+
+def _is_personal(group):
+    return group is not None and group.startswith("u_")
 
 
 def _group_names(cur, subject):
@@ -782,7 +829,8 @@ def _spaces(cur, names):
     `manage` for its stewards."""
     cur.execute("SELECT name FROM groups WHERE name = ANY(%s)", (sorted(n for n in names if n),))
     return {r["name"]: {"describe": [r["name"]], "read": [r["name"]], "write": [r["name"]],
-                        "delete": [f"{r['name']}#admin"], "manage": [f"{r['name']}#steward"], "detach": []}
+                        "delete": [f"{r['name']}#admin"], "manage": [f"{r['name']}#steward"],
+                        "detach": [], "revoked": []}
             for r in cur.fetchall()}
 
 
@@ -803,7 +851,7 @@ def _folder_layers(cur, items):
     grants reach the entries under it, not one at the folder itself, whose own grants are set by
     publishing it: unpublished data is reached through the folders above it alone."""
     prefixes = sorted({p for _, p, _ in items})
-    cur.execute('SELECT prefix, describe, read, manage, write, "delete", detach FROM folder_grants '
+    cur.execute(f"SELECT prefix, {_GRANT_SQL} FROM folder_grants "
                 "WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) p WHERE starts_with(p, prefix) "
                 "AND p <> prefix)", (prefixes,))
     folders = sorted(cur.fetchall(), key=lambda f: -len(f["prefix"]))
@@ -823,8 +871,8 @@ def _namespace_layers(cur, names):
     """{namespace id: ([(where, grants)], the nearest published namespace at or above it, or
     None)}: the grants of the namespace and of each one above it, nearest first, and its space's
     defaults."""
-    cur.execute('SELECT id, description, published, published_by, describe, read, manage, write, '
-                '"delete", detach FROM namespaces WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) n '
+    cur.execute(f"SELECT id, description, published, published_by, {_GRANT_SQL} FROM namespaces "
+                "WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) n "
                 "WHERE n = id OR starts_with(n, id || '.'))", (sorted(set(names)),))
     rows = sorted(cur.fetchall(), key=lambda r: -len(r["id"]))
     spaces = _spaces(cur, {_table_space(n) for n in names})
@@ -838,8 +886,8 @@ def _namespace_layers(cur, names):
     return out
 
 
-_DATASET_SQL = ('SELECT id, prefix, description, steward, published, status, describe, access, manage, '
-                'write, detach, "delete" FROM datasets WHERE id = ANY(%s)')
+_DATASET_SQL = (f"SELECT id, prefix, description, steward, published, status, {_DATASET_GRANT_SQL} "
+                "FROM datasets WHERE id = ANY(%s)")
 
 
 def _file_entries(ids, would_be=False):
@@ -908,9 +956,11 @@ def _effective(ids):
 
 
 def _source_read(ids):
-    """{id: {read}}: each source's effective `read`, a table's `write` included, as rule 3 checks
-    it (PROVENANCE.md 6). A source with no entry is absent and admits no one."""
-    return {i: {"read": sorted(set(e["read"]) | (set(e["write"]) if TABLE_ID_RE.match(i) else set()))}
+    """{id: {read, revoked}}: each source's effective `read`, a table's `write` included, as rule
+    3 checks it (PROVENANCE.md 6), and its effective `revoked`. A source with no entry is absent
+    and admits no one."""
+    return {i: {"read": sorted(set(e["read"]) | (set(e["write"]) if TABLE_ID_RE.match(i) else set())),
+                "revoked": e["revoked"]}
             for i, e in _effective(ids).items()}
 
 
@@ -938,7 +988,7 @@ def _with_sources(ds_id, entry, direct=False):
     read = _source_read([c["id"] for c in sources])
     released = _released(ds_id, sources)
     return {**entry, "sources": [{"id": c["id"], "declared": c["declared"], "released": released[c["id"]],
-                                  **read.get(c["id"], {"read": []})} for c in sources]}
+                                  **read.get(c["id"], {"read": [], "revoked": []})} for c in sources]}
 
 
 def reconcile(ds_id):
@@ -994,8 +1044,8 @@ def internal_folders():
     items = [(i, f"datasets/{i}/") for i in ids if _confined_prefix(f"datasets/{i}/")]
     with db() as cur:
         layers = _folder_layers(cur, [(i, p, None) for i, p in items])
-        cur.execute('SELECT prefix, describe, read, manage, write, "delete", detach FROM folder_grants '
-                    "WHERE prefix = ANY(%s)", ([p for _, p in items],))
+        cur.execute(f"SELECT prefix, {_GRANT_SQL} FROM folder_grants WHERE prefix = ANY(%s)",
+                    ([p for _, p in items],))
         own = {r["prefix"]: _grants_of(r) for r in cur.fetchall()}
     entries = {i: {"id": i, "prefix": p, "space": _file_space(p),
                    **_union(([(p, own[p])] if p in own else []) + layers[i])}
@@ -1005,9 +1055,11 @@ def internal_folders():
 
 @internal_app.get("/internal/groups/<subject>")
 def internal_groups(subject):
+    # The names the subject holds grants through, and their personal space, whose own copies rule
+    # 3 does not cut (PROVENANCE.md 9).
     with db() as cur:
         read, write = _group_names(cur, subject)
-    return jsonify({"groups": read, "write_groups": write})
+    return jsonify({"groups": read, "write_groups": write, "personal": _personal(subject) or ""})
 
 
 def _ids_from_body():
@@ -1127,6 +1179,7 @@ def record_accesses():
     body = request.get_json(silent=True) or {}
     if not _accesses_valid(body):
         return jsonify({"error": "person, sub, sid and entries [{dataset, kind, mode, expires}] required"}), 400
+    _ensure_personal(body["person"])
     # A folder is an entry from its first credential (docs/HANDOFF-2026-10-22-groups.md section
     # 3), read or write: a read must bring in what the folder's files carry, which only a tracked
     # folder's listing keeps up to date. The broker asks only after OPA allowed the credential.
@@ -1220,6 +1273,7 @@ def provision_principal():
         return err
     if subject in RESERVED_PRINCIPALS:
         return jsonify({"error": "reserved name"}), 403
+    _ensure_personal(subject)
     headers = {"Polaris-Realm": POLARIS_REALM}
     tok = _http.post(f"{POLARIS_URL}/api/catalog/v1/oauth/tokens", auth=PROVISIONER, headers=headers,
                      data={"grant_type": "client_credentials", "scope": "PRINCIPAL_ROLE:ALL"},
@@ -1283,6 +1337,8 @@ def change_permissions(kind, entry_id):
     key = {"dataset": entry_id, "folder": f"datasets/{entry_id}/", "namespace": entry_id}[kind]
     if (kind == "folder" and not _confined_prefix(key)) or (kind == "namespace" and not NAMESPACE_RE.match(key)):
         return jsonify({"error": "not found"}), 404
+    if _is_personal(_table_space(key) if kind == "namespace" else entry_id.split("/")[0]):
+        return jsonify({"error": "a personal space is granted to no one else; transfer it to share it"}), 403
     rule, package, inp = {"dataset": ("allow_change", "blob", {"dataset": entry_id}),
                           "folder": ("allow_change_folder", "blob", {"folder": entry_id}),
                           "namespace": ("allow_change", "tables", {"id": entry_id})}[kind]
@@ -1311,6 +1367,14 @@ def change_permissions(kind, entry_id):
             cur.execute(f"INSERT INTO {table} ({key_col}, {col_sql}) VALUES (%s{', %s' * len(cols)}) "
                         f"ON CONFLICT ({key_col}) DO UPDATE SET "
                         + ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in cols.values()), [key] + values)
+        # Who added each group to `revoked`, and who took it out (PROVENANCE.md 9).
+        for c in changes:
+            if "revoked" in c.get("add", []) and c["group"] not in (row["revoked"] if row else []):
+                cur.execute("INSERT INTO revocations (kind, entry, grp, added_by) VALUES (%s, %s, %s, %s)",
+                            (kind, key, c["group"], subject))
+            if "revoked" in c.get("remove", []):
+                cur.execute("UPDATE revocations SET removed_by = %s, removed_at = now() WHERE kind = %s "
+                            "AND entry = %s AND grp = %s AND removed_at IS NULL", (subject, kind, key, c["group"]))
     app.logger.info("CHANGE subject=%s %s=%s changes=%s", subject, kind, entry_id, changes)
     return jsonify({"ok": True, "id": entry_id, "grants": {g: sorted(v) for g, v in sets.items()}})
 
@@ -1338,11 +1402,12 @@ def publish_dataset(ds_id):
     subject = subject_of(claims)
     body = _publish_body(request.get_json(silent=True))
     if body is None:
-        return jsonify({"error": "body is {description, describe, read, manage, write, delete, detach}"}), 400
+        return jsonify({"error": f"body is {{description, {', '.join(GRANTS)}}}"}), 400
+    if _is_personal(ds_id.split("/")[0]):
+        return jsonify({"error": "nothing in a personal space is published; transfer it to share it"}), 403
     with db(commit=True) as cur:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_KEY,))
-        cur.execute('SELECT prefix, describe, access, manage, write, "delete", detach FROM datasets '
-                    "WHERE id = %s FOR UPDATE", (ds_id,))
+        cur.execute(f"SELECT prefix, {_DATASET_GRANT_SQL} FROM datasets WHERE id = %s FOR UPDATE", (ds_id,))
         row = cur.fetchone()
         if row is None or opa("allow_publish", {"subject": subject, "dataset": ds_id,
                                                 "platform_admin": platform_admin(claims)}) is not True:
@@ -1354,9 +1419,9 @@ def publish_dataset(ds_id):
             return jsonify({"error": f"{ds_id} is inside or contains a published dataset: {', '.join(nested)}"}), 409
         own = {g: sorted(set(body[g])) if g in body else sorted(row["access" if g == "read" else g])
                for g in GRANTS}
-        cur.execute('UPDATE datasets SET published = true, published_at = now(), steward = %s, '
-                    'description = COALESCE(%s, description), describe = %s, access = %s, manage = %s, '
-                    'write = %s, "delete" = %s, detach = %s WHERE id = %s',
+        cur.execute("UPDATE datasets SET published = true, published_at = now(), steward = %s, "
+                    "description = COALESCE(%s, description), "
+                    + ", ".join(f'"{"access" if g == "read" else g}" = %s' for g in GRANTS) + " WHERE id = %s",
                     (subject, body.get("description"), *(own[g] for g in GRANTS), ds_id))
     app.logger.info("PUBLISH subject=%s dataset=%s", subject, ds_id)
     return jsonify({"ok": True, "id": ds_id, "published": True, "grants": own})
@@ -1373,7 +1438,9 @@ def publish_namespace(ns_id):
     subject = subject_of(claims)
     body = _publish_body(request.get_json(silent=True))
     if body is None or not NAMESPACE_RE.match(ns_id):
-        return jsonify({"error": "body is {description, describe, read, manage, write, delete, detach}"}), 400
+        return jsonify({"error": f"body is {{description, {', '.join(GRANTS)}}}"}), 400
+    if _is_personal(_table_space(ns_id)):
+        return jsonify({"error": "nothing in a personal space is published; transfer it to share it"}), 403
     with db(commit=True) as cur:
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_KEY,))
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (f"grants:namespace:{ns_id}",))
@@ -1385,16 +1452,14 @@ def publish_namespace(ns_id):
                     "OR starts_with(%(i)s, id || '.')) ORDER BY id", {"i": ns_id})
         if nested := [r["id"] for r in cur.fetchall()]:
             return jsonify({"error": f"{ns_id} is inside or contains a published namespace: {', '.join(nested)}"}), 409
-        cur.execute('SELECT describe, read, manage, write, "delete", detach FROM namespaces WHERE id = %s', (ns_id,))
+        cur.execute(f"SELECT {_GRANT_SQL} FROM namespaces WHERE id = %s", (ns_id,))
         row = cur.fetchone() or {g: [] for g in GRANTS}
         own = {g: sorted(set(body[g])) if g in body else sorted(row[g]) for g in GRANTS}
-        cur.execute('INSERT INTO namespaces (id, description, published, published_by, published_at, '
-                    'describe, read, manage, write, "delete", detach) VALUES (%s, %s, true, %s, now(), '
-                    '%s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET published = true, '
-                    'published_by = EXCLUDED.published_by, published_at = now(), '
-                    'description = COALESCE(EXCLUDED.description, namespaces.description), '
-                    'describe = EXCLUDED.describe, read = EXCLUDED.read, manage = EXCLUDED.manage, '
-                    'write = EXCLUDED.write, "delete" = EXCLUDED."delete", detach = EXCLUDED.detach',
+        cur.execute(f"INSERT INTO namespaces (id, description, published, published_by, published_at, {_GRANT_SQL}) "
+                    f"VALUES (%s, %s, true, %s, now(){', %s' * len(GRANTS)}) ON CONFLICT (id) DO UPDATE SET "
+                    "published = true, published_by = EXCLUDED.published_by, published_at = now(), "
+                    "description = COALESCE(EXCLUDED.description, namespaces.description), "
+                    + ", ".join(f'"{g}" = EXCLUDED."{g}"' for g in GRANTS),
                     (ns_id, body.get("description"), subject, *(own[g] for g in GRANTS)))
     app.logger.info("PUBLISH subject=%s namespace=%s", subject, ns_id)
     return jsonify({"ok": True, "id": ns_id, "published": True, "grants": own})
@@ -1494,6 +1559,8 @@ def change_group(name):
             and all(_names(v, SUBJECT_RE) for v in body[f].values())
             for f in body)):
         return jsonify({"error": "body is {owners|admins|members|viewers: {add: [subject], remove: [subject]}}"}), 400
+    if _is_personal(name):
+        return jsonify({"error": f"{name} is a personal group: it has its person alone"}), 403
     with db(commit=True) as cur:
         _lock_group(cur, name)
         cur.execute("SELECT 1 FROM groups WHERE name = %s", (name,))
@@ -1539,6 +1606,8 @@ def change_steward(name, person):
     if err:
         return err
     subject = subject_of(claims)
+    if _is_personal(name):
+        return jsonify({"error": f"{name} is a personal group: it has its person alone"}), 403
     with db(commit=True) as cur:
         _lock_group(cur, name)
         if opa("allow_steward", {"subject": subject, "group": name, "platform_admin": platform_admin(claims)},
@@ -1564,6 +1633,8 @@ def delete_group(name):
     if err:
         return err
     subject = subject_of(claims)
+    if _is_personal(name):
+        return jsonify({"error": f"{name} is a personal group: it has its person alone"}), 403
     with db(commit=True) as cur:
         _lock_group(cur, name)
         cur.execute("SELECT 1 FROM groups WHERE name = %s", (name,))
@@ -1595,6 +1666,7 @@ def me():
     if err:
         return err
     subject = subject_of(claims)
+    _ensure_personal(subject)
     with db() as cur:
         cur.execute("SELECT m.grp, m.role, m.steward, EXISTS (SELECT 1 FROM group_members s "
                     "WHERE s.grp = m.grp AND s.steward) AS tenant FROM group_members m "
@@ -1648,7 +1720,8 @@ def _entry_view(kind, entry_id):
     from, the names in its read (a table's write included) all of whose holders pass every
     source, whether it is published, its status, whether the caller may read it, and, when they
     may not, why: whether they hold `read` at all, the carried sources that refuse them, each
-    named only if they may describe it, and releases of it to them that were withdrawn."""
+    named only if they may describe it, and releases of it to them that were withdrawn. A holder
+    of its `manage` also gets who added each group to its `revoked`, and when (PROVENANCE.md 9)."""
     subject, err = authed_user()
     if err:
         return err
@@ -1666,10 +1739,17 @@ def _entry_view(kind, entry_id):
         return jsonify({"error": "not found"}), 404
     e = entries[entry_id]
     with db() as cur:
-        read_names, _ = _group_names(cur, subject)
+        read_names, write_names = _group_names(cur, subject)
         if kind == "dataset":
             cur.execute("SELECT description, steward, status FROM datasets WHERE id = %s", (entry_id,))
             e = {**e, **cur.fetchone(), "read": e["access"]}
+        # The rows revoked was set on: the dataset's own, the folders' and namespaces' above it.
+        where = [("dataset" if w == "own" else "folder" if kind == "dataset" else "namespace",
+                  entry_id if w == "own" else w) for w, _ in layers[entry_id] if w != "space"]
+        cur.execute("SELECT grp, added_by, added_at, removed_by, removed_at FROM revocations "
+                    "WHERE (kind, entry) IN (SELECT * FROM unnest(%s::text[], %s::text[])) ORDER BY id",
+                    ([k for k, _ in where], [i for _, i in where]))
+        revocations = cur.fetchall()
     grants = {g: e[g] for g in GRANTS}
     readers = sorted(set(grants["read"]) | (set(grants["write"]) if kind == "table" else set()))
     effective = opa("effective_read", {key: entry_id, "holders": {n: _implied(n) for n in readers}},
@@ -1679,6 +1759,9 @@ def _entry_view(kind, entry_id):
               if k in e},
            "grants": grants, "layers": [{"from": where, "grants": g} for where, g in layers[entry_id]],
            "effective_read": sorted(effective), "can_read": readable}
+    if set(write_names) & set(grants["manage"]):
+        out["revocations"] = [{"group": r["grp"], **{k: r[k] for k in ("added_by", "added_at", "removed_by",
+                                                                    "removed_at")}} for r in revocations]
     if not readable:
         blocking = sorted(opa("blocking", {"subject": subject, key: entry_id}, package=package) or [])
         named = _describable(subject, blocking) if blocking else set()
@@ -1820,15 +1903,17 @@ def _lineage_rows(subject):
 
 
 # What governance.derivations shows a person (PROVENANCE.md 5.3, 6.5): their own declarations;
-# every detach, and every putting back, of a source whose `manage` names one of their groups;
-# and every putting back on a target they have declared. The query returns the candidates with
-# what each is; `manage` is effective, so it is checked after (_derivation_rows).
+# every row marking a source unused, detaches included, and every putting back, of a source
+# whose `manage` names one of their groups or which sits in the space of a group they are an
+# admin of (docs/HANDOFF-2026-10-22-groups.md section 1: a plain group's space has no `manage`
+# holders); and every putting back on a target they have declared. The query returns the
+# candidates with what each is; `manage` is effective, so it is checked after (_derivation_rows).
 _DERIVATIONS_SQL = """
 SELECT s.source, s.source_type, d.target, s.used, d.person AS declared_by, d.declared_at,
-       d.person = %(p)s AS own, s.detached OR d.reattach AS to_owners,
+       d.person = %(p)s AS own, NOT s.used OR s.detached OR d.reattach AS to_owners,
        d.reattach AND d.target IN (SELECT target FROM declarations WHERE person = %(p)s) AS on_mine
 FROM declarations d JOIN declared_sources s ON s.declaration = d.id
-WHERE d.person = %(p)s OR s.detached OR d.reattach
+WHERE d.person = %(p)s OR NOT s.used OR s.detached OR d.reattach
 ORDER BY d.id, s.source NULLS FIRST
 """
 
@@ -1840,13 +1925,22 @@ def _managed(subject, ids):
     return {i for i, e in _effective([i for i in ids if i]).items() if set(e["manage"]) & set(names)}
 
 
+def _space_of_source(source, source_type):
+    if source_type == "table":
+        return _table_space(source)
+    return source.split("/")[0] if source_type == "files" else None
+
+
 def _derivation_rows(subject):
     with db() as cur:
         cur.execute(_DERIVATIONS_SQL, {"p": subject})
         rows = cur.fetchall()
+        _, names = _group_names(cur, subject)
     managed = _managed(subject, {r["source"] for r in rows if r["to_owners"] and not r["own"]})
+    admin_of = {n.split("#")[0] for n in names if n.endswith("#admin")}
     return [{k: r[k] for k in ("source", "source_type", "target", "used", "declared_by", "declared_at")}
-            for r in rows if r["own"] or r["on_mine"] or (r["to_owners"] and r["source"] in managed)]
+            for r in rows if r["own"] or r["on_mine"] or (r["to_owners"] and r["source"] and (
+                r["source"] in managed or _space_of_source(r["source"], r["source_type"]) in admin_of))]
 
 
 def _may_write(subject, target):
