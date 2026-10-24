@@ -342,8 +342,9 @@ publisher the lookup; the publisher still signs.
   table reads had rows returned to the client (from the same events). Candidates per
   `lineage` that are table reads, not inputs of this statement, and never returned to the
   client get `unused`; a candidate returned to the client, a `files` candidate, and a source
-  that arrived through a read (`direct` false) get no row. An event whose output is not a registered
-  entry the person wrote is dropped and logged.
+  that arrived through a read (`direct` false) get no row. An event whose output is not an entry the
+  person wrote is dropped and logged. Unregistered entries count (section 3): the draft must
+  exist before the publisher registers, since registering is when they declare.
 - `governance.drafts`, read-only, served like `lineage`: the person's own drafts, columns of
   `derivations` plus `engine` and `statement_id`. Built from Postgres on each load as the
   other governance tables are.
