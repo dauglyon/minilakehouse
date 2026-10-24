@@ -394,6 +394,21 @@ CREATE TABLE IF NOT EXISTS transfers (
     session BIGINT REFERENCES sessions (id),  -- a folder's: the session its copies were logged in
     done_at TIMESTAMPTZ
 );
+-- Stored sources (docs/PLAN-2026-10-24.md item 3e): what carried() last worked out for an
+-- entry, for its whole folder and for the files directly in it, with the entry's version then.
+-- Every change carried() reads from bumps the version of each entry it can change, in the
+-- change's own transaction, and a stored row counts only while its version is current.
+CREATE TABLE IF NOT EXISTS entry_sources (
+    dataset TEXT NOT NULL,
+    direct  BOOLEAN NOT NULL,
+    version BIGINT NOT NULL,
+    sources JSONB NOT NULL,
+    PRIMARY KEY (dataset, direct)
+);
+CREATE TABLE IF NOT EXISTS sources_version (
+    dataset TEXT PRIMARY KEY,
+    version BIGINT NOT NULL
+);
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -664,6 +679,27 @@ def _folder(ds_id):
     return f"datasets/{ds_id}/" if _confined_prefix(f"datasets/{ds_id}/") else None
 
 
+def _invalidate(cur, ids):
+    """Mark the stored sources of these entries, and of every tracked folder inside or containing
+    one of them, out of date: a file belongs to every credential whose folder holds it."""
+    ids = sorted({i for i in ids if i})
+    cur.execute("SELECT DISTINCT b.id FROM datasets a JOIN datasets b ON starts_with(b.prefix, a.prefix) "
+                "OR starts_with(a.prefix, b.prefix) WHERE a.id = ANY(%s)", (ids,))
+    ids = sorted({*ids, *(r["id"] for r in cur.fetchall())})
+    cur.execute("INSERT INTO sources_version (dataset, version) SELECT unnest(%s::text[]), 1 "
+                "ON CONFLICT (dataset) DO UPDATE SET version = sources_version.version + 1", (ids,))
+
+
+def _invalidate_writes_of(cur, person):
+    """Mark out of date the stored sources of every entry the person could have written in the
+    last FILE_TIME_SLACK + CLOCK_TOLERANCE seconds: a read they make now counts toward a file
+    that recent (PROVENANCE.md 8)."""
+    cur.execute("SELECT DISTINCT dataset FROM accesses WHERE person = %s AND (mode = 'write' OR can_write) "
+                "AND COALESCE(expires, at) >= now() - %s * interval '1 second'",
+                (person, FILE_TIME_SLACK + CLOCK_TOLERANCE))
+    _invalidate(cur, [r["dataset"] for r in cur.fetchall()])
+
+
 def list_folder(ds_id):
     """Record every file in the dataset's folder with its last-modified time, replacing what
     the previous listing found; returns whether the folder holds anything. Storage decides
@@ -681,6 +717,8 @@ def list_folder(ds_id):
                         (ds_id, key, modified))
         cur.execute("INSERT INTO folder_listings (dataset, listed_at) VALUES (%s, now()) "
                     "ON CONFLICT (dataset) DO UPDATE SET listed_at = now()", (ds_id,))
+        cur.execute("INSERT INTO sources_version (dataset, version) VALUES (%s, 1) "
+                    "ON CONFLICT (dataset) DO UPDATE SET version = sources_version.version + 1", (ds_id,))
     return bool(found)
 
 
@@ -780,11 +818,13 @@ GROUP BY c.source ORDER BY 1
 """
 
 
-def carried(ds_id, direct=False):
+def carried(ds_id, direct=False, stored=True):
     """The sources the files in a dataset's folder carry, or with direct only the files directly
     in it, each with whether a declaration says it was used (declared) rather than its being
     there because a writer has not declared yet, and the paths it arrived by, each the datasets
-    it passed through, as [{id, declared, paths}].
+    it passed through, as [{id, declared, paths}]. The answer is stored and reused until
+    something it was worked out from changes (_invalidate), except for an entry whose folder is
+    unknown, which counts every write as made now; stored=False works it out regardless.
     The folder is listed first if it never has been, if a credential that could write it has
     expired since the last listing, so that what it wrote, or did not, is settled by storage
     even if a notification was lost, or if it is not tracked, since no notification lists it."""
@@ -813,10 +853,24 @@ def carried(ds_id, direct=False):
             stale = cur.fetchone() is not None
     if stale:
         list_folder(ds_id)
-    with db() as cur:
+    keep = stored and folder is not None and not untracked
+    with db(commit=keep) as cur:
+        # The version is read before the sources, so a change committed in between leaves this
+        # answer stored under a version that is no longer current.
+        cur.execute("SELECT COALESCE((SELECT version FROM sources_version WHERE dataset = %s), 0) AS v", (ds_id,))
+        version = cur.fetchone()["v"]
+        if keep:
+            cur.execute("SELECT sources FROM entry_sources WHERE dataset = %s AND direct = %s AND version = %s",
+                        (ds_id, params["direct"], version))
+            if row := cur.fetchone():
+                return row["sources"]
         cur.execute(_CARRIED_SQL.format(writes=writes), params)
-        return [{"id": r["source"], "declared": r["declared"], "paths": r["paths"]}
-                for r in cur.fetchall()]
+        sources = [{"id": r["source"], "declared": r["declared"], "paths": r["paths"]} for r in cur.fetchall()]
+        if keep:
+            cur.execute("INSERT INTO entry_sources (dataset, direct, version, sources) VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (dataset, direct) DO UPDATE SET version = EXCLUDED.version, "
+                        "sources = EXCLUDED.sources", (ds_id, params["direct"], version, json.dumps(sources)))
+        return sources
 
 
 # --- Effective grants (docs/HANDOFF-2026-10-22-groups.md sections 1 to 3) ---
@@ -1173,6 +1227,7 @@ def table_events():
             cur.execute("UPDATE table_entries SET status = CASE WHEN status = 'moved' THEN 'moved' "
                         "ELSE 'gone' END WHERE id = %s RETURNING id", (table_id,))
         changed = cur.fetchone() is not None
+        _invalidate(cur, [table_id])
     app.logger.info("TABLE %s %s%s", event, table_id, "" if changed else " (no entry; ignored)")
     return jsonify({"ok": True, "changed": changed})
 
@@ -1208,6 +1263,7 @@ def internal_transfers():
                 return jsonify({"error": "no such transfer under way"}), 404
             cur.execute("UPDATE datasets SET status = 'moved', moved_to = %s WHERE id = %s", (t["to_id"], t["from_id"]))
             cur.execute("UPDATE accesses SET expires = now() WHERE session = %s AND mode = 'write'", (t["session"],))
+            _invalidate(cur, [t["from_id"], t["to_id"]])
         reconcile(t["to_id"])
         list_folder(t["from_id"])
         app.logger.info("TRANSFER done %s -> %s", t["from_id"], t["to_id"])
@@ -1244,6 +1300,7 @@ def internal_transfers():
                         "VALUES (%s, %s, %s, %s, %s, 'files', %s, to_timestamp(%s / 1000.0), %s, %s)",
                         (body["person"], body["sub"], f"transfer:{tid}", session, dataset, mode, body["expires"],
                          sources, m))
+        _invalidate(cur, [src, dst])
     app.logger.info("TRANSFER begin %s %s -> %s (%s)", tid, src, dst, body["person"])
     return jsonify({"transfer": tid})
 
@@ -1327,6 +1384,9 @@ def record_accesses():
                         (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
                          e["mode"], e.get("expires"), brought[i], e.get("can_write", False), marks[i],
                          e.get("location"), e.get("recursive", True)))
+        _invalidate(cur, [e["dataset"] for e in body["entries"] if e["mode"] == "write" or e.get("can_write")])
+        if any(e["mode"] == "read" for e in body["entries"]):
+            _invalidate_writes_of(cur, body["person"])
         cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
         name = cur.fetchone()["name"]
     app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,
@@ -2208,6 +2268,9 @@ def _declare(subject, rows):
                 cur.execute("INSERT INTO declared_sources (declaration, source, source_type, used, detached) "
                             "VALUES (%s, %s, %s, %s, %s)",
                             (declaration, src["source"], src["source_type"], src["used"], src["detached"]))
+        # A declaration of a target covers the files written with credentials for it, which the
+        # folders inside and around it hold too.
+        _invalidate(cur, list(checked))
     app.logger.info("DECLARE person=%s %s", subject, " ".join(
         f"{t}:{'put back ' if c.get('reattach') else ''}{sum(s['used'] for s in c['sources'])}/{len(c['sources'])}"
         for t, c in checked.items()))
