@@ -252,7 +252,8 @@ grants OPA reads are the ones the write replaces.
   `governance`. A name any grant already uses, or whose space has entries, is refused, since
   the new group's owner would hold those grants.
 - Deleting a group: its owners, while its space holds no data.
-- A collection's `describe` and `read`: callers holding its `manage`; its `manage`, `write`
+- Creating a collection: members and above of a group other than a personal one, which owns
+  none. A collection's `describe` and `read`: callers holding its `manage`; its `manage`, `write`
   and `delete`: stewards of the group it belongs to. Its description and members: callers
   holding its `write`, with `manage` on each member added; a member's `manage` holders may
   also remove it from any collection holding it directly.

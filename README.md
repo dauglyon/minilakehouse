@@ -333,8 +333,8 @@ Its members write there with no step first, and a steward publishes what is to b
 
 A collection (`docs/HANDOFF-2026-10-22-groups.md` section 5) groups published datasets, folders
 and namespaces alike, and other collections, by reference; it holds no data and no credential
-is issued for it. It belongs to a group and is named `<group>:<name>`; it takes its group's
-space defaults. Its `describe` and `read` reach every member, through nested collections, still
+is issued for it. It belongs to a group, never a personal one, and is named `<group>:<name>`;
+it takes its group's space defaults. Its `describe` and `read` reach every member, through nested collections, still
 cut by each member's sources; its `manage`, `write` and `delete` are its own. Adding a member
 takes `write` on the collection and `manage` on the member, whose holders so consent; removing
 takes either, and a collection that would come to hold itself is refused.

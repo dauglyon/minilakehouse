@@ -96,6 +96,8 @@ r = gov("POST", "/collections", "alice", {"group": "jgi", "name": f"share{ts}", 
 check(f"alice creates a collection in jgi ({r.status_code})", r.status_code == 201)
 check("bob may not create one in jgi", gov("POST", "/collections", "bob",
                                            {"group": "jgi", "name": f"x{ts}"}).status_code == 403)
+check("a personal group owns none", gov("POST", "/collections", "alice",
+                                        {"group": "u_alice", "name": f"x{ts}"}).status_code == 403)
 check("she gives projw read on it", gov("PATCH", f"/collections/{share}", "alice",
       {"changes": [{"group": "projw", "add": ["read"]}]}).status_code == 200)
 check("carol may not change who reads it", gov("PATCH", f"/collections/{share}", "carol",

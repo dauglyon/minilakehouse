@@ -1814,6 +1814,8 @@ def create_collection():
     if not (isinstance(group, str) and isinstance(name, str) and COLLECTION_RE.match(cid)
             and isinstance(body.get("description", ""), str) and set(body) <= {"group", "name", "description"}):
         return jsonify({"error": "body is {group, name, description}; a name is lowercase letters, digits, _ and -"}), 400
+    if _is_personal(group):
+        return jsonify({"error": f"{group} is a personal group: it owns no collections"}), 403
     if opa("allow_create", {"subject": subject, "group": group, "platform_admin": platform_admin(claims)},
            package="collections") is not True:
         return jsonify({"error": "forbidden"}), 403
