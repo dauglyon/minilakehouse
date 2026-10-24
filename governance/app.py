@@ -348,7 +348,7 @@ UPDATE table_entries SET status = 'gone' WHERE status = 'pending';
 -- A table has no grants of its own: its grants are its namespaces' and its space's. The
 -- grant columns of table_entries are read only to keep a group name some grant used from
 -- being created again.
--- Grants on a folder, reaching every entry under it.
+-- Grants on a folder, reaching it and every entry under it.
 CREATE TABLE IF NOT EXISTS folder_grants (
     prefix   TEXT PRIMARY KEY,                 -- datasets/<group>/<...>/
     describe TEXT[] NOT NULL DEFAULT '{}',
@@ -979,21 +979,19 @@ def _union(layers):
 
 def _folder_layers(cur, items):
     """{id: [(where, grants)]} for folders, items [(id, prefix, own grants or None)]: the
-    folder's own grants when it is a published dataset (where "own"), those of each folder above
-    it, nearest first (where its prefix), and its space's defaults (where "space"). A folder's
-    grants reach the entries under it, not one at the folder itself, whose own grants are set by
-    publishing it: unpublished data is reached through the folders above it alone."""
+    folder's own grants when it is a published dataset (where "own"), those set on the folder
+    itself and on each folder above it, nearest first (where its prefix), and its space's
+    defaults (where "space"). A folder's grants reach its own files as well as the entries under
+    it, published or not."""
     prefixes = sorted({p for _, p, _ in items})
     cur.execute(f"SELECT prefix, {_GRANT_SQL} FROM folder_grants "
-                "WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) p WHERE starts_with(p, prefix) "
-                "AND p <> prefix)", (prefixes,))
+                "WHERE EXISTS (SELECT 1 FROM unnest(%s::text[]) p WHERE starts_with(p, prefix))", (prefixes,))
     folders = sorted(cur.fetchall(), key=lambda f: -len(f["prefix"]))
     spaces = _spaces(cur, {_file_space(p) for p in prefixes})
     out = {}
     for i, prefix, own in items:
         layers = [("own", own)] if own else []
-        layers += [(f["prefix"], _grants_of(f)) for f in folders
-                   if prefix.startswith(f["prefix"]) and prefix != f["prefix"]]
+        layers += [(f["prefix"], _grants_of(f)) for f in folders if prefix.startswith(f["prefix"])]
         if _file_space(prefix) in spaces:
             layers.append(("space", spaces[_file_space(prefix)]))
         out[i] = layers
@@ -1260,11 +1258,7 @@ def internal_folders():
     items = [(i, f"datasets/{i}/") for i in ids if _confined_prefix(f"datasets/{i}/")]
     with db() as cur:
         layers = _folder_layers(cur, [(i, p, None) for i, p in items])
-        cur.execute(f"SELECT prefix, {_GRANT_SQL} FROM folder_grants WHERE prefix = ANY(%s)",
-                    ([p for _, p in items],))
-        own = {r["prefix"]: _grants_of(r) for r in cur.fetchall()}
-    entries = {i: {"id": i, "prefix": p, "space": _file_space(p),
-                   **_union(([(p, own[p])] if p in own else []) + layers[i])}
+    entries = {i: {"id": i, "prefix": p, "space": _file_space(p), **_union(layers[i])}
                for i, p in items if any(where == "space" for where, _ in layers[i])}
     return jsonify({"entries": entries})
 
@@ -2403,7 +2397,7 @@ _INDEX_FILES_SQL = """
 SELECT id FROM datasets d WHERE status = 'live' AND (
     split_part(prefix, '/', 2) = ANY(%(groups)s) OR (describe || access) && %(names)s::text[]
     OR id = ANY(%(held)s)
-    OR EXISTS (SELECT 1 FROM folder_grants f WHERE starts_with(d.prefix, f.prefix) AND d.prefix <> f.prefix
+    OR EXISTS (SELECT 1 FROM folder_grants f WHERE starts_with(d.prefix, f.prefix)
                AND (f.describe || f.read) && %(names)s::text[]))
 """
 _INDEX_TABLES_SQL = """

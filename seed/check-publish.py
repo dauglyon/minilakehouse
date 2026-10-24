@@ -124,12 +124,13 @@ check(f"the steward changes the published dataset's grants ({r.status_code})",
 check("a member, holding no manage, may not", gov("PATCH", f"/permissions/dataset/{folder}", "bob",
       {"changes": [{"group": "noaccess", "add": ["read"]}]}).status_code == 403)
 
-# A folder's grants reach the entries under it
+# A folder's grants reach the folder itself and the entries under it
+check("projw may not read a folder before it is granted", vend("carol", f"{g}/team").status_code == 403)
 r = gov("PATCH", f"/permissions/folder/{g}/team", "alice", {"changes": [{"group": "projw", "add": ["read"]}]})
-check(f"the steward grants projw read on a folder ({r.status_code})", r.status_code == 200)
+check(f"the steward grants projw read on the folder ({r.status_code})", r.status_code == 200)
+check("projw reads the folder itself through it", vend("carol", f"{g}/team").status_code == 200)
 check("a member writes a folder inside it", vend("bob", f"{g}/team/notes", "write").status_code == 200)
 check("projw reads that folder through the grant above it", vend("carol", f"{g}/team/notes").status_code == 200)
-check("but not the folder itself, which the grant is on", vend("carol", f"{g}/team").status_code == 403)
 
 # Tables take their namespaces' grants
 r = gov("PATCH", f"/permissions/namespace/lakehouse.{g}.shared", "alice",

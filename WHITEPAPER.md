@@ -108,7 +108,7 @@ service.
 | `published` | Whether a steward has published it: a folder, or a namespace at or above a table. A folder becomes an entry at its first credential, unpublished. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups, and `revoked` beside them (section 4.3, `PROVENANCE.md` 9). Each is a union of layers: a published folder's own, those of every folder or namespace above it, its space's defaults, and the `describe` and `read` of every collection holding it (section 10); a table has none of its own. See 4.2. |
+| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups, and `revoked` beside them (section 4.3, `PROVENANCE.md` 9). Each is a union of layers: a published folder's own, those set on the folder or namespace and on every one above it, its space's defaults, and the `describe` and `read` of every collection holding it (section 10); a table has none of its own. See 4.2. |
 | sources | Not stored in the entry: the datasets its stored files were built from, worked out from the access log and a listing of its folder. See 4.3. |
 | releases | Per source, the groups that source's `manage` holders let read this dataset although they may not read the source. See 4.3. |
 | `status` | `live`, `gone`, `moved` with `moved_to`. See section 9. |

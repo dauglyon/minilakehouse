@@ -196,7 +196,8 @@ groups.allow_steward, allow_delete, allow_view
 Every rule also fetches `GET /internal/groups/<subject>`, except the shipped `tables.load` on a load without a credential, which fetches nothing. It returns the names the person holds grants through, `<g>` for each group and `<g>#member`, `<g>#admin`, `<g>#owner` and `<g>#steward` for their role in it and those below it, in two lists: every name, which `describe`, `read` and a source's `read` are checked against, and the names of the groups they are more than a viewer in, which every other grant is checked against (`governance.holder`), and the person's personal space. `platform_admin` is whether the caller's verified token carries the Keycloak realm role `platform-admin`; it passes every check a steward or a group's owner passes.
 
 An entry's grants are layers (`docs/HANDOFF-2026-10-22-groups.md` sections 1 to 3): a published
-folder's own, every folder's or namespace's above it, and its space's defaults; a table has none
+folder's own, those set on the folder or namespace and on every one above it, and its space's
+defaults; a table has none
 of its own; and the `describe` and `read` of every collection holding the dataset, directly or
 through other collections. Governance serves their union, and answers for a folder no
 credential has named yet as for an entry, so its first credential is decided like any other.

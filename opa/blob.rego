@@ -27,7 +27,8 @@ package lakehouse.blob
 # An entry is a folder in a group's space (docs/HANDOFF-2026-10-22-groups.md sections 1 to 3):
 # {id, prefix, tracked, published, space, inside_published, contains_published, sources, and
 # describe, access (read), manage, write, detach, delete: [name]}, each grant the union of the
-# folder's own when it is published, the folders' above it and its space's defaults. Governance
+# folder's own when it is published, those set on it and on the folders above it, and its
+# space's defaults. Governance
 # answers for an untracked folder in a space too, which its first credential makes an entry. A
 # dataset can be visible-but-not-readable: in `visible` and not in `readable`. An id with no
 # entry is denied exactly as a dataset the caller has no grant on.

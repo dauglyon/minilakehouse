@@ -293,18 +293,18 @@ Its members write there with no step first, and a steward publishes what is to b
   members and above, `delete` for its admins (`<g>#admin`), `manage` for its stewards
   (`<g>#steward`), `detach` empty.
 - A folder becomes an entry the first time someone is given a credential for it. Until it is
-  published it has no description or grants of its own, and it is listed only to those who
-  may read it. A table becomes an entry when it is created.
+  published it has no description, its grants are those set on the folder and above it, and it
+  is listed only to those who may read it. A table becomes an entry when it is created.
 - A steward publishes a folder with `PATCH /datasets/<id>` and a namespace, one dataset of its
   tables, with `PATCH /namespaces/<id>`: `{"description", "describe": [...], "read": [...],
   ...}`. Published datasets do not nest: publishing one inside or around another is refused,
   and no credential for a folder reaches into a published dataset under it.
 - Grants can also be set on any folder (`PATCH /permissions/folder/<id>`) and any namespace
-  (`PATCH /permissions/namespace/<id>`), whether or not it exists yet. They reach every entry
-  under it, published or not, and every table created there later. A table has no grants of
+  (`PATCH /permissions/namespace/<id>`), whether or not it exists yet. They reach the folder's
+  own files and every entry under it, published or not, and every table created there later. A table has no grants of
   its own.
-- An entry's grants are the union of its own (while published), those of every folder or
-  namespace above it, and its space's. `GET /datasets/<id>` and `GET /tables/<id>` show each
+- An entry's grants are the union of its own (while published), those set on its folder or
+  namespace and on every one above it, and its space's. `GET /datasets/<id>` and `GET /tables/<id>` show each
   layer, and `governance.grants` names where each inherited grant comes from.
 - A group whose space holds data cannot be deleted, and a group cannot be created under a name
   whose space already has entries.
