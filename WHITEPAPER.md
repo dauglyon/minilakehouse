@@ -481,11 +481,14 @@ Grants are independent of status. Listings show `live` entries only.
 - **A dataset is one unit, as a repository is.** Every file in a dataset's folder shares its
   grants and the sources its files carry, as every file in a GitHub or GitLab repository shares
   the repository's permissions; no file has grants of its own. Roots and namespaces nest and
-  hold datasets, as GitLab groups and subgroups hold projects. A folder becomes a dataset
-  when it is published. Published datasets do not nest: a folder inside one is part of it,
-  and one can sit among other folders and files but not inside another, because no credential
-  may reach into a published dataset except its own. This differs from Google Drive, where
-  any file or folder can be shared on its own.
+  hold datasets, as GitLab groups and subgroups hold projects. A dataset is a published folder
+  of files or a published namespace of tables; a single file or table is not published.
+  Published datasets do not nest: a folder inside one is part of it, and one can sit among
+  other folders and files but not inside another, because no credential may reach into a
+  published dataset except its own. Collections give nesting instead: a collection groups
+  datasets and other collections by reference, holds no data, and passes `describe` and `read`
+  to its members. This differs from Google Drive, where any file or folder can be shared on
+  its own.
 - **No per-person dynamic filtering.** "Rows where owner is the current user" is not a
   dataset.
 - **Revocation lag.** A grant or group membership change reaches the next decision and

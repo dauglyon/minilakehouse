@@ -340,6 +340,10 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
 
 # Section 2 — namespace grants (inheritance)
 
+Partly replaced on 2026-10-24 by sections 3 and 5: a table has no grants of its own, so its
+grants are its namespace's and those above it, plus the collections that contain its namespace;
+the table-level `own` sets below go.
+
 ## Why
 
 In the platform's ingest (`kbase/data-lakehouse-ingest`) one dataset is a namespace with many
@@ -458,8 +462,15 @@ comes after.
   2: an entry's grants are its own, every folder's above it, and its space's. The space's admins
   change them (section 1's role model), and an inherited `detach` narrows as section 2 says.
   Section 2's "later, same shape" grants on file roots become grants on any folder.
-- **Tables** are already single units. Publishing a table gives it a description and grants of
-  its own. Whether a namespace can be published as one dataset of its tables is open (below).
+- **Tables are published as namespaces** (decided 2026-10-24). Publishing a namespace makes it
+  one dataset of its tables, with one description and one set of grants; a single table is not
+  published and has no grants of its own, as a single file is not. This is how KBase's ingest
+  treats a dataset (`tenant.dataset`, many tables) and how Kaggle, Dataverse and Hugging Face
+  publish a dataset of several tables. Published namespaces do not contain or sit inside one
+  another, as folders do not; a table that needs its own audience goes in a namespace of its
+  own. Each table still has its own credential, so rule 3 can close one table built from a
+  source a person may not read and leave the rest of its namespace open, which a folder of
+  files cannot do. Collections (section 5) group datasets of either kind.
 
 ## Credentials
 
@@ -530,9 +541,12 @@ not for every file. No storage listing is needed for browsing.
 ### Tables
 - `opa/tables.rego`: `allow_create` allows an admin of a group owning the namespace or one
   above (drop the `pending` entry requirement). Drop `allow_register`.
-- `gate/app.py`: reports created tables as now; governance inserts the entry unpublished with
-  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` publishes.
-- `table_entries.published` as for files; `pending` goes away.
+- `gate/app.py`: reports created tables as now; governance records the table under its
+  namespace, with status `live`. `POST /tables` goes away; `PATCH /namespaces/<id>` publishes a
+  namespace: description and grants, refused inside or around another published namespace.
+- Grants move from `table_entries` to namespace entries: a table's grants are its namespace's
+  and those of the namespaces above it, plus collections (section 5). Today `lakehouse.db` holds
+  tables with different grants (`t1`, `t2`, …); each moves to a namespace of its own.
 
 ### Read API (sections 1–2) additions
 - `GET /groups/<name>` gains `unpublished`: entries in its spaces not yet published, each with
@@ -563,14 +577,11 @@ description; declaring sources sits beside it, prefilled from the lineage candid
 - No credential reaches into a published dataset except its own; a folder with one under it is
   opened non-recursively (`"recursive": false`) plus its parts.
 - Grants can be set on any folder and are inherited by every entry under it.
+- Tables are published only as namespaces; single tables have no grants of their own.
 - Unpublished data is readable only through its space's grants and those of the folders above
   it, never grants of its own.
 - `pending` is removed; `published` is a flag on a live entry.
 - "Publish" is the user-facing word (decided 2026-10-24).
-
-## Open
-- Tables: publish only tables, or also a namespace as one dataset of its tables (with
-  inheritance as Polaris and Unity Catalog grant, or under the no-nesting rule of files).
 
 ---
 
@@ -688,3 +699,74 @@ publisher the lookup; the publisher still signs.
   and `INSERT`.
 - Matching a statement to access-log rows by person and time window when the person runs
   statements concurrently.
+
+---
+
+# Section 5 — collections
+
+Decided 2026-10-24. Published datasets do not nest (section 3); collections give the nesting.
+A dataset is a published folder of files or a published namespace of tables. A **collection**
+groups datasets and other collections by reference. It holds no data, and no storage
+credential is ever issued for one, so nothing about storage changes.
+
+Prior art: Dataverse collections hold datasets and other collections, and nest; Hugging Face
+Collections are curated lists of datasets and models; a Delta Sharing share is a set of tables
+and schemas granted to recipients together.
+
+Example: the collection `pangenome` holds the namespace `kbase.pangenome` (tables `genome`,
+`gene`) and the folder `pangenome-raw/` holding the files they were loaded from; the collection
+`kbase-reference` holds `pangenome` and `taxonomy`.
+
+## Model
+
+- A dataset or a collection can be in several collections. A collection cannot end up
+  containing itself.
+- A collection has a description and appears in the dataset index as one entry, its members
+  under it.
+
+## Grants
+
+- A collection has `describe` (see it, its description, and the members the viewer may
+  describe), `read` (read every member through it), `share` (change who may describe or read
+  it), `write` (curate it: its description, adding and removing members) and `delete` (delete
+  it; its members are untouched).
+- `describe` and `read` flow down to members, through nested collections: `read` on
+  `kbase-reference` reads `pangenome`'s namespace and folder. `share`, `write` and `delete` on a
+  collection give no rights over its members.
+- A dataset's effective `describe` and `read` are its own, those of the folders or namespaces
+  above it, and those of every collection containing it directly or through other collections.
+  Governance serves these effective sets, as section 2 does for namespaces, both for the entry
+  and for each carried source's `read` and `share` in rule 3's lookups.
+- Sources still apply. Reading a member through a collection is restricted by that member's
+  sources as reading it directly is; only a release (`PROVENANCE.md` 6.7) gets past a source.
+- The access log records the dataset read, never the collection, so lineage and declarations
+  are unchanged.
+
+## Membership
+
+- Adding a dataset or a collection takes `write` on the receiving collection and `share` on what
+  is added: its owners decide whether it joins.
+- Consent reaches through nesting: joining a collection trusts its `share` holders, including to
+  place it inside larger collections, as the old design's chain of grants did. A dataset's
+  `share` holders see every collection it reaches and can remove it from any collection that
+  holds it directly.
+- Removing takes `write` on the collection, or `share` on the member.
+
+## Ownership
+
+- A collection belongs to a group; that group's admins hold `share` and `delete` on it, as for
+  datasets in its space (section 1's role model). A collection can hold datasets from other
+  groups' spaces when their owners agree, which shares across tenants.
+
+## Changes
+
+- Governance: `collections (id, owner, description, describe, read, share, write, delete)` and
+  `collection_members (collection, member, member_kind, added_by, added_at)`, with a cycle check
+  on adding; `POST /collections`, `PATCH /collections/<id>` (description and grants),
+  `POST` and `DELETE /collections/<id>/members/<member>`; `GET /collections/<id>` in the read API.
+- OPA: `collections.allow_change` (`describe` and `read` by `share` holders; `share`, `write`
+  and `delete` by the owning group's admins), `allow_add` (`write` on the collection and `share`
+  on the member) and `allow_remove`.
+- Lookups: effective sets include collections, as above.
+- Index: `governance.datasets` lists collections (kind `collection`) to their `describe`
+  holders, with members under them.
