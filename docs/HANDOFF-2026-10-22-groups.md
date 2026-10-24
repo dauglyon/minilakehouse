@@ -378,3 +378,55 @@ publisher the lookup; the publisher still signs.
   and `INSERT`.
 - Matching a statement to access-log rows by person and time window when the person runs
   statements concurrently.
+
+# Section 5 — what the web UI assumes
+
+The wireframes (design canvas, 2026-10-23) are faithful to sections 1–4 and the whitepaper
+except where listed here. Each item is either an extension to build or a decision taken.
+
+## Model
+- **One noun.** A group owns a folder and a namespace, but the UI never shows that split. A
+  group lists its datasets; kind is `folder`, `table` or `namespace`. Every first-level folder
+  or table is an entry from its first write (section 3), so "scratch" is a dataset that is not
+  yet published, shown to the owning group only. The physical roots appear only under the
+  group's Ownership.
+- **Grant names where access is edited, outcome words where it is read.** Editors use
+  `describe`, `read`, `read and share`, `write`, `delete`, `detach`. Outcome columns use
+  reads / sees only / on request / undeclared, per viewer. The two are never mixed in one
+  column.
+- A folder dataset has no `delete` (whitepaper 4.2); a namespace has no `detach`.
+- Hidden sources are never counted or named to a viewer (whitepaper 4.3). Requests for them
+  are routed server-side and appear to the requester only as rows of their own request once
+  sent.
+- Any member of a group holding `share` decides a request, since a grant held by a group is
+  held by its members. Admins-only would need a default `share: [its admins]`.
+
+## Extensions to build
+1. **Requests.** Table `requests (dataset, grant, grantee, requester, note, status, decided_by,
+   reason, at)`. A request for `read` on a dataset is routed to the groups holding `share` on
+   it; a reader at "on request" sends one per narrower source. Approve = `allow_change`
+   through the normal path; decline stores a reason; the requester reads the status of each.
+2. **Usage.** Per dataset, for its `share` holders and owning admins: readers from the access
+   log (person, through which group, count, last) over a period; the datasets carrying it
+   (reverse index over per-file carried sets), with detached ones and a *put back*
+   (`PROVENANCE.md` 6.5). A request card's "also opens" line asks OPA what else the grantee
+   would then read.
+3. **Web credentials.** The web login is a login like any other: the UI vends a broker read
+   credential to list a dataset's files and a write credential for upload. Dropping files
+   writes under the person's own folder and so creates an entry.
+4. **Declarations from the web.** `POST /declarations` with the person's token, the same checks
+   as the `INSERT INTO governance.derivations`, signed by governance. The sources step of
+   publishing and *Declare…* on a dataset use it.
+5. **`may_detach`** on each carried source in `GET /datasets|tables/<id>`, so the *Not used*
+   box can be disabled in advance for an arrived-through source whose `detach` is held.
+6. **Per-row outcome in list routes** (own-read membership and effective read), so the
+   catalog and search do not call once per dataset.
+7. **Batch publish** of the tables under one namespace: one `PATCH /tables/<id>` each.
+8. **Blob root grants** (`root_grants`) are required, not deferred: unpublished folders are
+   readable through them (section 3).
+9. **`GET /me`** lists the person's groups with role, requests waiting and entries not yet
+   published, for the Groups page.
+
+## Docs to update
+- `PROVENANCE.md` 9 still says a project folder "is scratch, not a dataset"; section 3 and
+  the UI supersede it.
