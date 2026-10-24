@@ -253,8 +253,9 @@ def transfer():
     # 2). The broker copies exactly the files governance listed, server-side and each only while
     # its ETag matches, so a file written into the old folder since is left behind rather than
     # copied without its sources; it deletes the originals once all are copied, and has governance
-    # record the old entry as moved to the new one. A failure before that leaves the old folder
-    # whole, and a changed file removes the copies made so far.
+    # record the old entry as moved to the new one before deleting the originals. A failure before
+    # that leaves the old folder whole: a changed file, or governance refusing to record the move,
+    # removes the copies made so far.
     claims, err = authed_user()
     if err:
         return err
@@ -298,11 +299,14 @@ def transfer():
                 s3.delete_object(Bucket=BUCKET, Key=k)
             app.logger.info("transfer %s -> %s stopped, a file changed: %s", src, dst, e)
             return jsonify({"error": f"{src} changed during the move; nothing was moved"}), 409
-        for k in keys:
-            s3.delete_object(Bucket=BUCKET, Key=k)
         status, done = _internal("/internal/transfers", {"phase": "done", "transfer": begun["transfer"]})
         if status != 200:
-            raise requests.RequestException(f"record refused: {done}")
+            for k in copied:
+                s3.delete_object(Bucket=BUCKET, Key=k)
+            app.logger.info("transfer %s -> %s not recorded, copies removed: %s", src, dst, done)
+            return jsonify({"error": done.get("error", "the move was not recorded; nothing was moved")}), 409
+        for k in keys:
+            s3.delete_object(Bucket=BUCKET, Key=k)
     except (requests.RequestException, boto3.exceptions.Boto3Error, ClientError) as e:
         app.logger.warning("transfer %s -> %s failed: %s", src, dst, e)
         return jsonify({"error": "transfer failed"}), 503

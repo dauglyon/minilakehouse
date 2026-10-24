@@ -407,6 +407,7 @@ CREATE TABLE IF NOT EXISTS transfers (
 -- A folder's transfer is under way until done or until the broker's credential for it expires;
 -- meanwhile nothing in or around either folder is published.
 ALTER TABLE transfers ADD COLUMN IF NOT EXISTS expires TIMESTAMPTZ;
+UPDATE transfers SET expires = at + interval '15 minutes' WHERE expires IS NULL;
 -- Stored sources (docs/PLAN-2026-10-24.md item 3e): what carried() last worked out for an
 -- entry, for its whole folder and for the files directly in it, with the entry's version then.
 -- Every change carried() reads from bumps the version of each entry it can change, in the
@@ -1380,15 +1381,25 @@ def internal_transfers():
     #     Answers {transfer, files: [{key, etag}]}: the files that listing found, which are all the
     #     broker copies, each only while its ETag still matches, so a file written into the old
     #     folder after the listing is never copied with less than it carries.
-    #   done {transfer}: the old entry is moved to the new one, and the write ends now.
+    #   done {transfer}: once every file is copied and before the originals are deleted, the old
+    #     entry is moved to the new one and the write ends now; refused, and the broker removes its
+    #     copies, if the broker's credential has expired or a dataset in or around either folder
+    #     was published meanwhile.
     body = request.get_json(silent=True) or {}
     if body.get("phase") == "done":
         with db(commit=True) as cur:
-            cur.execute("UPDATE transfers SET done_at = now() WHERE id = %s AND kind = 'files' AND done_at IS NULL "
-                        "RETURNING from_id, to_id, session", (body.get("transfer"),))
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_KEY,))
+            cur.execute("SELECT from_id, to_id, session FROM transfers WHERE id = %s AND kind = 'files' "
+                        "AND done_at IS NULL AND expires > now() FOR UPDATE", (body.get("transfer"),))
             t = cur.fetchone()
             if t is None:
                 return jsonify({"error": "no such transfer under way"}), 404
+            cur.execute("SELECT id FROM datasets WHERE published AND EXISTS (SELECT 1 FROM unnest(%s::text[]) p "
+                        "WHERE starts_with(prefix, p) OR starts_with(p, prefix)) LIMIT 1",
+                        ([f"datasets/{t['from_id']}/", f"datasets/{t['to_id']}/"],))
+            if cur.fetchone():
+                return jsonify({"error": "a dataset in or around the folders was published"}), 409
+            cur.execute("UPDATE transfers SET done_at = now() WHERE id = %s", (body.get("transfer"),))
             cur.execute("UPDATE datasets SET status = 'moved', moved_to = %s WHERE id = %s", (t["to_id"], t["from_id"]))
             cur.execute("UPDATE accesses SET expires = now() WHERE session = %s AND mode = 'write'", (t["session"],))
             _invalidate(cur, [t["from_id"], t["to_id"]])
