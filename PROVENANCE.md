@@ -629,8 +629,8 @@ reading one's own project folder would make the whole project a source of the ch
 Decided 2026-10-23: scratch is per person. Each person has a default group with themselves
 as its only member, which owns their private space (the personal space in
 `docs/HANDOFF-2026-10-22-groups.md` section 1; its name in a UI is not settled, "My Data" is a
-candidate). Each top-level folder in it is a dataset of its own, as under any root (the
-handoff's section 3), so what follows applies folder by folder.
+candidate). Each folder in it that the person writes into is an entry of its own, published
+or not (the handoff's section 3), so what follows applies folder by folder.
 
 - The person's own reads and writes in their private space are not cut by rule 3. They could
   read every source their files carry when they wrote them; losing `read` on a source later

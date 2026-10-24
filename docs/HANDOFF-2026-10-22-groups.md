@@ -421,92 +421,146 @@ enumeration is added.
 
 ---
 
-# Section 3 — storage-first registration
+# Section 3 — write first, publish later
 
-Vocabulary follows the whitepaper: a **publisher** writes and then **registers** an entry;
-**declaring** is the separate provenance act that names which candidate sources were used.
-`describe` stays a grant name and is not used for anything else.
+Rewritten 2026-10-24. **Publishing** is the act this section's first version called
+registering: giving a folder or a table a description and grants of its own. The docs that
+describe today's code keep "register" for what the code does now, registering an entry before
+anything is written, until this section is built. **Declaring** is the separate provenance
+act that names which candidate sources were used. `describe` stays a grant name.
 
 ## Why
 
 The design's rule is "storage owns existence, the registry owns meaning", and the registry
-already reconciles against RGW events. But registration today is form-first: a dataset is
-registered (`POST /datasets`, `allow_register`) before its bytes exist, and a table must be
-registered `pending` before `CREATE TABLE` is allowed. Writing is gated on a registry entry
-that describes nothing yet. Invert it: writing under a root you own is allowed by ownership
-alone; registering what was written comes after.
+already reconciles against RGW events. But today a dataset is registered (`POST /datasets`,
+`allow_register`) before its bytes exist, and a table must be registered `pending` before
+`CREATE TABLE` is allowed: writing waits on an entry that describes nothing yet. Invert it:
+writing in a space your group owns needs no entry first, and publishing what was written
+comes after.
 
 ## Model
 
-- A **tenant admin** (section 1) may write anywhere under a root their group owns: a blob
-  folder under `datasets/<root>/`, a table under `<catalog>.<ns>`.
-- Whatever appears there is an entry at once, **unregistered**: no description, grants = those
-  inherited from the root or namespace (section 2), nothing of its own. Readable by whoever
-  the root's grants name — by default only the owning group.
-- **Registering** it (description, own grants) is the publisher's act; declaring sources is
-  the separate act it already is. The entry's `registered` flag replaces `pending`; `live`/`gone` stay as the storage truth.
-- The cross-tenant guard moves, it does not go: writing needs an owned root; overlapping blob
-  folders are refused at registration, which now follows the write.
+- **A folder becomes a dataset by being published.** Until then it is a folder. Any folder in
+  a space can be published, at any depth, and nothing is copied or moved when it is.
+- **Published datasets do not nest.** A published dataset can sit among other folders and
+  loose files, but cannot contain, or sit inside, another published dataset. Governance
+  already refuses a folder inside or containing a registered one; publishing keeps that check.
+- **A folder is tracked from its first write credential.** The first time someone is given a
+  credential to write a folder, the folder becomes an entry that is not published: no
+  description, no grants of its own. Governance tracks its files from then on, as it tracks a
+  dataset today. Folders nobody has written into are not tracked, and nothing scans the
+  bucket (`DESIGN.md` 2: "neither enumerates the whole bucket").
+- **Before publishing, a folder is reached through its space's grants** (the root's, section
+  1; by default the owning group), and rule 3 restricts it by what its files were made from,
+  as for any entry. Publishing gives it a description and grants of its own.
+- **Tables** are already single units. Publishing a table gives it a description and grants of
+  its own. Whether a namespace can be published as one dataset of its tables is open (below).
+
+## Credentials
+
+Agreed and tried against Ceph on 2026-10-24. No credential reaches into a published dataset
+except that dataset's own; the broker keeps this by choosing what each credential covers,
+not by moving data.
+
+- **A folder with no published dataset under it:** one credential for the whole folder, as for
+  a dataset now. Recursive commands (`aws s3 sync`, `cp --recursive`, `ls --recursive`) work.
+- **A published dataset:** its own credential, under its own grants.
+- **A folder with a published dataset under it:** no credential covers it whole, since one
+  would reach the dataset. Asked for, the broker refuses with a short message, the same for
+  any folder and naming nothing inside it:
+
+      datasets/projw/ contains published datasets, so one credential can't cover it.
+      Ask for its own files with "own_files": true, or open its subfolders and datasets separately.
+
+  With `own_files`, the credential covers the folder's own files and nothing in its
+  subfolders: it allows `<folder>*` and denies `<folder>*/*`, and lists only `<folder>` one
+  level at a time (`s3:prefix` exactly the folder, `s3:delimiter` `/`). Its size is the same
+  for every folder and every person. Tried: it read and wrote a file directly in the folder,
+  was refused reading or writing inside a subfolder and listing below the folder, and listed
+  the folder's own files and its subfolders' names.
+- **Logged against what it covers.** A credential is logged against the entry of the folder
+  or dataset it covers, so file attribution (`PROVENANCE.md` 6.2) works as it does now.
+- **Rejected on the way:** a folder credential denying each published dataset inside it, with
+  listing restricted to one level so dataset contents stay hidden (Ceph limits a credential's
+  policy to about 2,048 characters: 19 short-named datasets fit, 13 with longer names,
+  measured); a list of files to deny for each person (OPA would be deciding file by file, and
+  a list of 50 was already refused); copying a folder's files to a separate area when it is
+  published; and a whole-folder credential for people who may read every dataset under the
+  folder, which would count every one of those datasets as read, so all their later outputs
+  would carry them as sources.
+
+## Seeing what is in a folder
+
+Through `describe` and the dataset index: `governance.datasets` lists each folder a person may
+describe, with whether it is published and whether they can read it. Files are listed a page
+at a time by a read route (section 1's read API): the SQL index is rebuilt from Postgres on
+every load and Trino cannot pass a folder filter through to it, which is fine for entries but
+not for every file. No storage listing is needed for browsing.
 
 ## Changes
 
-### Blobs
-- `opa/blob.rego`: drop `allow_register`. `vend_write` takes `{subject, prefix}`, where
-  `prefix` is one folder: exactly one level below a root (a new dataset), or inside an
-  existing dataset's folder (that dataset). It allows an admin of a group owning a root above
-  the folder, or the dataset's `write` grant, cut by its sources as now. A key directly under
-  a root is never writable: a dataset is a folder (`WHITEPAPER.md` 10).
-- `broker/app.py`: `POST /vend` with `mode: write` takes `prefix` instead of `dataset`.
-  Governance derives the folder's dataset id as registration does (`derive_id`), and the
-  broker logs the credential against that id before returning it, as now; the entry the
-  first event creates has the same id. A credential is never for a whole root: a folder's
-  files are matched to the write credentials logged against that dataset (`_CARRIED_SQL`),
-  by time, so a root-wide credential would either carry nothing (logged against no dataset)
-  or, matched by prefix, make every folder under the root carry its holder's reads while it
-  was valid. S3 Access Grants' `privilege=Minimal`, a credential no wider than the requested
-  target inside a wider grant, is the same shape.
-- `governance/app.py` `/events`: a key under an owned root with no entry creates one. Its id
-  is derived as now; its folder is the key's first path segment below the root (deeper
-  structure stays inside the dataset). Log `EVENT ... created unregistered <id>` instead of
-  "ungoverned". A key under no owned root stays ungoverned and logged.
-- `POST /datasets` becomes `PATCH /datasets/<id>` on an unregistered entry: description and
-  own grants. Sources are declared as today (`governance.derivations`). Allowed for an admin of a group owning a root above it. Keep the
-  overlap check here (refuse registering a folder that overlaps a registered one).
-- Schema: `datasets.registered BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
+### Files
+- `opa/blob.rego`: drop `allow_register`. `vend` and `vend_write` take `{subject, folder,
+  own_files}`: a folder in a space, allowed by the space's grants or, for a published dataset,
+  its own, restricted by sources as now; refused for a folder with a published dataset under
+  it unless `own_files`.
+- `broker/app.py`: `POST /vend` takes `folder` and `own_files` instead of `dataset`, returns the
+  message above when refused for that reason, and builds the own-files policy. A write
+  credential for a folder with no entry creates its entry (id from its path, as `derive_id`
+  does now) before the credential is logged.
+- `governance/app.py` `/events`: a key under a tracked folder is recorded for it; any other key
+  stays ungoverned and logged. Publishing is `PATCH /datasets/<id>` on an entry: description
+  and own grants, allowed for an admin of a group owning the space, refused for a folder inside
+  or containing a published dataset. Sources are declared as today (`governance.derivations`).
+- Schema: `datasets.published BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
   Drop `register_grants`.
+- Store each entry's sources, updated when its folder is listed or a declaration is accepted,
+  rather than working them out on every decision (scale; today's per-decision cost too).
 
 ### Tables
 - `opa/tables.rego`: `allow_create` allows an admin of a group owning the namespace or one
   above (drop the `pending` entry requirement). Drop `allow_register`.
-- `gate/app.py`: reports created tables as now; governance inserts the entry unregistered with
-  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` registers.
-- `table_entries.registered` as for datasets; `pending` goes away.
+- `gate/app.py`: reports created tables as now; governance inserts the entry unpublished with
+  status `live`. `POST /tables` goes away; `PATCH /tables/<id>` publishes.
+- `table_entries.published` as for files; `pending` goes away.
 
 ### Read API (sections 1–2) additions
-- `GET /groups/<name>` gains `unregistered`: entries under its roots with `registered = false`,
-  each with writer (from the access log), first-seen time, object or row count, and, for a
-  blob folder, the tables whose sessions read it (so an ingest pair shows side by side).
-- `GET /datasets/<id>` / `GET /tables/<id>`: `registered`, and `writer`.
+- `GET /groups/<name>` gains `unpublished`: entries in its spaces not yet published, each with
+  writer (from the access log), first-seen time, object or row count, and, for a folder, the
+  tables whose sessions read it (so an ingest pair shows side by side).
+- `GET /datasets/<id>` / `GET /tables/<id>`: `published`, and `writer`.
+- A paged route listing one level of a folder: its files and subfolders, with published state.
 
 ### Index
-- `governance.datasets` lists unregistered entries only to groups that may read them (the
-  owning group by default). A registered entry a group may describe but not read is visible by `describe` as now.
+- `governance.datasets` lists unpublished entries only to groups that may read them (the owning
+  group by default), and published ones by `describe` as now.
 
 ### Docs and seed
 - README "Registry freshness & governed ingest", "Flow B" (the `t2` demo) and the whitepaper's
-  register-at-ingest section change to: write, then register. `seed/ingest-demo.py` uploads
-  with a root-scoped write credential, then registers.
+  register-at-ingest section change to: write, then publish, using "publish" throughout.
+  `seed/ingest-demo.py` uploads with a folder's write credential, then publishes.
 
 ## UI consequence
-"Register" is not a form. It is an inbox on the group page: things in your roots nobody has
-registered yet. Registering is the same grants panel as everywhere else plus a description;
-declaring sources sits beside it, prefilled from the lineage candidates.
+"Publish" is not a form. It is an inbox on the group page: folders and tables in your spaces
+nobody has published yet. Publishing is the same grants panel as everywhere else plus a
+description; declaring sources sits beside it, prefilled from the lineage candidates.
 
 ## Decided
-- Writing under an owned root needs no prior registry entry.
-- Unregistered data is readable only through root/namespace grants, never wider.
-- `pending` is removed; `registered` is a flag on a live entry.
-- No new vocabulary: register, declare, publisher, entry, as in `WHITEPAPER.md` and `PROVENANCE.md`.
+- Writing in an owned space needs no prior entry; a folder is tracked from its first write
+  credential.
+- A folder becomes a dataset when published; published datasets do not contain or sit inside
+  one another; nothing is copied.
+- No credential reaches into a published dataset except its own; a folder with one under it is
+  opened as its own files plus its parts.
+- Unpublished data is readable only through the space's grants, never wider.
+- `pending` is removed; `published` is a flag on a live entry.
+- "Publish" is the user-facing word (decided 2026-10-24).
+
+## Open
+- Tables: publish only tables, or also a namespace as one dataset of its tables (with
+  inheritance as Polaris and Unity Catalog grant, or under the no-nesting rule of files).
+- Grants set on any folder and inherited by the entries under it, as namespace grants are in
+  section 2.
 
 ---
 
@@ -587,8 +641,8 @@ publisher the lookup; the publisher still signs.
   table reads had rows returned to the client (from the same events). Candidates per
   `lineage` that are table reads, not inputs of this statement, and never returned to the
   client get `unused`; a candidate returned to the client, a `files` candidate, and a source
-  that arrived through a read (`direct` false) get no row. An event whose output is not a registered
-  entry the person wrote is dropped and logged.
+  that arrived through a read (`direct` false) get no row. An event whose output is not an entry,
+  published or not, that the person wrote is dropped and logged.
 - `governance.drafts`, read-only, served like `lineage`: the person's own drafts, columns of
   `derivations` plus `engine` and `statement_id`. Built from Postgres on each load as the
   other governance tables are. The gate answers the `governance` namespace itself and treats
