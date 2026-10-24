@@ -481,6 +481,37 @@ sources needs as many approvals. Authority given ahead of time is how Palantir F
 markings, whose administrators choose who may remove them, and how declassification
 authority is delegated for classified documents.
 
+### 6.7 Releasing a dataset past a source
+
+Decided 2026-10-23. A release lets a group read a dataset built from a source although the
+group may not read the source: the source's `share` holders approve that audience for that
+dataset. Detaching says the source's data is not in the dataset; a release says it is, and the
+source's owners consent. US handling of originator-controlled material has the same step: a
+derivative product keeps the marking, and further dissemination needs the originator's
+permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
+
+- **Two decisions, by different people.** The target's `share` holders choose who may see
+  and read it, holding `share` on the target alone. A group they add that may not read a
+  source stays blocked by rule 3 until that source's `share` holders release the target to
+  it. This replaces the rule under which changing a dataset's `describe` or `read` also took
+  `share` on every source.
+- **Asking.** A release is requested for a target, a source and a group, by a `share` holder
+  of the target, once the group is in the target's `read`, and only for a source the target's
+  declarations mark used. Until its writers declare, a dataset carries everything they read,
+  and owners of sources it never used would be asked.
+- **Approving.** A `share` holder of the source approves or declines, shown the target's
+  description, declared sources and writers. Each source consents separately: a target built
+  from two sources the group may not read needs a release from each.
+- **What it covers.** Under rule 3 the group passes that source's check on the target.
+  Reading the target brings in the source marked with the release, so data built from the
+  target carries the mark and the group may read that too. Data that took the source by
+  another path is not covered and still needs the source's `read`.
+- **Read only.** A release grants `read`; the group cannot release the target further.
+- **Recorded, visible, withdrawable.** A release is stored with who requested and approved it
+  and when, shown to the source's `share` holders, and withdrawn by any of them; withdrawal
+  reaches the target and what was built from it at the next decision. A release stays when
+  its approver later loses `share` on the source.
+
 ### 6.6 Lifecycle of an output
 
 Decided 2026-10-22: a write needs no declaration, and status does not wait for one.
@@ -708,6 +739,7 @@ Build order, each step usable on its own:
    arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
    columns with detaches shown to the source's `share` holders, and putting a source back.
 3. The `sessions` lever as an insert.
+4. Releases (6.7).
 
 Section 13 of `WHITEPAPER.md`, the "inputs are trusted" statements in its sections 4.3, 10
 and 11, and its section 4.2's list of grants, which gains `detach`, change when step 2 lands.
