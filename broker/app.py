@@ -8,10 +8,12 @@ no engine in the byte path, safe even against a compromised engine.
 Flow:
   1. verify the user's token            -> subject
   2. ask OPA about the dataset id -> {allow, prefix}: `vend` to read (the dataset's `read`
-     grant), `vend_write` to write (its `write` grant). OPA fetches the person's groups and
-     the dataset's grants and registered prefix from governance
-  3. on allow: AssumeRole on `blob-vendor` (read: get and list) or `blob-writer` (write: put
-     and delete, no get, WHITEPAPER 4.2) with an inline session policy scoped to that prefix
+     grant), `vend_write` to write (its `write` grant), `vend_delete` to delete (its `delete`
+     grant). OPA fetches the person's groups and the dataset's grants and registered prefix
+     from governance
+  3. on allow: AssumeRole on `blob-vendor` (read: get and list), `blob-writer` (write: put
+     and delete, no get, WHITEPAPER 4.2) or `blob-deleter` (delete: list and delete, no get
+     or put) with an inline session policy scoped to that prefix
      (the role permits datasets/*; the session policy narrows; the client cannot widen it)
      -> per-dataset temp credentials
   4. have governance log the credential against the person's current session (PROVENANCE.md
@@ -40,6 +42,7 @@ OPA_BLOB = os.environ["OPA_BLOB_URL"]  # .../v1/data/lakehouse/blob
 RGW_ENDPOINT = os.environ["RGW_ENDPOINT"]
 BLOB_ROLE_ARN = os.environ["BLOB_ROLE_ARN"]
 BLOB_WRITE_ROLE_ARN = os.environ["BLOB_WRITE_ROLE_ARN"]
+BLOB_DELETE_ROLE_ARN = os.environ["BLOB_DELETE_ROLE_ARN"]
 BUCKET = os.environ["BUCKET"]
 BROKER_KEY = os.environ["BLOB_BROKER_KEY"]
 BROKER_SECRET = os.environ["BLOB_BROKER_SECRET"]
@@ -95,7 +98,7 @@ def authed_user():
 
 def opa_vend(subject, dataset, mode):
     """OPA's {allow, prefix} for this subject reading or writing this dataset."""
-    rule = "vend_write" if mode == "write" else "vend"
+    rule = {"write": "vend_write", "delete": "vend_delete"}.get(mode, "vend")
     r = _http.post(f"{OPA_BLOB}/{rule}", json={"input": {"subject": subject, "dataset": dataset}},
                    timeout=5)
     r.raise_for_status()
@@ -116,6 +119,14 @@ def log_access(claims, dataset, mode, expiration):
 
 
 def session_policy(prefix, mode):
+    if mode == "delete":
+        return json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": ["s3:DeleteObject"],
+             "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*"]},
+            {"Effect": "Allow", "Action": ["s3:ListBucket"],
+             "Resource": [f"arn:aws:s3:::{BUCKET}"],
+             "Condition": {"StringLike": {"s3:prefix": [f"{prefix}*"]}}},
+        ]})
     if mode == "write":
         return json.dumps({"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*"],
@@ -147,8 +158,8 @@ def vend():
     dataset, mode = body.get("dataset"), body.get("mode", "read")
     if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
         return jsonify({"error": "invalid dataset id"}), 400
-    if mode not in ("read", "write"):
-        return jsonify({"error": "mode must be read or write"}), 400
+    if mode not in ("read", "write", "delete"):
+        return jsonify({"error": "mode must be read, write or delete"}), 400
     decision = opa_vend(subject, dataset, mode)
     if decision.get("allow") is not True:
         app.logger.info("DENY %s subject=%s dataset=%s", mode, subject, dataset)
@@ -163,7 +174,7 @@ def vend():
 
     cr = _sts.assume_role(
         # STS caps the session-name length; truncate so a long username can't fail AssumeRole.
-        RoleArn=BLOB_WRITE_ROLE_ARN if mode == "write" else BLOB_ROLE_ARN,
+        RoleArn={"write": BLOB_WRITE_ROLE_ARN, "delete": BLOB_DELETE_ROLE_ARN}.get(mode, BLOB_ROLE_ARN),
         RoleSessionName=f"blob-{subject}"[:32],
         Policy=session_policy(prefix, mode), DurationSeconds=TTL,
     )["Credentials"]

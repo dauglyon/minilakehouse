@@ -132,8 +132,11 @@ request, since every rule looks the person's groups up at decision time.
   Writing is narrowed by what a dataset was built from exactly as reading is, so no one writes
   into a dataset they may not read.
 - **delete**: for a table, dropping it, which also removes its files. Writing a table does
-  not include dropping it. A file dataset has no `delete`: its `write` credential already
-  deletes objects.
+  not include dropping it. For a file dataset, a credential that lists and deletes in its
+  folder and cannot get or put, used with ordinary S3 tools (`aws s3 rm --recursive`); the
+  listing shows file names, sizes, times and ETags, which for a single-part upload are an MD5
+  of its contents. Neither kind is narrowed by what a dataset was built from, so data nobody
+  may read can still be removed.
 
 Two grants imply others, and no more: `read` implies `describe`, so a dataset a group may read is
 listed for it; and for tables, `write` implies `read`, because writing an Iceberg table

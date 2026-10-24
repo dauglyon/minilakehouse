@@ -192,6 +192,7 @@ DO $$ BEGIN
 END $$;
 -- Who may detach a dataset from data derived from it (PROVENANCE.md 6.5).
 ALTER TABLE datasets ADD COLUMN IF NOT EXISTS detach TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE datasets ADD COLUMN IF NOT EXISTS "delete" TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE table_entries ADD COLUMN IF NOT EXISTS detach TEXT[] NOT NULL DEFAULT '{}';
 CREATE INDEX IF NOT EXISTS datasets_viewers ON datasets USING gin ((describe || access));
 CREATE INDEX IF NOT EXISTS table_entries_viewers ON table_entries USING gin ((describe || read || write));
@@ -328,11 +329,11 @@ def init_db():
             if not _confined_prefix(d["prefix"]):  # the fixture is untrusted-into-ARN too
                 raise ValueError(f"registry.json: bad prefix {d['prefix']!r}")
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
+                'INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, "delete") '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                 (derive_id(d["prefix"]), d["prefix"], d.get("description"), d.get("steward"),
                  d.get("describe", []), d.get("access", []), d.get("share", []), d.get("write", []),
-                 d.get("detach", [])),
+                 d.get("detach", []), d.get("delete", [])),
             )
         for grp, members in reg.get("groups", {}).items():
             for m in members:
@@ -370,7 +371,7 @@ def _entry(row):
     """The meaning/grants half of a datasets row — what OPA decides over."""
     return {"id": row["id"], "prefix": row["prefix"],
             "describe": row["describe"], "access": row["access"], "share": row["share"],
-            "detach": row["detach"],
+            "detach": row["detach"], "delete": row["delete"],
             "write": row["write"]}
 
 
@@ -664,7 +665,7 @@ def internal_datasets():
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         return jsonify({"error": "ids must be a list of strings"}), 400
     with db() as cur:
-        cur.execute("SELECT id, prefix, describe, access, share, write, detach FROM datasets WHERE id = ANY(%s)",
+        cur.execute('SELECT id, prefix, describe, access, share, write, detach, "delete" FROM datasets WHERE id = ANY(%s)',
                     (ids,))
         rows = cur.fetchall()
     return jsonify({"entries": {r["id"]: _with_sources(r["id"], _entry(r)) for r in rows}})
@@ -793,7 +794,7 @@ def _accesses_valid(body):
     return (all(isinstance(body.get(k), str) for k in ("person", "sub", "sid"))
             and body["person"] and body["sub"] and isinstance(entries, list) and entries
             and all(isinstance(e, dict) and isinstance(e.get("dataset"), str) and e["dataset"]
-                    and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write")
+                    and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write", "delete")
                     and (e.get("expires") is None or isinstance(e["expires"], int))
                     and isinstance(e.get("can_write", False), bool)
                     for e in entries))
@@ -881,9 +882,9 @@ def register_dataset():
     if not _confined_prefix(prefix):
         return jsonify({"error": "prefix must be datasets/<...>/ with no '..' or escape"}), 400
     ds_id = derive_id(prefix)
-    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write", "detach")}
+    grants = {g: body.get(g, []) for g in ("describe", "access", "share", "write", "detach", "delete")}
     if not all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in grants.values()):
-        return jsonify({"error": "describe, access, share, write and detach must be lists of groups"}), 400
+        return jsonify({"error": "describe, access, share, write, detach and delete must be lists of groups"}), 400
 
     if opa("allow_register", {"subject": subject, "prefix": prefix}) is not True:
         app.logger.info("DENY register subject=%s prefix=%s", subject, prefix)
@@ -899,10 +900,11 @@ def register_dataset():
             if any(prefix.startswith(p) or p.startswith(prefix) for p in existing):
                 return jsonify({"error": "dataset unavailable"}), 409
             cur.execute(
-                "INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, status) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
+                'INSERT INTO datasets (id, prefix, description, steward, describe, access, share, write, detach, "delete", status) '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
                 (ds_id, prefix, body.get("description"), subject,
-                 grants["describe"], grants["access"], grants["share"], grants["write"], grants["detach"]),
+                 grants["describe"], grants["access"], grants["share"], grants["write"], grants["detach"],
+                 grants["delete"]),
             )
     except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "dataset unavailable"}), 409
@@ -978,7 +980,7 @@ def register_table():
 # The grants a change may name, per kind, and the column each is stored in. A file dataset has
 # no delete: its write credential deletes objects (WHITEPAPER 4.2).
 _GRANT_COLS = {"dataset": {"describe": "describe", "read": "access", "share": "share", "write": "write",
-                           "detach": "detach"},
+                           "detach": "detach", "delete": "delete"},
                "table": {g: g for g in ("describe", "read", "share", "write", "delete", "detach")}}
 
 

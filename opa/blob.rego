@@ -6,13 +6,14 @@ package lakehouse.blob
 #
 #   vend            input {subject, dataset: id}       broker: {allow, prefix} to read one dataset
 #   vend_write      input {subject, dataset: id}       broker: {allow, prefix} to write one dataset
+#   vend_delete     input {subject, dataset: id}       broker: {allow, prefix} to delete in one dataset
 #   discover        input {subject, datasets: [id]}    governance: {visible: [id], readable: [id]}
 #   allow_register  input {subject, prefix}            governance: may register at prefix
 #   allow_change    input {subject, dataset: id, grants: [grant]}
 #                                                      governance: may change these grants
 #   allow_change_root  input {subject, prefix}         governance: may change who owns this root
 #
-# An entry is {id, prefix, describe: [group], access: [group], share: [group], write: [group]}. A dataset can be
+# An entry is {id, prefix, describe, access, share, write, detach, delete: [group], sources}. A dataset can be
 # visible-but-not-readable: in `visible` and not in `readable`. An unknown id has no entry,
 # so it is denied exactly as a dataset the caller has no grant on.
 
@@ -46,6 +47,17 @@ vend_write := {"allow": true, "prefix": e.prefix} if {
 	}
 }
 
+# Deleting (WHITEPAPER 4.2): list and delete in the dataset's folder, granted by `delete` and,
+# like a table's `delete`, not cut by the sources its files carry. The credential reads and
+# writes nothing, so data that has become unreadable to everyone can still be removed. Listing
+# shows names, sizes, times and ETags (an MD5 of a single-part upload's contents).
+default vend_delete := {"allow": false}
+
+vend_delete := {"allow": true, "prefix": e.prefix} if {
+	e := _entries[input.dataset]
+	_holds(e.delete)
+}
+
 discover := {"visible": visible, "readable": readable}
 
 # `read` implies `describe`: a dataset a group may read is listed for it. Governance's dataset index
@@ -77,9 +89,9 @@ allow_register if {
 }
 
 # Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `share` on the dataset;
-# `share`, `write` and `detach` by a group owning a root above its prefix, the ownership
-# registration checks: `detach` decides how far the dataset's protection follows its data
-# (PROVENANCE.md 6.5), as `share` does.
+# `share`, `write`, `detach` and `delete` by a group owning a root above its prefix, the
+# ownership registration checks: `detach` decides how far the dataset's protection follows its
+# data (PROVENANCE.md 6.5), as `share` does.
 default allow_change := false
 
 allow_change if {
@@ -99,7 +111,7 @@ _may_change(e, g) if {
 }
 
 _may_change(e, g) if {
-	g in {"share", "write", "detach"}
+	g in {"share", "write", "detach", "delete"}
 	_owns_root(e.prefix)
 }
 

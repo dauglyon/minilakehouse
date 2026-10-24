@@ -113,6 +113,19 @@ JSON
 echo ">>> ensuring role ${BLOB_WRITE_ROLE}"
 ensure_role "$BLOB_WRITE_ROLE" "$BLOB_TRUST" blobwrite "$BLOB_WRITE_PERM"
 
+# The role the broker assumes for a dataset's `delete` grant: list and delete under datasets/,
+# never get or put, so `aws s3 rm --recursive` works and nothing is read or written.
+BLOB_DELETE_ROLE="${BLOB_DELETE_ROLE:-blob-deleter}"
+BLOB_DELETE_PERM=$(cat <<JSON
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::${BUCKET}/${BLOB_PREFIX}/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"],
+   "Condition":{"StringLike":{"s3:prefix":["${BLOB_PREFIX}/*"]}}}]}
+JSON
+)
+echo ">>> ensuring role ${BLOB_DELETE_ROLE}"
+ensure_role "$BLOB_DELETE_ROLE" "$BLOB_TRUST" blobdelete "$BLOB_DELETE_PERM"
+
 # --- Governance reader: a least-privilege S3 user the governance service uses to LIST
 # dataset prefixes (reconcile). It holds no rights of its own; the rgw-setup one-shot grants
 # it ListBucket on datasets/* via a bucket policy. So governance never holds the admin key. ---
