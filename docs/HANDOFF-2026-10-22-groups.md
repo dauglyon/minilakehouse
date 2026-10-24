@@ -327,8 +327,8 @@ another group's space. Its old path stops working.
 - **Who.** For a personal folder or table, the person whose space it is; for a plain group's,
   an owner or admin of that group. The caller is a member or above of the receiving group.
 - **Where.** The destination does not exist yet and is not inside a published dataset or
-  namespace, so a transfer reaches no one beyond the receiving group; publishing it is a
-  steward's separate act.
+  namespace. The moved data takes the grants of the folders or namespaces above its new path,
+  and publishing it is a steward's separate act.
 - **Files.** `POST /transfers {from, to}`. The broker copies each object with a server-side copy
   and deletes the original, under a session policy covering the old folder (get, list, delete)
   and the new one (put); governance keeps its read-only storage key. Ceph shares stored data

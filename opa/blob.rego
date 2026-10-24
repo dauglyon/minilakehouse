@@ -172,9 +172,9 @@ readable contains id if {
 # in nor holding a published dataset, so the move's credential reaches into none, out of the
 # subject's own personal space, or out of a plain group's space by one of its owners or admins, into the
 # space of a group the subject is a member or above of, other than a personal one, at a folder
-# that is not published and neither sits in nor holds a published dataset: a move reaches no one
-# beyond the receiving group, and publishing is a steward's act. Governance checks that the
-# destination holds nothing yet.
+# that is not published and neither sits in nor holds a published dataset. The moved folder takes
+# the grants of the folders above its new path, and publishing it is a steward's act. Governance
+# checks that the destination holds nothing yet.
 default allow_transfer := false
 
 allow_transfer if {
