@@ -404,6 +404,9 @@ CREATE TABLE IF NOT EXISTS transfers (
     session BIGINT REFERENCES sessions (id),  -- a folder's: the session its copies were logged in
     done_at TIMESTAMPTZ
 );
+-- A folder's transfer is under way until done or until the broker's credential for it expires;
+-- meanwhile nothing in or around either folder is published.
+ALTER TABLE transfers ADD COLUMN IF NOT EXISTS expires TIMESTAMPTZ;
 -- Stored sources (docs/PLAN-2026-10-24.md item 3e): what carried() last worked out for an
 -- entry, for its whole folder and for the files directly in it, with the entry's version then.
 -- Every change carried() reads from bumps the version of each entry it can change, in the
@@ -1399,8 +1402,11 @@ def internal_transfers():
             or not isinstance(body.get("expires"), int)):
         return jsonify({"error": "begin {person, sub, sid, from, to, expires} or done {transfer}"}), 400
     entries, _ = _file_entries([src, dst], would_be=True)
-    if src not in entries or not entries[src]["tracked"] or entries[src]["status"] == "moved":
-        return jsonify({"error": f"{src} cannot be moved"}), 409
+    if (src not in entries or not entries[src]["tracked"] or entries[src]["status"] == "moved"
+            or entries[src]["published"] or entries[src]["inside_published"] or entries[src]["contains_published"]
+            or entries[src]["inside_moved"]):
+        return jsonify({"error": f"{src} cannot be moved: it has moved, is published, or sits in or holds a "
+                                 "published dataset"}), 409
     if dst in entries and (entries[dst]["tracked"] and entries[dst]["status"] != "gone"
                            or entries[dst]["published"] or entries[dst]["inside_published"]
                            or entries[dst]["contains_published"] or entries[dst]["inside_moved"]):
@@ -1413,8 +1419,17 @@ def internal_transfers():
     list_folder(src, found)
     brought, marks = _brought(src)
     with db(commit=True) as cur:
-        cur.execute("INSERT INTO transfers (kind, from_id, to_id, by) VALUES ('files', %s, %s, %s) RETURNING id",
-                    (src, dst, body["person"]))
+        # Under the publishing lock, so a dataset published in or around either folder since the
+        # check above is seen, and none can be published there until the transfer ends.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_KEY,))
+        cur.execute("SELECT id FROM datasets WHERE published AND EXISTS (SELECT 1 FROM unnest(%s::text[]) p "
+                    "WHERE starts_with(prefix, p) OR starts_with(p, prefix)) LIMIT 1",
+                    ([f"datasets/{src}/", f"datasets/{dst}/"],))
+        if cur.fetchone():
+            return jsonify({"error": f"a dataset in or around {src} or {dst} is published"}), 409
+        cur.execute("INSERT INTO transfers (kind, from_id, to_id, by, expires) "
+                    "VALUES ('files', %s, %s, %s, to_timestamp(%s / 1000.0)) RETURNING id",
+                    (src, dst, body["person"], body["expires"]))
         tid = cur.fetchone()["id"]
         cur.execute("INSERT INTO sessions (person, name) VALUES (%s, %s) RETURNING id",
                     (body["person"], f"transfer {tid}: {src} -> {dst}"))
@@ -1980,6 +1995,12 @@ def publish_dataset(ds_id):
                     "OR starts_with(%(p)s, prefix)) ORDER BY id", {"i": ds_id, "p": row["prefix"]})
         if nested := [r["id"] for r in cur.fetchall()]:
             return jsonify({"error": f"{ds_id} is inside or contains a published dataset: {', '.join(nested)}"}), 409
+        # A folder being moved, or one in or around it, is published only after the move.
+        cur.execute("SELECT from_id FROM transfers t, unnest(ARRAY[t.from_id, t.to_id]) f WHERE t.kind = 'files' "
+                    "AND t.done_at IS NULL AND t.expires > now() AND (starts_with(%(p)s, 'datasets/' || f || '/') "
+                    "OR starts_with('datasets/' || f || '/', %(p)s)) LIMIT 1", {"p": row["prefix"]})
+        if moving := cur.fetchone():
+            return jsonify({"error": f"{ds_id} is in or around a folder being moved ({moving['from_id']})"}), 409
         own = {g: sorted(set(body[g])) if g in body else sorted(row["access" if g == "read" else g])
                for g in GRANTS}
         cur.execute("UPDATE datasets SET published = true, published_at = now(), steward = %s, "

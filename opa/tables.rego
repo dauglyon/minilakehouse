@@ -117,9 +117,10 @@ default allow_namespace := false
 
 allow_namespace if _holds(governance.holder(input.subject).write, namespace(input.id).write)
 
-# Recording a table's move, as blob.rego's allow_transfer for folders: out of the subject's
-# own personal space, or a plain group's space by its owners and admins, into the space of a
-# group they are a member or above of, outside every published namespace.
+# Recording a table's move, as blob.rego's allow_transfer for folders: a table in no published
+# namespace, out of the subject's own personal space, or a plain group's space by its owners and
+# admins, into the space of a group they are a member or above of, outside every published
+# namespace.
 default allow_transfer := false
 
 allow_transfer if {
@@ -128,6 +129,7 @@ allow_transfer if {
 	t := table(input.to)
 	f.status == "live"
 	t.status == "live"
+	not f.published
 	_may_send(h, f)
 	t.space != f.space
 	not startswith(t.space, "u_")

@@ -109,6 +109,7 @@ check("a tenant's folder is not moved", broker("/transfers", "alice", {"from": "
 check("nor into a folder that exists", broker("/transfers", "alice", {"from": work, "to": report}).status_code == 409)
 gov("PUT", f"/groups/{g}/stewards/alice", "carol")
 vend("alice", f"{g}/pubdest", "write")
+vend("alice", f"{g}/outer/pub/deep", "write")   # tracked before the dataset around it is published
 vend("alice", f"{g}/outer/pub", "write")
 for d in (f"{g}/pubdest", f"{g}/outer/pub"):
     gov("PATCH", f"/datasets/{d}", "alice", {"description": "published, empty"})
@@ -116,6 +117,9 @@ gov("DELETE", f"/groups/{g}/stewards/alice", "carol")
 check("nor into a published dataset, though it is empty",
       broker("/transfers", "alice", {"from": work, "to": f"{g}/pubdest"}).status_code == 403)
 check("nor into a folder holding one", broker("/transfers", "alice", {"from": work, "to": f"{g}/outer"}).status_code == 403)
+check("a published dataset is not moved out of a group that has since lost its steward",
+      broker("/transfers", "alice", {"from": f"{g}/pubdest", "to": f"{g2}/a"}).status_code == 403)
+check("nor a folder inside one", broker("/transfers", "alice", {"from": f"{g}/outer/pub/deep", "to": f"{g2}/b"}).status_code == 403)
 r = broker("/transfers", "alice", {"from": work, "to": moved})
 check(f"alice moves her personal folder into G ({r.status_code})", r.status_code == 200 and r.json()["objects"] == 1)
 check("the moved folder keeps its sources", carries(moved, src))
@@ -150,6 +154,15 @@ check("a move the copy does not carry is refused",
       gov("POST", "/transfers", "alice", {"from": old, "to": f"lakehouse.{g}.other"}).status_code == 409)
 check("someone else's move of it is refused",
       gov("POST", "/transfers", "carol", {"from": old, "to": new}).status_code == 403)
+gov("PUT", f"/groups/{g}/stewards/alice", "carol")
+gov("PATCH", f"/namespaces/lakehouse.{g}.pubns", "alice", {"description": "published"})
+gov("DELETE", f"/groups/{g}/stewards/alice", "carol")
+cat.create_namespace_if_not_exists((g, "pubns"))
+cat.create_table((g, "pubns", "p"), schema=schema)
+cat.create_namespace_if_not_exists((g2,))
+cat.create_table((g2, "pcopy"), schema=schema)
+check("a table in a published namespace is not moved",
+      gov("POST", "/transfers", "alice", {"from": f"lakehouse.{g}.pubns.p", "to": f"lakehouse.{g2}.pcopy"}).status_code == 403)
 r = gov("POST", "/transfers", "alice", {"from": old, "to": new})
 check(f"alice records the move ({r.status_code})", r.status_code == 200)
 check("carol now reads the copy", reads_table("carol", (g, "tt")))

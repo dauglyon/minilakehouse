@@ -167,8 +167,9 @@ readable contains id if {
 	_reads(e)
 }
 
-# Moving a folder (docs/HANDOFF-2026-10-22-groups.md section 1): out of the subject's own
-# personal space, or out of a plain group's space by one of its owners or admins, into the
+# Moving a folder (docs/HANDOFF-2026-10-22-groups.md section 1): an unpublished folder, neither
+# in nor holding a published dataset, so the move's credential reaches into none, out of the
+# subject's own personal space, or out of a plain group's space by one of its owners or admins, into the
 # space of a group the subject is a member or above of, other than a personal one, at a folder
 # that is not published and neither sits in nor holds a published dataset: a move reaches no one
 # beyond the receiving group, and publishing is a steward's act. Governance checks that the
@@ -180,6 +181,8 @@ allow_transfer if {
 	t := _pair[input.to]
 	f.tracked
 	_not_moved(f)
+	not f.published
+	count(f.inside_published) == 0
 	count(f.contains_published) == 0
 	_may_send(f)
 	t.space != f.space
