@@ -525,9 +525,12 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   another path is not covered and still needs the source's `read`.
 - **Read only.** A release grants `read`; the group cannot release the target further.
 - **Recorded, visible, withdrawable.** A release is stored with who requested and approved it
-  and when, shown to the source's `share` holders, and withdrawn by any of them; withdrawal
-  reaches the target and what was built from it at the next decision. A release stays when
-  its approver later loses `share` on the source.
+  and when, shown to the source's `share` holders, and withdrawn by any of them. A release
+  stays when its approver later loses `share` on the source.
+- **Withdrawing** works as losing `read` on the source does. At the next decision the target
+  closes to the group, and so does everything built from it that people read only through
+  the release, except a person's own copies in their private space (section 9), which stay
+  theirs unless the source's owners add them to its `revoked`.
 
 ## 7. What this enforces, decides, declares
 
