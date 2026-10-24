@@ -220,6 +220,24 @@ def writes(segments, body):
     return []
 
 
+def commit_locations(segments, body):
+    """{table id: location} for each table a commit gives a location, as completing a staged
+    create does with a set-location update. Other commits write the table's current folder."""
+    if segments[:3] != ["api", "catalog", "v1"] or len(segments) < 5:
+        return {}
+    catalog, rest = segments[3], segments[4:]
+    if len(rest) == 4 and rest[0] == "namespaces" and rest[2] == "tables":
+        changes = [(ident([catalog, *rest[1].split(SEP), rest[3]]), body.get("updates"))]
+    elif rest == ["transactions", "commit"]:
+        changes = [(ident([catalog, *(c.get("identifier") or {}).get("namespace", []),
+                           (c.get("identifier") or {}).get("name") or ""]), c.get("updates"))
+                   for c in body.get("table-changes") or []]
+    else:
+        return {}
+    return {t: u["location"] for t, updates in changes for u in updates or []
+            if isinstance(u, dict) and u.get("action") == "set-location" and isinstance(u.get("location"), str)}
+
+
 def vended(r):
     """(whether this catalog response hands out a storage credential, its expiry in epoch ms or
     None)."""
@@ -502,8 +520,11 @@ def proxy(_):
 
         written = writes(segments, body) if request.method == "POST" else []
         if written:
-            log_access(claims, [{"dataset": t, "kind": "table", "mode": "write", "expires": None}
-                                for t in written])
+            # Each write names the folder it writes when it names one, so that a staged create
+            # abandoned at one location never counts toward the table created later at another.
+            located = commit_locations(segments, body)
+            log_access(claims, [{"dataset": t, "kind": "table", "mode": "write", "expires": None,
+                                 "location": located.get(t)} for t in written])
         delegated = any(k.lower() == DELEGATION for k in headers)
         r = forward(raw, headers)
         if r.ok:
@@ -555,8 +576,15 @@ def proxy(_):
                 # A credential handed to someone who may write the table can write it, so its
                 # time is a time they could have written files (PROVENANCE.md 6.2).
                 can_write = mode == "read" and load.get("write") is True
+                # The folder the credential is scoped to (PROVENANCE.md 6.2): for a staged
+                # create, a location the table may never be created at.
+                try:
+                    location = ((r.json() if r.content else {}).get("metadata") or {}).get("location")
+                except ValueError:
+                    location = None
                 log_access(claims, [{"dataset": held, "kind": "table", "mode": mode,
-                                     "expires": expires, "can_write": can_write}])
+                                     "expires": expires, "can_write": can_write,
+                                     "location": location if isinstance(location, str) else None}])
         if "metadata" in loaded and load.get("history") is not True:
             keep = set(load.get("properties") or [])
             return current_only(r, keep) if table else current_view_only(r, keep)

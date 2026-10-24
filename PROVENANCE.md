@@ -412,6 +412,18 @@ included, and it protected only the seconds before the listing a write's notific
 triggers. Anyone holding a credential reads new files in the folder until it expires whatever
 governance knows, as with any grant change.
 
+A table write counts only where it can write (decided 2026-10-24). The gate logs each table
+credential with the folder it is scoped to, and a staged create's commit with the location it
+sets; a write counts toward a table if it names no location, the table's folder, or a location
+a commit the gate logged for the table names. Creating a table with `CREATE TABLE … AS SELECT`
+stages it at a new folder each attempt, and an attempt refused before its commit leaves a
+credential for a folder the table is never created at: counted, it held the table to that
+attempt's session for the credential's hour and refused every later attempt. A table whose
+creation report the gate failed to deliver has no folder in its entry; its creating commit's
+location still counts, so attribution stays closed. A create is therefore not refused for the
+sources its own attempt brings in: the table is created, and rule 3 cuts it once a listing
+finds its files.
+
 ### 6.3 What a declaration covers
 
 A person's declaration of a target covers their files in it that no earlier declaration of
@@ -747,6 +759,13 @@ attribution (4.2).
     entries deleted from the registry instead of marked `gone` left reads that named them,
     and a source with no entry admits no one, so alice could not write until they were put
     back as `gone`.
+16. Writes counted where they can write, run on the stack 2026-10-24. A credential planted for
+    `relx1` at a folder no commit names, in carol's session that had read `t1` directly, still
+    valid, no longer stopped carol creating `relx1` from a fresh session, and `relx1` carried
+    nothing that session had read. The creating commit was logged with its location. With
+    `relx1`'s folder blanked in its entry, as after a lost creation report, it carried the same
+    sources. alice's `relx2` built from `t1` stayed closed to carol, and lineage paired it with
+    `t1`.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions

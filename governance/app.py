@@ -236,6 +236,10 @@ ALTER TABLE accesses ADD COLUMN IF NOT EXISTS can_write BOOLEAN NOT NULL DEFAULT
 -- For each source a read brought in through the dataset read, the datasets it arrived through,
 -- once per path: {source: [[dataset, ...], ...]}. A release of any of them covers it (6.7).
 ALTER TABLE accesses ADD COLUMN IF NOT EXISTS marks JSONB;
+-- The folder a table write can write, when the gate knows it: a credential's location, or the
+-- location a staged create's commit sets. A write counts toward a table only if it names no
+-- location or the table's current one (6.2), so an abandoned staged create counts for nothing.
+ALTER TABLE accesses ADD COLUMN IF NOT EXISTS location TEXT;
 -- Releases (PROVENANCE.md 6.7): a target's share holder asks for a source's share holders to
 -- let a group read the target although the group may not read the source.
 CREATE TABLE IF NOT EXISTS releases (
@@ -565,12 +569,21 @@ FILE_TIME_SLACK = 2
 # notification triggers, and anyone holding a credential reads new files in the folder until it
 # expires whatever governance knows. A dataset whose folder cannot be listed counts every write
 # ever logged for it as having written a file.
+# Whether a logged write counts toward dataset %(t)s at folder %(loc)s: it names no location (a
+# file credential, a commit to an existing table), or the table's folder, or a location a commit
+# the gate logged for the table names, which covers a table whose creation report was lost. A
+# staged create abandoned before its commit was logged names a folder nothing else does.
+_COUNTS_SQL = """(location IS NULL OR location = %(loc)s OR location IN (
+          SELECT c.location FROM accesses c WHERE c.dataset = %(t)s AND c.mode = 'write'
+          AND c.expires IS NULL AND c.location IS NOT NULL))"""
+
 _CARRIED_SQL = """
 WITH f AS (
     SELECT key, last_modified AS lm FROM files WHERE dataset = %(t)s
 ), w AS (
     SELECT person, session, sid, at, expires IS NULL AS instant, COALESCE(expires, at) AS until
     FROM accesses WHERE dataset = %(t)s AND (mode = 'write' OR can_write)
+      AND """ + _COUNTS_SQL + """
 ), fw AS (
     SELECT f.lm, w.person, w.session, w.sid, w.at FROM f JOIN w
       ON f.lm BETWEEN w.at - %(tol)s * interval '1 second' AND w.until + %(tol)s * interval '1 second'
@@ -614,20 +627,23 @@ def carried(ds_id):
     that what it wrote, or did not, is settled by storage even if a notification was lost."""
     unlisted = _folder(ds_id) is None
     with db() as cur:
+        cur.execute("SELECT location FROM table_entries WHERE id = %s", (ds_id,))
+        location = (cur.fetchone() or {}).get("location")
         cur.execute("SELECT listed_at FROM folder_listings WHERE dataset = %s", (ds_id,))
         row = cur.fetchone()
         stale = row is None and not unlisted
         if row:
-            cur.execute("SELECT 1 FROM accesses WHERE dataset = %s AND (mode = 'write' OR can_write) "
-                        "AND COALESCE(expires, at) + %s * interval '1 second' > %s "
+            cur.execute("SELECT 1 FROM accesses WHERE dataset = %(t)s AND (mode = 'write' OR can_write) "
+                        "AND " + _COUNTS_SQL + " "
+                        "AND COALESCE(expires, at) + %(tol)s * interval '1 second' > %(listed)s "
                         "AND COALESCE(expires, at) < now() LIMIT 1",
-                        (ds_id, CLOCK_TOLERANCE, row["listed_at"]))
+                        {"t": ds_id, "loc": location, "tol": CLOCK_TOLERANCE, "listed": row["listed_at"]})
             stale = cur.fetchone() is not None
     if stale:
         list_folder(ds_id)
     with db() as cur:
         cur.execute(_CARRIED_SQL, {"t": ds_id, "tol": CLOCK_TOLERANCE, "slack": FILE_TIME_SLACK,
-                                   "unlisted": unlisted})
+                                   "unlisted": unlisted, "loc": location})
         return [{"id": r["source"], "declared": r["declared"], "paths": r["paths"]}
                 for r in cur.fetchall()]
 
@@ -838,6 +854,7 @@ def _accesses_valid(body):
                     and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write", "delete")
                     and (e.get("expires") is None or isinstance(e["expires"], int))
                     and isinstance(e.get("can_write", False), bool)
+                    and (e.get("location") is None or isinstance(e["location"], str))
                     for e in entries))
 
 
@@ -869,10 +886,11 @@ def record_accesses():
         session = _pointer(cur, body["person"], body["sid"], create=True)
         for i, e in enumerate(body["entries"]):
             cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires, "
-                        "sources, can_write, marks) VALUES (%s, %s, %s, %s, %s, %s, %s, "
-                        "to_timestamp(%s / 1000.0), %s, %s, %s)",
+                        "sources, can_write, marks, location) VALUES (%s, %s, %s, %s, %s, %s, %s, "
+                        "to_timestamp(%s / 1000.0), %s, %s, %s, %s)",
                         (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
-                         e["mode"], e.get("expires"), brought[i], e.get("can_write", False), marks[i]))
+                         e["mode"], e.get("expires"), brought[i], e.get("can_write", False), marks[i],
+                         e.get("location")))
         cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
         name = cur.fetchone()["name"]
     app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,
@@ -1288,7 +1306,11 @@ _LINEAGE_SQL = """
 WITH a AS (
     SELECT id, session, sid, dataset, kind, mode, at, COALESCE(sources, ARRAY[dataset]) AS sources,
            CASE WHEN kind = 'files' THEN COALESCE(expires, 'infinity') ELSE at END AS until
-    FROM accesses WHERE person = %(p)s
+    FROM accesses a WHERE person = %(p)s
+      AND (a.mode <> 'write' OR a.location IS NULL
+           OR a.location = (SELECT t.location FROM table_entries t WHERE t.id = a.dataset)
+           OR a.location IN (SELECT c.location FROM accesses c WHERE c.dataset = a.dataset
+                             AND c.mode = 'write' AND c.expires IS NULL AND c.location IS NOT NULL))
 ), reads AS (  -- each read once per source it brought in; direct for the dataset read
     SELECT a.id, a.session, a.sid, a.at, src.source, src.source = a.dataset AS direct
     FROM a CROSS JOIN LATERAL unnest(a.sources) AS src(source) WHERE a.mode = 'read'
