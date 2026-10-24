@@ -367,7 +367,7 @@ source's own grant at decision time, and a grant change takes effect at the next
 with nothing to recompute.
 
 OPA applies rule 3, not governance (decided 2026-10-22). Governance's lookups return a
-dataset's own grants and its carried sources, each with that source's own `read` and `manage`
+dataset's own grants and its carried sources, each with that source's own `read`
 and whether a declaration says it was used (`declared`) or it is there because a writer has
 not declared yet. The rules in `opa/tables.rego` (`readable`, `writable`) and
 `opa/blob.rego` (`_reads`, `vend_write`) do the cut, so how undeclared data is treated is policy: the shipped

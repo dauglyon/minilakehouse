@@ -663,13 +663,13 @@ def carried(ds_id):
 
 
 def _own_grants(ids):
-    """{id: {read, manage}} by each dataset's own grants, as groups: a table's write implies read."""
+    """{id: {read}} by each dataset's own `read`, as groups: a table's write implies read."""
     with db() as cur:
-        cur.execute("SELECT id, access AS read, manage FROM datasets WHERE id = ANY(%s)", (ids,))
-        own = {r["id"]: {"read": sorted(r["read"]), "manage": sorted(r["manage"])} for r in cur.fetchall()}
-        cur.execute("SELECT id, ARRAY(SELECT DISTINCT unnest(read || write)) AS read, manage "
+        cur.execute("SELECT id, access AS read FROM datasets WHERE id = ANY(%s)", (ids,))
+        own = {r["id"]: {"read": sorted(r["read"])} for r in cur.fetchall()}
+        cur.execute("SELECT id, ARRAY(SELECT DISTINCT unnest(read || write)) AS read "
                     "FROM table_entries WHERE id = ANY(%s)", (ids,))
-        own.update({r["id"]: {"read": sorted(r["read"]), "manage": sorted(r["manage"])} for r in cur.fetchall()})
+        own.update({r["id"]: {"read": sorted(r["read"])} for r in cur.fetchall()})
     return own
 
 
@@ -689,15 +689,15 @@ def _released(target, sources):
 
 
 def _with_sources(ds_id, entry):
-    """The entry as stored, with the sources its files carry: each source's own `read` and
-    `manage` grants, whether a declaration says it was used, and the groups released past it on
-    each path it arrived by. OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no
+    """The entry as stored, with the sources its files carry: each source's own `read` grant,
+    whether a declaration says it was used, and the groups released past it on each path it
+    arrived by. OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no
     entry has no grants, so it admits no one."""
     sources = carried(ds_id)
     own = _own_grants([c["id"] for c in sources])
     released = _released(ds_id, sources)
     return {**entry, "sources": [{"id": c["id"], "declared": c["declared"], "released": released[c["id"]],
-                                  **own.get(c["id"], {"read": [], "manage": []})} for c in sources]}
+                                  **own.get(c["id"], {"read": []})} for c in sources]}
 
 
 def reconcile(ds_id):

@@ -348,7 +348,7 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   time, and attributes each file to the write credentials and commits valid at that time,
   so a file carries what its writers had read before writing it, minus what they declared
   unused. The lookups OPA makes return each dataset's own grants and the sources its files
-  carry, with each source's own `read` and `manage` and whether a declaration says it was used;
+  carry, with each source's own `read` and whether a declaration says it was used;
   OPA's rules let a person read or write only if they may also read every
   source or a release covers them (`PROVENANCE.md` 6.7), and change `describe` and `read` with
   `manage` on the entry itself; a source's own `manage` holders decide releases past it.

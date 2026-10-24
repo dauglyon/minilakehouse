@@ -365,7 +365,7 @@ another group's space. Its old path stops working.
 - Entries gain status `moved` and `moved_to`. `transfers (id, kind, from_id, to_id, by, at)`.
 - `revoked`: a per-source set of groups beside the six grants, changed by the source's
   stewards, recorded and shown to its `manage` holders as detaches are; governance's lookups
-  return it with each source's `read` and `manage`.
+  return it with each source's `read`.
 
 ### OPA
 - `opa/governance.rego`: `/internal/groups/<subject>` returns the subject's groups with role
@@ -481,7 +481,7 @@ enumeration is added.
   namespace's (`lakehouse.db.t1` gets `lakehouse.db` and `lakehouse`). Add `own` (the table's
   own sets) and `inherited_from` ({group: namespace} per set) beside them, for the read API
   and UI only; rules use the effective sets.
-- `_own_grants` (`governance/app.py`), which supplies each carried source's `read` and `manage`
+- `_own_grants` (`governance/app.py`), which supplies each carried source's `read`
   for provenance narrowing (`_with_sources`, `PROVENANCE.md` 6, rule 3), returns the same
   effective sets. Otherwise a source granted only through its namespace admits nobody to
   anything derived from it, though people can read the source itself.
@@ -843,7 +843,7 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
 - A dataset's effective `describe` and `read` are its own, those of the folders or namespaces
   above it, and those of every collection containing it directly or through other collections.
   Governance serves these effective sets, as section 2 does for namespaces, both for the entry
-  and for each carried source's `read` and `manage` in rule 3's lookups.
+  and for each carried source's `read` in rule 3's lookups.
 - Sources still apply. Reading a member through a collection is restricted by that member's
   sources as reading it directly is; only a release (`PROVENANCE.md` 6.7) gets past a source.
 - The access log records the dataset read, never the collection, so lineage and declarations

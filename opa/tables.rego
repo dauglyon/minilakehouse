@@ -162,7 +162,7 @@ _parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
 }
 
 # A table's grants, and the sources its files carry (PROVENANCE.md 6, rule 3). Governance's
-# entry lists each source with its own `read` and `manage` grants, whether a declaration says it
+# entry lists each source with its own `read` grant, whether a declaration says it
 # was used (`declared`) or it is there because a writer has not declared yet, and `released`:
 # for each path the source arrived by, the groups a release lets past it (6.7). The shipped
 # rules treat declared and undeclared alike: a person may read or write the table only if, for
