@@ -156,6 +156,9 @@ read-only (TAC README.md:14).
 
 ### Contradictions with sections 1-4
 
+Section 1 was rewritten on 2026-10-24 to follow these findings; the items below are what its
+first version assumed.
+
 **Section 1.**
 - Self-serve creation: only platform admins create tenants (management.py:491-501).
 - "One role, admin, at least one": BERDL has 0..n stewards assigned only by platform admins,
@@ -226,115 +229,213 @@ read-only (TAC README.md:14).
 - UI labels in tenant-data-browser and berdl_access_request_extension.
 - No tests or code were run.
 
-## Goal
+# Section 1 — groups, tenants and spaces
 
-Make the group model match how the platform's **tenants** already work, and make it
-self-serve, like GitHub orgs:
+Rewritten 2026-10-24 from the findings above. Prior art: Google Groups for owners, managers
+(here admins) and members; BERDL for stewards appointed by platform admins and for read-only
+members; Dataverse, where contributors deposit and curators publish, for separating work in a
+space from publishing it; Google Drive's move from My Drive into a shared drive for transfers.
 
-- Any user may create a group.
-- A group has **members** and one role, **admin**. At least one admin at all times.
-- A group that owns a root (`datasets/<name>/`, `<catalog>.<namespace>`) is a **tenant**.
-  Its admins are what the source material calls **data stewards**: they register datasets
-  under the root, change grants on them, and hand sub-roots to other groups.
-- A group that owns no root is a plain consumer group (a grant target). Same kind of thing.
-- Every user has a personal space, modelled as a group of one that owns their personal root.
+## Roles
 
-"Steward" stops being a global capability and becomes "admin of a group that owns a root".
+Each role is held in one group. A person is an owner, admin, member or viewer of a group, and
+can also be its steward.
 
-## What to verify first (needs org access)
+| Role | May |
+|---|---|
+| Owner | everything an admin may; delete the group; add and remove owners and admins |
+| Admin | add and remove members and viewers; delete in the group's space; see declarations that mark the space's folders unused |
+| Steward | in a tenant: publish from its space, change grants there, add and remove members and viewers. Appointed and removed by platform admins only |
+| Member | read and write the group's space; transfer folders and tables into it |
+| Viewer | read the group's space |
 
-Read, at `KBaseDataLakehouse/*` on `main`: `minio_manager_service`, `trino_access_control`,
-`berdl_docs`, `spark_notebook` (`notebook_utils/.../spark/database.py`,
-`create_namespace_if_not_exists`), and whatever holds tenant administration. The earlier review
-(root `HANDOFF.md`) read these on 2026-10-19. Confirm or correct:
+- Owner includes admin, admin includes member, member includes viewer. A steward is a member
+  or above.
+- A group always has at least one owner; a change that would leave none is refused.
+- A viewer never holds `write`. A grant naming a group gives `describe` and `read` to everyone
+  in it, and every other grant to its members and above. Viewers are BERDL's read-only members.
+- **Platform admins** hold no role in any group. They appoint and remove stewards, act for a
+  tenant that has none, and act in emergencies. How a person is marked as one is open (below).
 
-1. A tenant is one Iceberg catalog and one object-store prefix
-   (`tenant-general-warehouse/<tenant>/`), and its members get read on the whole catalog.
-2. There is a tenant-admin role, decided by the governance service. Who may create a tenant?
-   Who may grant admin? Can a tenant have more than one admin?
-3. Personal space is `my.u_<user>__<dataset>` (tables) and a per-user prefix (files). Who else
-   can be given read on it, if anyone?
-4. Whether any role exists between admin and member (e.g. writer). If so, record it; do not
-   add it here yet.
-5. The names actually used (tenant, admin, owner, steward, member) so the UI can use them.
+## Groups and tenants
 
-Record findings at the top of this file before changing code.
+- Any signed-in person may create a group, and becomes its owner.
+- Names follow BERDL's rule (MMS src/s3/utils/validators.py:117-179): 2 to 64 lowercase letters
+  and digits, starting with a letter. Reserved: BERDL's list (`admin`, `root`, `system`, `all`,
+  `everyone`, `public`, `default`, `minio`, `service`, `backup`, `warehouse`) and `governance`,
+  the namespace the gate answers itself (`gate/app.py:72`). BERDL's refusal of tenant names
+  ending in `ro` (validators.py:182-205) is not adopted: it protects the `<t>ro` group BERDL
+  creates for read-only members, which viewers replace.
+- Every group has a space: the folder `datasets/<group>/` and the namespace
+  `lakehouse.<group>`. Creating a group writes nothing to storage; a folder is tracked from its
+  first write credential (section 3).
+- A group with at least one steward is a **tenant**. A member asks; a platform admin appoints.
+  Only stewards publish or change grants in a space, so a group without one cannot open its
+  space to anyone outside it.
+- When a tenant's last steward leaves, its published datasets stay published with their grants.
+  Nothing is published and no grant changes until a platform admin appoints a steward or acts
+  for the group. BERDL lets a tenant run with no steward the same way (tenant_manager.py:648-657).
 
-## Changes to make
+## Default grants in a space
+
+Grants name groups, and a role within a group as `<group>#<role>`, the notation Zanzibar and
+SpiceDB use for the members of a relation. A space's defaults, which folder grants (section 3)
+and publishing add to:
+
+| Grant | Default |
+|---|---|
+| `describe`, `read` | `<g>`: viewers and above |
+| `write` | `<g>`: members and above |
+| `delete` | `<g>#admin` |
+| `share` | `<g>#steward` |
+| `detach` | empty |
+
+Changing `share`, `write`, `delete`, `detach` or `revoked` anywhere in a space takes a steward of
+its group; changing `describe` and `read` takes `share`, as now.
+
+## Why a plain group's space reaches no one outside the group
+
+- Nobody in it holds `share`, and changing its grants or publishing takes a steward.
+- Rule 3 limits anything built from it, wherever written, to people who can read the folder it
+  came from: the group's viewers and above.
+- Who is in the group decides who reads it, and only owners and admins change that.
+- What remains is what every dataset has (`PROVENANCE.md` 7 and 8): a member can download, or
+  declare a read of the space unused, which the shipped policy accepts for a direct read
+  (`PROVENANCE.md` 6.5). A declaration marking a source unused is shown to the source's `share`
+  holders and, for a folder or table in a space, to its group's admins: a plain group's space
+  has no `share` holders.
+
+## Personal spaces
+
+- On a person's first appearance (`POST /principals/me`), governance creates the group
+  `u_<user>` with them as its only owner. No one else can be added, it can have no steward, and
+  nothing in it is published or granted to anyone else. No created group can take the name: the
+  name rule refuses underscores.
+- The personal-space exemption and `revoked` (`PROVENANCE.md` 9) apply in personal spaces only.
+- A person shares from their space by transferring a folder or table: to a group, for its
+  members, or to a tenant, for a steward to publish.
+
+## Transfers
+
+A transfer moves a folder or a table from a personal space or a plain group's space into
+another group's space. Its old path stops working.
+
+- **Who.** For a personal folder or table, the person whose space it is; for a plain group's,
+  an owner or admin of that group. The caller is a member or above of the receiving group.
+- **Where.** The destination does not exist yet and is not inside a published dataset or
+  namespace, so a transfer reaches no one beyond the receiving group; publishing it is a
+  steward's separate act.
+- **Files.** `POST /transfers {from, to}`. The broker copies each object with a server-side copy
+  and deletes the original, under a session policy covering the old folder (get, list, delete)
+  and the new one (put); governance keeps its read-only storage key. Ceph shares stored data
+  between an object and its copy in the same bucket: measured 2026-10-24 on this stack, the copy
+  of a 64 MiB object left the data pool at 64 MiB, and read back intact after the original was
+  deleted and garbage collection forced (`radosgw-admin gc process --include-all`). The broker's
+  credentials are logged as a read of the old folder and a write of the new one, in a session of
+  the caller's own for the transfer, so the listing (`PROVENANCE.md` 6.2) attributes the copies
+  to that session and rule 2 gives each copy everything the old folder carried. Every moved file
+  therefore carries every source any file in the folder carried. Reading the moved folder brings
+  in the same sources as reading the old one did; removing a source that only one file carried takes a declaration
+  (`PROVENANCE.md` 6.4) instead of deleting that file.
+- **Tables.** The caller copies the table with `CREATE TABLE <to> AS SELECT * FROM <from>`,
+  posts `POST /transfers {from, to}`, and drops the original. The copy loses the original's
+  version history and every setting the `CREATE` does not restate: partitioning, sort order,
+  comments. It carries the original as a source, so without the record below only the
+  original's readers could read it.
+- **The record.** The old entry stays, with status `moved` and `moved_to` naming the new one.
+  Governance's lookups follow `moved_to` for every carried source, so data built from the old
+  folder or table, wherever it is, is checked against the new one's grants; the new one carrying
+  the old as a source is then a dataset carrying itself, which changes nothing
+  (`PROVENANCE.md` 6.1). The broker refuses a credential for a moved folder; the refusal names
+  the new path to anyone who may describe it, and is the ordinary refusal for everyone else.
+- A personal folder's transfer ends the personal-space exemption for its data.
+
+## Changes
 
 ### Schema (`governance/app.py`)
-- `group_members (grp, member)` gains `role text not null check (role in ('admin','member'))`.
-- Drop `group_owners`. Migrate seed: `governance/registry.json` `group_owners` → the owning
-  group's members become admins of the owned group. Seed should end with:
-  `jgi-writers`: alice admin; `projw-team`: carol admin; `stewards`, `no-access`,
-  `group-admins`: carol admin.
-- Drop `register_grants` and the `stewards` group once rego no longer reads them.
+- `groups (name PRIMARY KEY, created_by, created_at)`.
+- `group_members (grp, member, role, steward)`: `role` in `owner`, `admin`, `member`, `viewer`;
+  `steward` a boolean, changed by platform admins only, and only for a member or above.
+- Drop `group_owners`, `register_grants`, `namespace_owners` and the `stewards` group: a
+  group's space follows from its name.
+- Entries gain status `moved` and `moved_to`. `transfers (id, kind, from_id, to_id, by, at)`.
+- `revoked`: a per-source set of groups beside the six grants, changed by the source's
+  stewards, recorded and shown to its `share` holders as detaches are; governance's lookups
+  return it with each source's `read` and `share`.
 
-### Rego
-- `opa/groups.rego`: `allow_create` true for any authenticated subject. `allow_change`:
-  caller is an admin of the group. Add `is_admin(subject, group)` for the other packages.
-- `opa/blob.rego` / `opa/tables.rego`: `allow_register` = caller is admin of a group owning a
-  root above the prefix/namespace (drop the `"stewards" in _groups` conjunct). `allow_change`
-  for `share`/`write`/`delete`/`detach` = admin of an owning group (not any member).
-  `describe`/`read` changes stay with `share` holders.
-- `allow_change_root`: unchanged in shape; "owner of a root above" means admin of a group
-  owning it. `group-admins` keeps top-level assignment.
-- `opa/governance.rego`: fetch `/internal/groups/<subject>` with roles, or add
-  `/internal/admin-of/<subject>`.
-- Private-space exemption (`PROVENANCE.md` 9): in `opa/blob.rego` (`_reads`, `vend_write`)
-  and `opa/tables.rego` (`readable`, `writable`), an entry under the subject's own personal
-  root skips the sources check, unless one of the subject's groups is in a carried source's
-  `revoked`. `revoked` is a new per-source set of groups beside the six grants, changed by the source's root owners as `share` and `detach`
-  are, recorded and shown to its `share` holders like detaches; governance's lookups return it
-  with each source's `read` and `share`.
+### OPA
+- `opa/governance.rego`: `/internal/groups/<subject>` returns the subject's groups with role
+  and steward flag, as the names grants use (`<g>`, `<g>#admin`, `<g>#steward`) in two lists:
+  those the subject reads through and those they write through, a viewer's groups left out of
+  the second. `write` is checked against the second.
+- `opa/groups.rego`: `allow_create` for any signed-in subject (governance checks the name).
+  `allow_change`: owners change owners and admins; owners, admins and, in a tenant, stewards
+  change members and viewers; platform admins change stewards.
+- `opa/blob.rego`, `opa/tables.rego`: drop `allow_register`, `allow_change_root` and the
+  `stewards` conjunct. The space defaults above join each entry's effective grants (sections 2,
+  3 and 5). `allow_change` for `share`, `write`, `delete`, `detach` and `revoked`: a steward of
+  the group whose space holds the entry. `allow_transfer {subject, from, to}` as above.
+- Personal-space exemption (`PROVENANCE.md` 9): in `_reads` and `vend_write` (`opa/blob.rego`)
+  and `readable` and `writable` (`opa/tables.rego`), an entry in the subject's own personal
+  space skips the sources check, unless one of the subject's groups is in a carried source's
+  `revoked`.
 
 ### Governance API
-- `POST /groups`: body `{name}`. Caller becomes the first admin and member. Owners/members in
-  the body are ignored (or refused). Keep the name-in-use check (grants, roots, and now
-  reserved names).
-- `PATCH /groups/<name>`: `{members: {add, remove}, admins: {add, remove}}`. Refuse a change
-  that leaves no admin. Admin implies member.
-- Decide: does creating group `X` also assign it `datasets/X/` and `lakehouse.X`? If yes,
-  do it in the same transaction and extend the name-in-use check to roots. If no,
-  `group-admins` assigns top-level roots as today. Verification item 2 decides this.
-- Reserved names: a list in `.env` or `registry.json` (`kbase`, `my`, `governance`, `u_*`,
-  `datasets`, `warehouse`). Refuse creating a group with one.
-- Personal space: on a person's first appearance (`POST /principals/me` already runs then),
-  create group `u_<user>` with them as admin, owning `datasets/u_<user>/` and `my.u_<user>`,
-  if that matches item 3.
-- Default grants at registration: a dataset registered under a tenant's root defaults to
-  `read: [<tenant>]`, `share: [<tenant>]`. Make this the default the caller may override in
-  the request body, not a rego rule; the registry stays the only truth. Confirm against item 1.
+- `POST /groups {name}`: the caller becomes its owner. Refused for a name in use, reserved or
+  outside the rule.
+- `PATCH /groups/<name>`: `{owners, admins, members, viewers: {add, remove}}`. Refuse a change
+  that leaves no owner.
+- `PUT` and `DELETE /groups/<name>/stewards/<person>`: platform admins.
+- `DELETE /groups/<name>`: owners.
+- `POST /principals/me` also creates the personal group.
+- `POST /transfers {from, to}`.
+- `governance.derivations` shows a declaration marking a source unused to the admins of the
+  group whose space holds the source, besides its `share` holders.
 
-### Read side (prerequisite for any UI; new)
+### Read side (prerequisite for any UI)
 Governance has no `GET` routes. Add, each narrowed by the same predicates as the writes:
-- `GET /me` → groups with my role in each; roots those groups own; whether I am in
-  `group-admins`.
-- `GET /groups/<name>` → members with roles, roots owned. Visible to members.
-- `GET /datasets/<id>`, `GET /tables/<id>` → the entry with declared grants, effective `read`
+- `GET /me`: my groups with my role in each and whether I am its steward; whether each is a
+  tenant; whether I am a platform admin.
+- `GET /groups/<name>`: owners, admins, members, viewers and stewards; transfers in and out.
+  Visible to its viewers and above.
+- `GET /datasets/<id>`, `GET /tables/<id>`: the entry with declared grants, effective `read`
   after provenance narrowing, status. Visible if `describe` passes. For a caller who may
   describe it but not read it, why (decided 2026-10-23): the carried sources they may not read,
   each named only if they may describe it, and any release of it to them that was withdrawn.
-- `GET /roots/<kind>/<id>` → owning groups and immediate children. Visible to an admin of an
-  owning group or one above.
 
 ### Docs and seed
-- Update `README.md` sections "Changing groups", "Assigning roots", the `stewards` mentions,
-  and the registration demo. Update `DESIGN.md` 4.4 and `WHITEPAPER.md` 4.2–4.4 where they
-  say "each group has owners, which are groups".
+- Seed: `jgi-writers` becomes `jgi` (alice owner and steward); `projw-team` becomes `projw`
+  (carol owner and steward); `no-access` becomes `noaccess` (bob owner); `bob-only` becomes
+  `bobonly`, with no members; `stewards` goes. Seed datasets and tables move into their group's
+  space, `datasets/projy/secret/` into `bobonly`'s, so that it stays invisible to everyone.
+- Update `README.md` sections "Changing groups", "Assigning roots", the `stewards` mentions and
+  the registration demo; `DESIGN.md` 4.4 and `WHITEPAPER.md` 4.2-4.4 where they say "each group
+  has owners, which are groups".
 - `seed/check-index-narrowing.py` and the README demos must still pass.
 
-## Out of scope here
+## Open
+- How platform admins are marked: the seed group `group-admins`, renamed under the name rule,
+  or a Keycloak realm role, as BERDL uses a KBase auth role (findings, item 2).
+- Deleting a group whose space holds data.
+
+## Out of scope
 - On-behalf-of tokens for the ingest pipeline (Keycloak token exchange). Pipelines act as
   subjects in groups for now.
-- A separate writer role between admin and member.
+- Transfers out of a tenant.
 - The web UI itself. The read routes above are its only server-side prerequisite.
 
-## Decisions already taken (do not reopen)
-- `group-admins` stays a small human group: break-glass, reclaiming abandoned roots,
-  top-level roots not named after a group.
+## Decided
+- Roles: owner, admin, steward, member, viewer, held per group; platform admins outside groups.
+- Anyone creates a group, and every group has a space; a steward appointed by a platform admin
+  makes it a tenant, and only a tenant publishes.
+- A tenant whose last steward leaves keeps its published datasets and grants, frozen until a
+  platform admin acts.
+- Personal spaces publish nothing and share only by transfer.
+- Transfers move files by server-side copy and tables by `CREATE TABLE … AS SELECT`, keeping a
+  record from the old entry to the new; only members and above of the receiving group transfer
+  in.
+- BERDL's name rule and reserved names, plus `governance`, without the `ro` rule.
 - The governance API takes a person's token only. No service lane.
-- One role (admin), not owner + steward. Split later if a need appears.
 
 ---
 
@@ -386,8 +487,8 @@ enumeration is added.
 
 ### API
 - `PATCH /permissions/namespace/<id>`: new kind. `describe`/`read` change for a group holding
-  the namespace's `share`; `share`/`write`/`delete`/`detach` for an admin of a group owning
-  the namespace or one above (section 1's role model).
+  the namespace's `share`; `share`/`write`/`delete`/`detach` for a steward of the group whose
+  space holds the namespace (section 1).
 - `POST /tables`: accept a list of entries in one request, all under one namespace, in one
   transaction. Grants on each are optional and default to empty (inherit only). Registering
   from an ingest config's table list is the intended use.
@@ -398,7 +499,7 @@ enumeration is added.
 - No other rule changes.
 
 ### Read API (section 1) additions
-- `GET /namespaces/<id>`: its own grants, owners, tables under it with status and whether each
+- `GET /namespaces/<id>`: its own grants, the group whose space holds it, tables under it with status and whether each
   has grants of its own. This is the steward's day-to-day page.
 - `GET /tables/<id>`: returns `grants` (effective), `own`, `inherited_from`.
 
@@ -409,10 +510,10 @@ enumeration is added.
 - Tables created later under a namespace inherit at once (Snowflake's "future grants" for free).
 - Provenance narrowing applies to effective `read`: a namespace grant does not let a group read
   a table derived from sources it may not read.
-- A group's root and namespace give its members `describe` and its admins `delete` by default
-  (decided 2026-10-23). Sources narrow neither, so a dataset in a group space that rule 3 has
-  closed, for instance after a release is withdrawn (`PROVENANCE.md` 6.7), stays listed for the
-  group's members and removable by its admins.
+- A group's space gives its viewers and above `describe` and its admins `delete` by default
+  (decided 2026-10-23; section 1's defaults). Sources narrow neither, so a dataset in a group
+  space that rule 3 has closed, for instance after a release is withdrawn (`PROVENANCE.md`
+  6.7), stays listed for the group's viewers and above and removable by its admins.
 
 ### Later, same shape
 - Blobs: `root_grants` on `datasets/<root>/`, unioned into `/internal/datasets` the same way.
@@ -454,13 +555,13 @@ comes after.
   description, no grants of its own. Governance tracks its files from then on, as it tracks a
   dataset today. Folders nobody has written into are not tracked, and nothing scans the
   bucket (`DESIGN.md` 2: "neither enumerates the whole bucket").
-- **Before publishing, a folder is reached through its space's grants** (the root's, section
-  1; by default the owning group), and rule 3 restricts it by what its files were made from,
+- **Before publishing, a folder is reached through its space's grants** (section 1's
+  defaults: the group's viewers and above read, its members write), and rule 3 restricts it by what its files were made from,
   as for any entry. Publishing gives it a description and grants of its own.
 - **Grants on folders** (decided 2026-10-24). Grants can be set on any folder in a space and
   are inherited by every entry under it, published or not, as namespace grants are in section
-  2: an entry's grants are its own, every folder's above it, and its space's. The space's admins
-  change them (section 1's role model), and an inherited `detach` narrows as section 2 says.
+  2: an entry's grants are its own, every folder's above it, and its space's. The group's stewards
+  change them (section 1), and an inherited `detach` narrows as section 2 says.
   Section 2's "later, same shape" grants on file roots become grants on any folder.
 - **Tables are published as namespaces** (decided 2026-10-24). Publishing a namespace makes it
   one dataset of its tables, with one description and one set of grants; a single table is not
@@ -531,7 +632,7 @@ not for every file. No storage listing is needed for browsing.
   does now) before the credential is logged.
 - `governance/app.py` `/events`: a key under a tracked folder is recorded for it; any other key
   stays ungoverned and logged. Publishing is `PATCH /datasets/<id>` on an entry: description
-  and own grants, allowed for an admin of a group owning the space, refused for a folder inside
+  and own grants, allowed for a steward of the group whose space holds it, refused for a folder inside
   or containing a published dataset. Sources are declared as today (`governance.derivations`).
 - Schema: `datasets.published BOOLEAN NOT NULL DEFAULT false`; `status` keeps `live|gone`.
   Drop `register_grants`.
@@ -539,8 +640,8 @@ not for every file. No storage listing is needed for browsing.
   rather than working them out on every decision (scale; today's per-decision cost too).
 
 ### Tables
-- `opa/tables.rego`: `allow_create` allows an admin of a group owning the namespace or one
-  above (drop the `pending` entry requirement). Drop `allow_register`.
+- `opa/tables.rego`: `allow_create` allows a member or above of the group whose space holds
+  the namespace (drop the `pending` entry requirement). Drop `allow_register`.
 - `gate/app.py`: reports created tables as now; governance records the table under its
   namespace, with status `live`. `POST /tables` goes away; `PATCH /namespaces/<id>` publishes a
   namespace: description and grants, refused inside or around another published namespace.
@@ -745,7 +846,7 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
 ## Membership
 
 - Adding a dataset or a collection takes `write` on the receiving collection and `share` on what
-  is added: its owners decide whether it joins.
+  is added: its `share` holders decide whether it joins.
 - Consent reaches through nesting: joining a collection trusts its `share` holders, including to
   place it inside larger collections, as the old design's chain of grants did. A dataset's
   `share` holders see every collection it reaches and can remove it from any collection that
@@ -754,9 +855,9 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
 
 ## Ownership
 
-- A collection belongs to a group; that group's admins hold `share` and `delete` on it, as for
-  datasets in its space (section 1's role model). A collection can hold datasets from other
-  groups' spaces when their owners agree, which shares across tenants.
+- A collection belongs to a group; that group's stewards hold `share` and its admins `delete`
+  on it, as for datasets in its space (section 1). A collection can hold datasets from other
+  groups' spaces when their `share` holders agree, which shares across tenants.
 
 ## Changes
 
@@ -765,7 +866,7 @@ Example: the collection `pangenome` holds the namespace `kbase.pangenome` (table
   on adding; `POST /collections`, `PATCH /collections/<id>` (description and grants),
   `POST` and `DELETE /collections/<id>/members/<member>`; `GET /collections/<id>` in the read API.
 - OPA: `collections.allow_change` (`describe` and `read` by `share` holders; `share`, `write`
-  and `delete` by the owning group's admins), `allow_add` (`write` on the collection and `share`
+  and `delete` by the owning group's stewards), `allow_add` (`write` on the collection and `share`
   on the member) and `allow_remove`.
 - Lookups: effective sets include collections, as above.
 - Index: `governance.datasets` lists collections (kind `collection`) to their `describe`

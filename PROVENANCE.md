@@ -546,8 +546,8 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   stays when its approver later loses `share` on the source.
 - **Withdrawing** works as losing `read` on the source does. At the next decision the target
   closes to the group, and so does everything built from it that people read only through
-  the release, except a person's own copies in their private space (section 9), which stay
-  theirs unless the source's owners add them to its `revoked`.
+  the release, except a person's own copies in their personal space (section 9), which stay
+  theirs unless they are added to the source's `revoked` (section 9).
 - **How it is carried.** A read records, for each source it brings in, the datasets the source
   arrived through on each path. Governance's lookups give OPA, for each source a dataset
   carries, the groups released past it on each path: releases on the dataset itself or on any
@@ -617,37 +617,39 @@ dataset.
 
 ## 9. Open
 
-**Project folders.** Decided 2026-10-22: a project folder is scratch, not a dataset, and a file
-written into it is not a registered output. Section 6 applies to scratch files like any
-other: a scratch file carries what its writer had read, and reading it brings that in, which
-closes the path from one session to another through scratch. Work in scratch becomes a
-dataset by being written into a registered dataset's own folder, and those files carry what
-the scratch files carried. No dataset sits inside another or inside a project folder:
-nesting was rejected because a parent's write credential reaches the child's files, and
-reading one's own project folder would make the whole project a source of the child.
+**Scratch.** Scratch is any folder in a space that is not published
+(`docs/HANDOFF-2026-10-22-groups.md` sections 1 and 3), in a person's personal space or in a
+group's. Section 6 applies to scratch files like any other: a scratch file carries what its
+writer had read, and reading it brings that in, which closes the path from one session to
+another through scratch. Work in scratch becomes a dataset when a steward publishes its folder or
+namespace in a tenant's space, where it was written or after a transfer into it; publishing
+copies nothing. Published datasets do not nest, and no credential for a folder reaches into a
+published dataset under it (the handoff's section 3): otherwise the folder's write credential
+would reach the dataset's files, and a person who read the folder and then wrote the dataset
+would make the whole folder a source of it. Each folder written into is an entry of its own, so
+what follows applies folder by folder.
 
-Decided 2026-10-23: scratch is per person. Each person has a default group with themselves
-as its only member, which owns their private space (the personal space in
-`docs/HANDOFF-2026-10-22-groups.md` section 1; its name in a UI is not settled, "My Data" is a
-candidate). Each folder in it that the person writes into is an entry of its own, published
-or not (the handoff's section 3), so what follows applies folder by folder.
+**Personal spaces.** Decided 2026-10-23 and 2026-10-24. Each person has a group with themselves
+as its only member, which owns their personal space (the handoff's section 1; its name in a UI
+is not settled, "My Data" is a candidate). Nothing in it is published or granted to anyone
+else; the person shares a folder or table by transferring it to a group or a tenant (the
+handoff's section 1).
 
-- The person's own reads and writes in their private space are not cut by rule 3. They could
+- The person's own reads and writes in their personal space are not cut by rule 3. They could
   read every source their files carry when they wrote them; losing `read` on a source later
-  leaves them their own copies, as a download would. Everyone else is cut there as anywhere:
-  whoever the person shares a folder with is held to its sources unless a release (6.7) covers
-  them.
-- A source's root owners can take a person's own copies back. Each source has `revoked`, a
-  set of groups; for anyone in one of them the exemption does not apply to
-  anything carrying that source, private space included. One person is named through their
-  group of one. Additions are recorded with who made them and when, shown to the source's
-  `share` holders, and reversible, as detaches are (6.5). Credentials already handed out last
-  until they expire, and files the person downloaded are out of reach (section 8).
+  leaves them their own copies, as a download would. A transfer ends this for what it moves:
+  in its new space rule 3 applies to them as to everyone.
+- A source's stewards can take a person's own copies back. Each source has `revoked`, a set of
+  groups; for anyone in one of them the exemption does not apply to anything carrying that
+  source, personal space included. One person is named through their group of one. Additions
+  are recorded with who made them and when, shown to the source's `share` holders, and
+  reversible, as detaches are (6.5). Credentials already handed out last until they expire,
+  and files the person downloaded are out of reach (section 8).
 - The exemption is a rule in OPA. A deployment that wants losing `read` on a source to reach
   every copy derived from it, as Palantir Foundry's markings do, turns it off.
 
-A shared folder would lock out any member who may not read a source another member's files
-carry, which is why scratch is not shared.
+**Group spaces.** A member who may not read a source another member's files carry is cut from
+the folders holding those files, and from no other folder in the space.
 
 
 
