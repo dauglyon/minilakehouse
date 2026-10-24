@@ -378,7 +378,14 @@ Build step 1 of `PROVENANCE.md`. Governance logs every dataset credential handed
 and every table write, stamped with the session the person's login points at, before the gate
 or the broker passes it on; when the log fails, the request is refused. A person's first
 access starts a session named `default`, and a new login continues the most recently used
-session. Naming and switching sessions is not built yet.
+session. Inserting a name into `governance.sessions` points the login at the person's session
+of that name, started then if they have none; `POST /sessions {"name": ...}` does the same for a
+client with no Iceberg engine.
+
+```bash
+q alice --execute "INSERT INTO iceberg.governance.sessions (name) VALUES ('run7')"
+#  -> INSERT: 1 row      (a new login continues run7, the most recently used session)
+```
 
 `governance.lineage` has the shape of Unity Catalog's `system.access.table_lineage`: a read
 is a row with an empty target, and a write is a row for each read of its session before it.

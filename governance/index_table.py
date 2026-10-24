@@ -15,10 +15,10 @@ SigV4 signature and serves a person only their own prefix.
 Nothing is written to storage. The version is a hash of the rows, so a changed row set gets
 new file paths: a cache keyed by path can never return stale rows or someone else's.
 
-`derivations` also accepts an engine's append (commit): the engine puts its data and manifest
-files through the same endpoint, under the person's own table, and commits through the gate.
-commit() applies the commit to the table the person last loaded, reads the rows it appends,
-and hands them to the caller's check, which stores them or refuses the commit.
+`derivations` and `sessions` also accept an engine's append (commit): the engine puts its data
+and manifest files through the same endpoint, under the person's own table, and commits through
+the gate. commit() applies the commit to the table the person last loaded, reads the rows it
+appends, and hands them to the caller's check, which acts on them or refuses the commit.
 """
 import calendar
 import hashlib
@@ -79,7 +79,7 @@ TABLES = {
     "grants": _schema(("entry", StringType), ("kind", StringType),   # Unity Catalog's column names
                       ("privilege_type", StringType), ("grantee", StringType)),
 }
-WRITABLE = {"derivations"}
+WRITABLE = {"derivations", "sessions"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine
 # may attach afterwards.
 _APPEND_UPDATES = (AddSnapshotUpdate, SetSnapshotRefUpdate, SetStatisticsUpdate,

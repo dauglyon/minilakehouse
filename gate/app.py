@@ -28,8 +28,8 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    `datasets` (the dataset index), `sessions`, `lineage`, `derivations`, `releases` and
    `grants`. A load of one
    returns governance's per-person table (governance/index_table.py), whose files governance
-   serves; a commit to `derivations` goes to governance, which accepts it only as a valid
-   declaration (PROVENANCE.md 5.3). Polaris holds none of them.
+   serves; a commit to `sessions` or `derivations` goes to governance, which accepts it only as
+   one session name or a valid declaration (PROVENANCE.md 3, 5.3). Polaris holds none of them.
 7. The access log (PROVENANCE.md 4.1). Before it passes on any response that hands out a
    storage credential, the gate has governance log it: a read of the table the path names, or
    on a create a write of the new table; before it forwards a table create or commit, the
@@ -173,7 +173,7 @@ def index_answer(named, segments):
     if kind in ("table", "view"):
         return not_found(kind, named[2], name)
     return forbidden("the governance namespace is governance's own; "
-                     "only governance.derivations takes inserted rows")
+                     "only governance.sessions and governance.derivations take inserted rows")
 
 
 def forbidden(message):

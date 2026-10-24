@@ -1683,11 +1683,56 @@ def _iceberg_error(status, kind, message):
     return jsonify({"error": {"message": message, "type": kind, "code": status}}), status
 
 
+def _switch_session(subject, sid, rows):
+    """Point this login at the session named by the one row inserted into governance.sessions
+    (PROVENANCE.md 3): the person's session of that name, started now if they have none.
+    Returns whether it was started. Raises index_table.Refused."""
+    def refuse(message):
+        return index_table.Refused(400, "BadRequestException", message)
+    if len(rows) != 1:
+        raise refuse("insert one session name")
+    row = rows[0]
+    if any(row.get(k) is not None for k in ("started", "last_used", "current")):
+        raise refuse("started, last_used and current are filled in by governance; insert into (name)")
+    name = row.get("name")
+    if not isinstance(name, str) or not name.strip() or len(name) > 200:
+        raise refuse("a session name is 1 to 200 characters, not all spaces")
+    with db(commit=True) as cur:
+        # xmax is 0 on a row this statement inserted, and set on one it updated.
+        cur.execute("INSERT INTO sessions (person, name) VALUES (%s, %s) ON CONFLICT (person, name) "
+                    "DO UPDATE SET last_used = now() RETURNING id, xmax = 0 AS started", (subject, name))
+        row = cur.fetchone()
+        cur.execute("INSERT INTO logins (person, sid, session) VALUES (%s, %s, %s) "
+                    "ON CONFLICT (person, sid) DO UPDATE SET session = EXCLUDED.session",
+                    (subject, sid, row["id"]))
+    app.logger.info("SESSION person=%s -> %s (%s)", subject, name, "started" if row["started"] else "resumed")
+    return row["started"]
+
+
+@app.post("/sessions")
+def switch_session():
+    # The same lever as an insert into governance.sessions (PROVENANCE.md 3), for a client with
+    # no Iceberg engine: {"name"}. It moves the pointer of the login the token was issued to.
+    claims, err = authed_claims()
+    if err:
+        return err
+    subject, sid = subject_of(claims), claims.get("sid") or ""
+    body = request.get_json(silent=True) or {}
+    if set(body) != {"name"}:
+        return jsonify({"error": "body is {name}"}), 400
+    try:
+        started = _switch_session(subject, sid, [{"name": body["name"]}])
+    except index_table.Refused as e:
+        return jsonify({"error": e.message}), e.status
+    return jsonify({"ok": True, "session": body["name"], "started": started}), 201 if started else 200
+
+
 @app.post("/index/commit")
 def index_commit():
     # The gate's answer to an engine's commit to one of <catalog>.governance's tables, on the
-    # person's own token. Only derivations accepts one: its rows are a declaration, checked and
-    # stored before the commit is accepted (PROVENANCE.md 5.3, 5.5).
+    # person's own token. Two accept one: a row inserted into sessions switches the login's
+    # session, and derivations' rows are a declaration, checked and stored before the commit is
+    # accepted (PROVENANCE.md 5.3, 5.5).
     claims, err = authed_claims(CATALOG_AUDIENCE)
     if err:
         return err
@@ -1695,12 +1740,13 @@ def index_commit():
     name = body.get("table")
     if name not in index_table.WRITABLE:
         return _iceberg_error(403, "ForbiddenException", f"governance.{name} is read-only")
-    subject = subject_of(claims)
+    subject, sid = subject_of(claims), claims.get("sid") or ""
+    check = {"derivations": lambda rows: _declare(subject, rows),
+             "sessions": lambda rows: _switch_session(subject, sid, rows)}[name]
     try:
-        built = index_table.commit(subject, name, body.get("commit") or {},
-                                   lambda rows: _declare(subject, rows))
+        built = index_table.commit(subject, name, body.get("commit") or {}, check)
     except index_table.Refused as e:
-        app.logger.info("REFUSE declaration person=%s: %s", subject, e.message)
+        app.logger.info("REFUSE governance.%s person=%s: %s", name, subject, e.message)
         return _iceberg_error(e.status, e.kind, e.message)
     return jsonify(built)
 

@@ -1,6 +1,6 @@
 # Provenance transactions: server-bounded inputs, attested use
 
-Build steps 1, 2 and 4 (section 10) are implemented; step 3 is design.
+Every build step in section 10 is implemented.
 Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
 document extends `WHITEPAPER.md`; its derivation rule, sources that travel with the stored data
 (section 6), replaced the whitepaper's earlier rule over a list of `inputs` per dataset, and
@@ -47,9 +47,9 @@ A session is a unit of work a person names. A person has one until they ask for 
 - Every login carries a current-session pointer, held by governance and keyed by the login's
   `sid`. Keycloak puts a `sid`, the login session id, in every access token this realm issues
   (checked 2026-10-22 on a token for alice; a refreshed token keeps it). Nothing is minted.
-- One lever: inserting a name into `governance.sessions` (section 5). A name the person has
-  not used starts a session and points the login at it; a name they have used points the
-  login at that session. There is no close, join, or link.
+- One lever: inserting a name into `governance.sessions` (section 5), or posting it as
+  `POST /sessions {name}`. A name the person has not used starts a session and points the
+  login at it; a name they have used points the login at that session. There is no close, join, or link.
 - A new login's pointer defaults to the person's most recently used session, so a re-login
   after an idle timeout continues the same work with no action.
 - Every credential record is stamped with the pointer's value at the moment governance writes
@@ -143,8 +143,9 @@ Three Iceberg tables in the `governance` namespace, which the gate already answe
 itself (`gate/app.py`, `index_answer`; `governance/index_table.py`). A load returns a table
 governance builds in memory for the person, with a credential for governance's own S3-style
 endpoint, which serves the files. Nothing is written to storage. Every client that speaks
-the Iceberg REST catalog, Trino, Spark, pyiceberg, sees the same tables, so the catalog is
-the whole interface and there is no governance API for the person. A table's rows cannot
+the Iceberg REST catalog, Trino, Spark, pyiceberg, sees the same tables, so any engine is
+enough; `POST /sessions` and `POST /declarations` take the two inserts from a client that has
+none. A table's rows cannot
 depend on a query's `WHERE`: no filter reaches the catalog (section 10, item 6), so each
 table holds all of the person's rows and a filter is an ordinary one.
 
@@ -156,7 +157,10 @@ table holds all of the person's rows and a filter is an ordinary one.
 | `started`, `last_used` | timestamps |
 | `current` | true for the session this login points at |
 
-`SELECT` lists the person's sessions. `INSERT` of a name is the lever of section 3.
+`SELECT` lists the person's sessions. `INSERT` of a name is the lever of section 3: one row,
+naming only `name`, which may not be all spaces or longer than 200 characters; governance
+fills in the rest. Any other insert is refused, and so is any insert into the other read-only
+tables.
 
 ### 5.2 `governance.lineage`
 
@@ -207,7 +211,7 @@ own `manage` names one of their groups, and every putting back on a target they 
 One `INSERT` is one commit is one attestation. Governance applies one rule to the commit as a
 whole: for every target it names, the caller must have written it, a caller group must be in
 its `write`, and the rows must give each of the caller's own candidates of that target a
-`used` value; every `external` row's source is a hash. Under section 6 (not built), a
+`used` value; every `external` row's source is a hash. Under section 6, a
 declaration covers only the caller's files in the target that no earlier declaration of
 theirs covered, and may also name a source that arrived through one of their reads, to mark
 it unused (6.3). A source named twice with the same `used` counts once; named with
@@ -291,7 +295,7 @@ SELECT source, source_type, used FROM governance.derivations
 WHERE target = 'lakehouse.db.joined';
 ```
 
-Cleaning (section 6.4; not built). `lakehouse.db.joined`'s files carry `lakehouse.db.weather`,
+Cleaning (section 6.4). `lakehouse.db.joined`'s files carry `lakehouse.db.weather`,
 and its rows from `weather` have been deleted, the files rewritten, and old versions removed.
 The rewrite read `joined`, which brought in `joined` and, through it, `weather`:
 
@@ -771,6 +775,15 @@ attribution (4.2).
     `relx1`'s folder blanked in its entry, as after a lost creation report, it carried the same
     sources. alice's `relx2` built from `t1` stayed closed to carol, and lineage paired it with
     `t1`.
+17. Switching sessions, run on the stack 2026-10-24 (`seed/check-sessions.py`, on one login).
+    alice inserted a new name with pyiceberg through the gate; `governance.sessions` showed it
+    current, and her next load of `t1` appeared in `lineage` stamped with it. Inserting
+    `default` pointed her back, and the next read was stamped `default`. An insert of two
+    rows was refused ("insert one session name") and left the pointer where it was.
+    `POST /sessions` started a new name (201) and resumed an old one (200). bob's
+    `governance.sessions` showed none of hers. Through Trino, `INSERT INTO
+    iceberg.governance.sessions (name) VALUES ('trino-check')` was accepted, and alice's next
+    login, a new `sid`, started on `trino-check`, her most recently used session.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
@@ -799,6 +812,6 @@ Build order, each step usable on its own:
    listing extended to table folders, the `detach` grant and OPA's rule, declarations naming
    arrived-through sources, `lineage`'s `direct` column, the `declared_by` and `declared_at`
    columns with detaches shown to the source's `manage` holders, and putting a source back.
-3. The `sessions` lever as an insert.
+3. The `sessions` lever as an insert, and as `POST /sessions`. Built 2026-10-24.
 4. Releases (6.7). Built 2026-10-24.
 
