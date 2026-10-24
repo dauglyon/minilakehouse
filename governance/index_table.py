@@ -61,7 +61,7 @@ def _schema(*columns):
 TABLES = {
     "datasets": _schema(("id", StringType), ("kind", StringType),   # kind: table | files
                         ("description", StringType), ("steward", StringType),
-                        ("can_read", BooleanType)),
+                        ("can_read", BooleanType), ("published", BooleanType)),
     "sessions": _schema(("name", StringType), ("started", TimestamptzType),
                         ("last_used", TimestamptzType), ("current", BooleanType)),
     "lineage": _schema(("source", StringType), ("source_type", StringType),     # table | files
@@ -77,7 +77,8 @@ TABLES = {
                         ("decided_by", StringType), ("decided_at", TimestamptzType),
                         ("withdrawn_by", StringType), ("withdrawn_at", TimestamptzType)),
     "grants": _schema(("entry", StringType), ("kind", StringType),   # Unity Catalog's column names
-                      ("privilege_type", StringType), ("grantee", StringType)),
+                      ("privilege_type", StringType), ("grantee", StringType),
+                      ("inherited_from", StringType)),   # a folder, a namespace, `space`; empty for its own
 }
 WRITABLE = {"derivations", "sessions"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine

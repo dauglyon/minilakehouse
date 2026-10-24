@@ -12,8 +12,8 @@ package polaris.authz
 #  3. table view      — whether a table or view exists, and its metadata (columns, snapshots,
 #                       storage location): describe, read or write on it, so a table can be viewed
 #                       without being read.
-#  4. namespace view  — whether a namespace exists, and its properties: its owners, and
-#                       anyone who may view a table under it.
+#  4. namespace view  — whether a namespace exists, and its properties: describe, read or
+#                       write on it or on a namespace under it.
 #  5. catalog reads   — the catalog, listings and metrics reports; any authenticated
 #                       principal. The gate (gate/app.py) trims every listing with
 #                       lakehouse.tables, so a listing shows only what lanes 3 and 4 allow.
@@ -26,8 +26,7 @@ package polaris.authz
 #                       credential): write on every target.
 #  8. drop            — dropping a table or view, with or without purging its files: delete on
 #                       it. Not implied by any other grant.
-#  9. namespace admin — dropping a namespace or changing its properties: members and above
-#                       of a group owning it.
+#  9. namespace admin — dropping a namespace: delete on it; changing its properties: write.
 #
 # Anything not named in a lane is root-only: admin operations (principals, roles, grants,
 # catalogs, policies, credentials), and renaming, registering or relocating a table, since
@@ -104,8 +103,13 @@ _allow if {
 
 # Lane 9 — namespace admin.
 _allow if {
-	input.action in _namespace_admin_ops
-	_namespaces_pass("own")
+	input.action == "DROP_NAMESPACE"
+	_namespaces_pass("delete")
+}
+
+_allow if {
+	input.action == "UPDATE_NAMESPACE_PROPERTIES"
+	_namespaces_pass("write")
 }
 
 # Every target is a table or view, and the names the principal holds grants through hold
@@ -138,8 +142,9 @@ _namespaces_pass(grant) if {
 
 _namespace_holds("view", h, e) if tables.namespace_viewable(h, e)
 
-# A member or above of a group owning it.
-_namespace_holds("own", h, e) if tables.namespace_owned(h.write, e)
+_namespace_holds("write", h, e) if tables.namespace_writable(h, e)
+
+_namespace_holds("delete", h, e) if tables.namespace_droppable(h, e)
 
 _view_ops := {"LOAD_TABLE", "TABLE_EXISTS", "LOAD_VIEW", "VIEW_EXISTS"}
 
@@ -177,8 +182,6 @@ _write_ops := {
 }
 
 _drop_ops := {"DROP_TABLE_WITHOUT_PURGE", "DROP_TABLE_WITH_PURGE", "DROP_VIEW"}
-
-_namespace_admin_ops := {"DROP_NAMESPACE", "UPDATE_NAMESPACE_PROPERTIES"}
 
 # Table or namespace id "<catalog>.<ns...>[.<table>]", from the resource hierarchy Polaris
 # sends: the catalog and every namespace level, in order. A target whose catalog, namespace

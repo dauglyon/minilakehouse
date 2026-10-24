@@ -23,9 +23,9 @@ vending broker) — with a real **metadata-visibility plane** (describe-but-not-
 - [Flow B — Iceberg tables](#flow-b--iceberg-tables)
 - [Flow C — blob datasets](#flow-c--blob-datasets)
 - [Registry freshness & governed ingest](#registry-freshness--governed-ingest)
+- [Spaces and publishing](#spaces-and-publishing)
 - [Changing grants](#changing-grants)
 - [Changing groups](#changing-groups)
-- [Assigning roots](#assigning-roots)
 - [Sessions and the access log](#sessions-and-the-access-log)
 - [Security model](#security-model)
 - [Limitations](#limitations)
@@ -49,7 +49,7 @@ Two independent permission **planes** per dataset:
 - **access** — may you *read the bytes*? (vending, Flows B/C)
 
 So a dataset can be **describe-but-not-read** (the Lake Formation model): `alice` can discover
-`projx/private` exists but cannot read it.
+`projw/private` exists but cannot read it.
 
 **How the user's identity reaches Polaris (tables):** the user connects to Trino with their
 Keycloak token and attaches the same token as the Trino extra credential `token`. Trino's
@@ -63,7 +63,7 @@ byte path.
 | Service | Role |
 |---|---|
 | **keycloak** | OIDC identity provider and the only token issuer (users `alice`/`bob`/`carol`, the `trino` login client and its service account). Proves who a person is; holds no groups. Its realm role `platform-admin` (carol) marks platform admins. |
-| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (persistent RGW bucket notifications), accepts governed ingest (`POST /datasets`), table registration (`POST /tables`), grant changes (`PATCH /permissions/...`), group changes (`POST /groups`, `PATCH` and `DELETE /groups/<name>`, `PUT` and `DELETE /groups/<name>/stewards/<person>`) and root ownership changes (`PATCH /roots/...`), answers `GET /me`, `GET /groups/<name>`, `GET /datasets/<id>` and `GET /tables/<id>`, keeps the access log and each login's current session, builds and serves each person's tables in the `governance` namespace, and creates each person's Polaris account on first use. |
+| **governance** | The PAP + dataset and table registries (single source of truth), Postgres-backed. Holds group membership and every grant. Serves them to OPA (`/internal/*`, closed to everyone else), serves the dataset index (Flow A), keeps the registry fresh (persistent RGW bucket notifications), makes a folder an entry at its first credential, accepts publishing (`PATCH /datasets/<id>`, `PATCH /namespaces/<id>`), grant changes (`PATCH /permissions/...`) and group changes (`POST /groups`, `PATCH` and `DELETE /groups/<name>`, `PUT` and `DELETE /groups/<name>/stewards/<person>`), answers `GET /me`, `GET /groups/<name>`, `GET /datasets/<id>` and `GET /tables/<id>`, keeps the access log and each login's current session, builds and serves each person's tables in the `governance` namespace, and creates each person's Polaris account on first use. |
 | **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read; such a load carries only the current version, without row or file counts or the writer's name, and so does a view load by someone who may only describe the view. Refuses a view that would run with its owner's rights. Decides which tables and schemas may be created, and reports creates and drops to governance. Has governance log every table credential it passes on and every table write it forwards, and refuses the request when that fails. Answers for the `governance` namespace's tables itself. |
@@ -108,7 +108,7 @@ instead logs in once through the **loginproxy**, which refreshes on its behalf:
 SID=$(docker compose exec -T governance python /seed/proxy_login.py alice)
 pq() { docker compose exec -T trino trino --server https://loginproxy:9200 --insecure \
          --user alice --access-token "$SID" "$@"; }
-pq --execute "SELECT * FROM iceberg.db.t1"      # -> 1
+pq --execute "SELECT * FROM iceberg.jgi.t1"     # -> 1
 # A real CLI user runs instead:  trino --server https://<proxy> --external-authentication
 ```
 
@@ -127,23 +127,25 @@ so each demo asks Keycloak for that service's audience: `scope=openid aud-broker
 
 *"What exists that I could request?"* — separate from "what can I read." Every engine
 connected to the catalog can query the answer as an Iceberg table, `governance.datasets`: one
-row per live dataset or table the person may see, with whether they may read it, and never
-bytes or credentials. A file dataset's id is the tenant-qualified slice of its prefix:
-`datasets/projx/public/` → `projx/public`.
+row per live dataset or table the person may see, with whether they may read it and whether it
+is published, and never bytes or credentials. A file dataset's id is its folder without the
+`datasets/` root, and starts with the group whose space holds it: `datasets/jgi/public/` →
+`jgi/public`.
 
 ```bash
 q alice --execute "SELECT * FROM iceberg.governance.datasets"
-#  -> "projx/private","files","projx private data","alice","false"
-#     "projx/public","files","projx public data","alice","true"
-#     "lakehouse.db.t1","table","demo table","alice","true"
-#         ^ projx/private is visible but can_read is false: describe-but-not-read
+#  -> "jgi/public","files","jgi public data","alice","true","true"
+#     "projw/private","files","projw private data","carol","false","true"
+#     "lakehouse.jgi.t1","table","","","true","false"
+#         ^ projw/private is visible but can_read is false: describe-but-not-read
+#         ^ t1 is in jgi's space and not published, so only jgi sees it
 q bob --execute "SELECT count(*) FROM iceberg.governance.datasets"
-#  -> "0"     bob is in no group with a grant, so he sees nothing
+#  -> "0"     bob's group noaccess has an empty space and no grants
 ```
 
 The gate answers for this table itself. Governance builds its files for the person loading
 it (one database query, then one OPA decision per kind: governance builds the candidate list
-and OPA says which candidates pass; the candidates are only entries whose viewing grants
+and OPA says which candidates pass; the candidates are only entries some of whose grants
 name one of the person's groups, so the work follows what the person may see, not the
 catalog's size, and `seed/check-index-narrowing.py` checks that this drops nothing OPA would
 show), keeps them in memory, and serves them from an S3-style endpoint that accepts only the
@@ -167,25 +169,19 @@ files directly from RGW. OPA is consulted at the vend — never on the byte path
 
 ```bash
 # (q is defined under "Run it")
-# ALLOW — alice is granted db.t1
-q alice --execute "SELECT * FROM iceberg.db.t1"
+# ALLOW — alice is in jgi, whose space holds jgi.t1
+q alice --execute "SELECT * FROM iceberg.jgi.t1"
 #  -> "1"
 
 # DENY — bob authenticates fine but has no grant, so for him the table and its schema do not
 # exist: the same answer as for a name nobody created
-q bob --execute "SELECT * FROM iceberg.db.t1"
-#  -> Query ... failed: line 1:15: Schema 'db' does not exist
+q bob --execute "SELECT * FROM iceberg.jgi.t1"
+#  -> Query ... failed: line 1:15: Schema 'jgi' does not exist
 
-# A new table is registered first, by a steward whose group owns the schema, with its grants;
-# then someone in its `write` grant creates it. An unregistered table is refused.
-docker compose exec -T governance python -c "
-import subprocess, requests
-t = subprocess.run(['python', '/seed/user_token.py', 'alice', 'governance'], capture_output=True, text=True).stdout.strip()
-print(requests.post('http://localhost:8000/tables', headers={'Authorization': 'Bearer ' + t},
-      json={'id': 'lakehouse.db.t2', 'read': ['jgi'], 'write': ['jgi']}).json())"
-#  -> {'id': 'lakehouse.db.t2', 'ok': True, 'status': 'pending'}
-q alice --execute "CREATE TABLE iceberg.db.t2 AS SELECT 2 AS y"
-#  -> CREATE TABLE: 1 row      (governance now lists lakehouse.db.t2 as live)
+# A member creates a table in their group's space with no step first; it is listed to the
+# group, unpublished, until a steward publishes its namespace (see "Spaces and publishing").
+q alice --execute "CREATE TABLE iceberg.jgi.t2 AS SELECT 2 AS y"
+#  -> CREATE TABLE: 1 row
 
 # See what OPA was asked, on the real per-user identity (bob is refused at the schema check,
 # which the gate answers as not-found):
@@ -198,7 +194,7 @@ docker compose logs opa | grep -E 'LOAD_TABLE_WITH|NAMESPACE_EXISTS'
 The plane tables can't give you: **non-tabular data, accessed by a client presenting its own
 token to a broker — no engine in the byte path**, so it's safe even against a compromised
 engine. The broker verifies the token, asks OPA the yes/no question, and vends a credential
-**narrowed to exactly the requested dataset's prefix**.
+**narrowed to exactly the requested folder**.
 
 ```bash
 docker compose exec -T governance python - <<'PY'
@@ -209,16 +205,15 @@ def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id=
     scope="openid aud-broker")).json()["access_token"]
 def vend(u, ds): return requests.post("http://broker:9100/vend",
     headers={"Authorization": f"Bearer {tok(u)}"}, json={"dataset": ds}).status_code
-print("alice projx/public :", vend("alice", "projx/public"))    # 200 -> scoped temp creds
-print("alice projx/private:", vend("alice", "projx/private"))   # 403 -> visible but not readable
-print("bob   projx/public :", vend("bob",   "projx/public"))    # 403 -> bob is granted nothing
+print("alice jgi/public   :", vend("alice", "jgi/public"))      # 200 -> scoped temp creds
+print("alice projw/private:", vend("alice", "projw/private"))   # 403 -> visible but not readable
+print("bob   jgi/public   :", vend("bob",   "jgi/public"))      # 403 -> bob is granted nothing
 PY
 ```
 
-The returned credential reads `datasets/projx/public/*` but is **denied** sibling prefixes by
-RGW — OPA's decision carries the prefix the dataset was registered with, and the broker
-scopes the session policy to it. A dataset id that doesn't exist gets the same 403 as a
-denied one.
+The returned credential reads `datasets/jgi/public/*` but is **denied** sibling prefixes by
+RGW — OPA's decision carries the entry's folder, and the broker scopes the session policy to
+it. A dataset id that doesn't exist gets the same 403 as a denied one.
 
 ## Registry freshness & governed ingest
 
@@ -226,28 +221,26 @@ The registry is the **mutable single source of truth**, so it lives in a real da
 `governance` Postgres database) and is kept **honest against storage**. Two truths, reconciled
 not merged: storage owns *existence*, the registry owns *meaning/grants*.
 
-- **Freshness.** Each object created or deleted under a dataset's folder makes RGW notify
+- **Freshness.** Each object created or deleted under a tracked folder makes RGW notify
   governance, which lists that folder, recording each file's time for attribution
-  (`PROVENANCE.md` 6.2), and sets `status`:
-  non-empty → `live`; emptied-after-being-live → `gone`. The dataset index lists only `live`
-  datasets. The notification topic is persistent: RGW queues each event and retries it until
-  governance accepts it, so an event sent while governance is down arrives once it is back.
-  There is no periodic sweep.
-- **Register-at-ingest.** A *new* dataset is born through a governed write path that registers
-  it **with its meaning** (prefix, description, grants — only a human can supply these; the id
-  derives from the prefix). Authenticated by the caller's own token, **authorized by OPA**: the
-  caller must be a steward of a group owning a root above the prefix.
-  The upload uses a write credential from the broker (`"mode": "write"`), which the dataset's
-  `write` grant allows: it puts and deletes in that folder only and cannot read or list.
+  (`PROVENANCE.md` 6.2), and sets `status`: non-empty → `live`, empty → `gone`. The dataset
+  index lists only `live` entries. The notification topic is persistent: RGW queues each event
+  and retries it until governance accepts it, so an event sent while governance is down
+  arrives once it is back. There is no periodic sweep.
+- **Write, then publish.** A member writes into a folder of their group's space with a write
+  credential from the broker (`"mode": "write"`): it puts and deletes in that folder only and
+  cannot read or list. The first credential for a folder makes it an entry, not yet
+  published. A steward then publishes it **with its meaning** (description and grants — only
+  a human can supply these; the id is the folder), authenticated by their own token and
+  **authorized by OPA** (`allow_publish`: a steward of the group whose space holds it).
 
 ```bash
-# Governed ingest of a NEW dataset, as alice (steward of jgi, which owns datasets/projz/):
+# Governed ingest of a NEW dataset, as alice (a member and the steward of jgi):
 docker compose exec governance python /seed/ingest-demo.py
-#  -> register: 201 {'id': 'projz', 'ok': True, 'registered_by': 'alice'}
-#     uploaded 2 objects under datasets/projz/ with a write credential
+#  -> uploaded 2 objects under datasets/jgi/projz/ with a write credential
+#     publish: 200 {'grants': {..., 'describe': ['projw'], ...}, 'id': 'jgi/projz', 'ok': True, 'published': True}
 
-# alice finds and reads projz at once; she is DENIED registering under another group's
-# root:
+# alice finds and reads jgi/projz at once; she is DENIED publishing in another group's space:
 docker compose exec -T governance python - <<'PY'
 import requests
 from pyiceberg.catalog.rest import RestCatalog
@@ -258,46 +251,73 @@ def tok(aud): return requests.post(KC, data=dict(grant_type="password", client_i
 index = RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse",
                     token=tok("polaris")).load_table("governance.datasets")
 print("index:", [r["id"] for r in index.scan().to_arrow().to_pylist()])
-print("vend projz:", requests.post("http://broker:9100/vend", json={"dataset": "projz"},
+print("vend jgi/projz:", requests.post("http://broker:9100/vend", json={"dataset": "jgi/projz"},
       headers={"Authorization": "Bearer " + tok("broker")}).status_code)
-print("register under datasets/projw/ (not owned):",
-      requests.post("http://governance:8000/datasets", json={"prefix": "datasets/projw/x/"},
-                    headers={"Authorization": "Bearer " + tok("governance")}).status_code)
+print("publish projw/private (projw's space):",
+      requests.patch("http://governance:8000/datasets/projw/private", json={"description": "x"},
+                     headers={"Authorization": "Bearer " + tok("governance")}).status_code)
 PY
-#  -> index: ['projx/private', 'projx/public', 'projz', 'lakehouse.db.t1']
-#     vend projz: 200
-#     register under datasets/projw/ (not owned): 403
+#  -> index: ['jgi/projz', 'jgi/public', 'projw/private', 'lakehouse.jgi.t1', 'lakehouse.jgi.t2']
+#     vend jgi/projz: 200
+#     publish projw/private (projw's space): 403
 ```
 
-Delete `projz`'s objects and it flips to `gone` and leaves the index; re-add one
-and it returns `live`. `bob` (a steward of nothing) is denied registration entirely.
+Delete `jgi/projz`'s objects and it flips to `gone` and leaves the index; re-add one and it
+returns `live`. `bob` (a steward of nothing) is denied publishing entirely.
 
-Because an id is the prefix's tenant slice, two stewards in different groups can each register
-a dataset called `results` (`projx/results` and `projw/results`) — names never collide across
-tenants, and neither can see the other's.
+Because an id begins with its space, two groups can each have a dataset called `results`
+(`jgi/results` and `projw/results`) — names never collide across groups, and neither can see
+the other's.
+
+## Spaces and publishing
+
+Every group has a space: the folder `datasets/<group>/` and the namespace `lakehouse.<group>`
+(Trino's schema `iceberg.<group>`, with schemas inside it named `iceberg."<group>.<name>"`).
+Its members write there with no step first, and a steward publishes what is to be shared
+(`docs/HANDOFF-2026-10-22-groups.md` sections 1 to 3).
+
+- A space's default grants: `describe` and `read` for everyone in the group, `write` for its
+  members and above, `delete` for its admins (`<g>#admin`), `manage` for its stewards
+  (`<g>#steward`), `detach` empty.
+- A folder becomes an entry the first time someone is given a credential for it. Until it is
+  published it has no description or grants of its own, and it is listed only to those who
+  may read it. A table becomes an entry when it is created.
+- A steward publishes a folder with `PATCH /datasets/<id>` and a namespace, one dataset of its
+  tables, with `PATCH /namespaces/<id>`: `{"description", "describe": [...], "read": [...],
+  ...}`. Published datasets do not nest: publishing one inside or around another is refused,
+  and no credential for a folder reaches into a published dataset under it.
+- Grants can also be set on any folder (`PATCH /permissions/folder/<id>`) and any namespace
+  (`PATCH /permissions/namespace/<id>`), whether or not it exists yet. They reach every entry
+  under it, published or not, and every table created there later. A table has no grants of
+  its own.
+- An entry's grants are the union of its own (while published), those of every folder or
+  namespace above it, and its space's. `GET /datasets/<id>` and `GET /tables/<id>` show each
+  layer, and `governance.grants` names where each inherited grant comes from.
+- A group whose space holds data cannot be deleted, and a group cannot be created under a name
+  whose space already has entries.
 
 ## Changing grants
 
-`PATCH /permissions/<dataset|table>/<id>` adds and removes groups from an entry's grants, in
-the shape of Unity Catalog's permissions API. OPA decides each change (`allow_change`):
-`describe` and `read` change only for someone in a group holding the entry's `manage`; `manage`,
-`write`, `delete` and `detach` only for a steward of a group owning the root the entry sits
-under (the prefix root or namespace that registration checks), or a platform admin. A change
-applies at the next decision.
+`PATCH /permissions/<dataset|folder|namespace>/<id>` adds and removes groups from a published
+dataset's, a folder's or a namespace's grants, in the shape of Unity Catalog's permissions
+API. OPA decides each change (`allow_change`, `allow_change_folder`): `describe` and `read`
+change only for someone in a group holding its `manage` (the space's stewards by default);
+`manage`, `write`, `delete` and `detach` only for a steward of the group whose space holds it,
+or a platform admin. A change applies at the next decision.
 
 ```bash
 docker compose exec -T governance python - <<'PY'
 import requests
 KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-def h(aud): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
-    client_id="trino", client_secret="trino-secret", username="alice", password="alice",
+def h(u, aud): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
+    client_id="trino", client_secret="trino-secret", username=u, password=u,
     scope=f"openid aud-{aud}")).json()["access_token"]}
-def change(op):
-    return requests.patch("http://governance:8000/permissions/dataset/projx/private",
-        headers=h("governance"),
+def change(op):  # carol stewards projw
+    return requests.patch("http://governance:8000/permissions/dataset/projw/private",
+        headers=h("carol", "governance"),
         json={"changes": [{"group": "jgi", op: ["read"]}]}).json()["grants"]["read"]
-vend = lambda: requests.post("http://broker:9100/vend", headers=h("broker"),
-                             json={"dataset": "projx/private"}).status_code
+vend = lambda: requests.post("http://broker:9100/vend", headers=h("alice", "broker"),
+                             json={"dataset": "projw/private"}).status_code
 print("grant read :", change("add"), vend())
 print("revoke read:", change("remove"), vend())
 PY
@@ -305,8 +325,8 @@ PY
 #     revoke read: [] 403
 ```
 
-alice may change `read` on `projx/private` because `jgi` holds its `manage`; bob gets
-403 for any change, the same answer as for an id that does not exist.
+carol may change `read` on `projw/private` because her space gives its stewards `manage`;
+anyone else gets 403 for any change, the same answer as for an id that does not exist.
 
 ## Changing groups
 
@@ -319,8 +339,8 @@ and SpiceDB: `jgi#admin` is jgi's admins and owners, `jgi#member` its members an
 
 - Anyone signed in creates a group, `POST /groups {"name"}`, and becomes its owner. A name is 2
   to 64 lowercase letters and digits starting with a letter, as BERDL requires, and not
-  reserved (BERDL's list and `governance`); a name some grant or root already uses is refused,
-  since its owner would hold those grants.
+  reserved (BERDL's list and `governance`); a name some grant already uses is refused,
+  since its owner would hold those grants, and so is one whose space already has entries.
 - `PATCH /groups/<name>` adds people to a role, moving them if they hold another, or removes
   them: owners change owners and admins; owners, admins and stewards change members and
   viewers. A change leaving no owner is refused.
@@ -329,7 +349,7 @@ and SpiceDB: `jgi#admin` is jgi's admins and owners, `jgi#member` its members an
   (`PUT` and `DELETE /groups/<name>/stewards/<person>`), and pass every check an owner or a
   steward passes. A group with a steward is a tenant; a change leaving a steward a viewer or
   out of the group is refused until a platform admin removes the steward.
-- `DELETE /groups/<name>` is its owners', refused while it owns a root.
+- `DELETE /groups/<name>` is its owners', refused while its space holds data.
 - `GET /me`, `GET /groups/<name>` (its viewers and above), `GET /datasets/<id>` and
   `GET /tables/<id>` (those who may describe it) read the same state back; for someone who may
   describe an entry but not read it, the last two say why.
@@ -356,41 +376,6 @@ PY
 #     bob removed : [] 403
 ```
 
-## Assigning roots
-
-A group owning a prefix root (`datasets/projx/`) or a namespace (`lakehouse.db`) owns
-everything under it: its stewards may register there and change `manage`, `write`, `delete`
-and `detach` on what is registered there, and its members and above may create namespaces
-under it. `PATCH /roots/<dataset|namespace>/<id>` adds and removes a root's owners (a dataset
-root is named like a dataset id: `projx/sub` is `datasets/projx/sub/`). OPA decides
-(`allow_change_root`): a steward of a group owning the root or one above it, or a platform
-admin, who assigns top-level roots (`datasets/<name>/`, `<catalog>.<namespace>`). So a steward
-can hand part of its group's tree to another group, and can always take it back.
-
-```bash
-docker compose exec -T governance python - <<'PY'
-import requests
-KC = "http://keycloak:8080/realms/lakehouse/protocol/openid-connect/token"
-def h(u): return {"Authorization": "Bearer " + requests.post(KC, data=dict(grant_type="password",
-    client_id="trino", client_secret="trino-secret", username=u, password=u,
-    scope="openid aud-governance")).json()["access_token"]}
-def owners(u, root, op, group):
-    r = requests.patch(f"http://governance:8000/roots/dataset/{root}", headers=h(u),
-                       json={"owners": {op: [group]}})
-    return r.status_code, r.json().get("owners")
-# alice stewards jgi, which owns datasets/projx/; carol stewards projw
-print("alice gives projx/sub to projw        :", owners("alice", "projx/sub", "add", "projw"))
-print("carol passes projx/sub/t2 to noaccess :", owners("carol", "projx/sub/t2", "add", "noaccess"))
-print("bob tries to take projx/sub           :", owners("bob", "projx/sub", "add", "noaccess"))
-print("alice takes both back                 :", owners("alice", "projx/sub/t2", "remove", "noaccess"),
-      owners("alice", "projx/sub", "remove", "projw"))
-PY
-#  -> alice gives projx/sub to projw        : (200, ['projw'])
-#     carol passes projx/sub/t2 to noaccess : (200, ['noaccess'])
-#     bob tries to take projx/sub           : (403, None)
-#     alice takes both back                 : (200, []) (200, [])
-```
-
 ## Sessions and the access log
 
 Build step 1 of `PROVENANCE.md`. Governance logs every dataset credential handed to a person
@@ -415,9 +400,9 @@ expires. After Flow B and Flow C:
 q alice --execute "SELECT * FROM iceberg.governance.sessions"
 #  -> "default","2026-10-22 23:21:58.824845 UTC","2026-10-22 23:21:59.143470 UTC","true"
 q alice --execute "SELECT source, target, session FROM iceberg.governance.lineage"
-#  -> "lakehouse.db.t1","","default"
-#     "projx/public","","default"
-#     "lakehouse.db.t1","lakehouse.db.t2","default"
+#  -> "jgi/public","","default"
+#     "lakehouse.jgi.t1","","default"
+#     "lakehouse.jgi.t1","lakehouse.jgi.t2","default"
 q bob --execute "SELECT count(*) FROM iceberg.governance.lineage"
 #  -> "0"     bob's refused read handed him no credential, so nothing is logged
 ```
@@ -433,13 +418,13 @@ signs it. An input from outside the platform is a row with `source_type` `extern
 ```bash
 q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used)
   SELECT DISTINCT source, source_type, target, false
-  FROM iceberg.governance.lineage WHERE target = 'lakehouse.db.t2'"
+  FROM iceberg.governance.lineage WHERE target = 'lakehouse.jgi.t2'"
 #  -> INSERT: 1 row
-q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used) VALUES (NULL, NULL, 'lakehouse.db.t2', true)"
+q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used) VALUES (NULL, NULL, 'lakehouse.jgi.t2', true)"
 #  -> Query ... failed: Failed to commit the transaction during insert: Malformed request:
-#     lakehouse.db.t2: not declared: lakehouse.db.t1
+#     lakehouse.jgi.t2: not declared: lakehouse.jgi.t1
 q alice --execute "SELECT source, source_type, target, used, declared_by FROM iceberg.governance.derivations"
-#  -> "lakehouse.db.t1","table","lakehouse.db.t2","false","alice"
+#  -> "lakehouse.jgi.t1","table","lakehouse.jgi.t2","false","alice"
 ```
 
 An insert names its four columns; governance fills in `declared_by` and `declared_at`.
@@ -460,9 +445,10 @@ not read, with the source's owners' approval. A `manage` holder of the target as
 group is in the target's `read` and the target's declarations mark the source used; a `manage`
 holder of the source approves or declines, and any of them can withdraw it. What the group
 builds from the target stays readable to it; data that took the source by another path does
-not. Run in-network, as alice, who holds `manage` on both `rel1` and `t1`, once she has built
-`lakehouse.db.rel1` from `t1`, registered with `read` for `jgi` and `projw`, and
-declared it with `t1` used:
+not. Run in-network, as alice, who holds `manage` on both `rel1` and `t1` as jgi's steward,
+once she has built `lakehouse.jgi.shared.rel1` from `t1`, given projw `read` on the namespace
+`lakehouse.jgi.shared` (`PATCH /permissions/namespace/lakehouse.jgi.shared`), and declared it
+with `t1` used:
 
 ```bash
 docker compose exec -T governance python -c "
@@ -470,15 +456,15 @@ import subprocess, requests
 t = subprocess.run(['python', '/seed/user_token.py', 'alice', 'governance'], capture_output=True, text=True).stdout.strip()
 h = {'Authorization': 'Bearer ' + t}
 r = requests.post('http://localhost:8000/releases', headers=h,
-                  json={'target': 'lakehouse.db.rel1', 'source': 'lakehouse.db.t1', 'group': 'projw'})
+                  json={'target': 'lakehouse.jgi.shared.rel1', 'source': 'lakehouse.jgi.t1', 'group': 'projw'})
 print(r.json())
 print(requests.post(f'http://localhost:8000/releases/{r.json()[\"id\"]}/approve', headers=h).json())"
-#  -> {'id': 1, 'status': 'pending'}     (409 'declare lakehouse.db.rel1's sources first: ...' before declaring)
+#  -> {'id': 1, 'status': 'pending'}     (409 'declare lakehouse.jgi.shared.rel1's sources first: ...' before declaring)
 #  -> {'id': 1, 'status': 'approved'}    (DELETE /releases/1 withdraws it)
-q carol --execute "SELECT * FROM iceberg.db.rel1"
+q carol --execute 'SELECT * FROM iceberg."jgi.shared".rel1'
 #  -> "1","10"
 q alice --execute "SELECT id, target, source, grantee, status FROM iceberg.governance.releases"
-#  -> "1","lakehouse.db.rel1","lakehouse.db.t1","projw","approved"
+#  -> "1","lakehouse.jgi.shared.rel1","lakehouse.jgi.t1","projw","approved"
 ```
 
 `governance.grants` lists every grant on the entries `governance.datasets` shows the person,
@@ -491,20 +477,19 @@ support grants on tables").
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across both
   planes, all by group. Tables (`opa/policy.rego`): `root` / read credential (`read` or
   `write`) / viewing a table's columns and location (`describe`, `read` or `write`) / viewing a
-  schema (its owners, or any grant on a table in it) / listings (anyone; the gate trims them
-  to what may be viewed) / creating (a registered table with the person in its `write`, or a
-  schema under one their group owns) / writes and read-write credentials (`write`) /
-  dropping a table or view, files included (`delete`). Blobs (`opa/blob.rego`): `vend`
-  (read) / `vend_write` (write) / `vend_delete` (delete) / `visible` (describe or read) /
-  `allow_register` (ingest, by a steward of a group owning the root). Grant changes
-  (`allow_change` in both): `describe` and `read` by `manage` holders of the entry itself,
-  sources being the business of releases; `manage`, `write`, `delete` and `detach` by stewards
-  of a group owning the root. Group changes (`opa/groups.rego`): anyone creates a group; owners
-  change owners and admins; owners, admins and stewards change members and viewers; platform
-  admins change stewards. Root ownership (`allow_change_root` in `blob.rego` and `tables.rego`):
-  stewards of a group owning a root or one above it. Platform admins, marked by a Keycloak realm
-  role in the token, pass every steward and owner check. Group membership and every grant come
-  from governance at decision time; tokens carry no groups.
+  schema (`describe`, `read` or `write` on it or on one inside it) / listings (anyone; the gate
+  trims them to what may be viewed) / creating a table or a schema (`write` on the schema it
+  goes in) / writes and read-write credentials (`write`) / dropping a table or view, files
+  included (`delete`). A table's grants are its schema's, those above it and its space's.
+  Blobs (`opa/blob.rego`): `vend` (read) / `vend_write` (write) / `vend_delete` (delete) /
+  `visible` (describe or read) / `allow_publish` (a steward of the space's group). Grant
+  changes (`allow_change` in both, `allow_change_folder`): `describe` and `read` by `manage`
+  holders, sources being the business of releases; `manage`, `write`, `delete` and `detach` by
+  stewards of the space's group. Group changes (`opa/groups.rego`): anyone creates a group;
+  owners change owners and admins; owners, admins and stewards change members and viewers;
+  platform admins change stewards. Platform admins, marked by a Keycloak realm role in the
+  token, pass every steward and owner check. Group membership and every grant come from
+  governance at decision time; tokens carry no groups.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Each service accepts only tokens issued for it (audience `polaris` for Trino, the gate and
   Polaris; `broker`; `governance`). Tables: Trino and Polaris both validate it (issuer,
@@ -524,12 +509,11 @@ support grants on tables").
   broker each authenticate as an RGW user that can only assume its vending role, and
   governance holds a **read-only RGW reader** (ListBucket on `datasets/*`, via a bucket
   policy). Admin-only RGW setup runs in a one-shot.
-- **Governed ingest is scoped.** A steward may register only under a prefix their group
-  owns (per-group ownership in OPA), prefixes are confined to `datasets/<...>/` (no traversal), and
-  the overlap check + insert are serialized so two registrations can't claim overlapping
-  prefixes.
-- **Tenant-scoped identity.** Dataset ids are derived from per-tenant prefixes, not a global
-  name, so names never collide across tenants and a registration leaks nothing cross-tenant.
+- **Publishing is scoped.** A steward publishes only in their group's space, folders are
+  confined to `datasets/<...>/` (no traversal), and publishing holds one lock, so two published
+  datasets never nest and no credential reaches into a published dataset but its own.
+- **Space-scoped identity.** A dataset's id begins with the group whose space holds it, not a
+  global name, so names never collide across groups.
 
 ## Limitations
 

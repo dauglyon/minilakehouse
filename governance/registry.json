@@ -9,46 +9,24 @@
     "jgi": ["alice"],
     "projw": ["carol"]
   },
-  "namespace_owners": { "jgi": ["lakehouse.db"] },
-  "tables": [
-    {
-      "id": "lakehouse.db.t1",
-      "description": "demo table",
-      "steward": "alice",
-      "describe": [],
-      "read": ["jgi"],
-      "manage": ["jgi"],
-      "write": ["jgi"],
-      "delete": ["jgi"]
-    }
-  ],
-  "register_grants": {
-    "jgi": ["datasets/projx/", "datasets/projz/"],
-    "projw": ["datasets/projw/"]
-  },
   "datasets": [
     {
-      "prefix": "datasets/projx/public/",
-      "description": "projx public data",
+      "prefix": "datasets/jgi/public/",
+      "description": "jgi public data",
       "steward": "alice",
-      "describe": ["jgi"],
-      "access": ["jgi"],
-      "manage": ["jgi"]
+      "published": true
     },
     {
-      "prefix": "datasets/projx/private/",
-      "description": "projx private data",
-      "steward": "alice",
-      "describe": ["jgi"],
-      "access": [],
-      "manage": ["jgi"]
+      "prefix": "datasets/projw/private/",
+      "description": "projw private data",
+      "steward": "carol",
+      "published": true,
+      "describe": ["jgi"]
     },
     {
-      "prefix": "datasets/projy/secret/",
-      "description": "projy secret data",
-      "steward": "bob",
-      "describe": ["bobonly"],
-      "access": ["bobonly"]
+      "prefix": "datasets/bobonly/secret/",
+      "description": "bobonly secret data",
+      "published": true
     }
   ]
 }

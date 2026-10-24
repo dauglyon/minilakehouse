@@ -1,7 +1,7 @@
 """
 seed/check-roles.py — groups, roles and stewards (docs/HANDOFF-2026-10-22-groups.md section 1,
 docs/PLAN-2026-10-24.md item 2) through governance's API, the broker and the gate. alice owns
-and stewards `jgi`, which owns datasets/projx/ and lakehouse.db; carol is a platform admin; bob
+and stewards `jgi`, whose space holds data; carol is a platform admin; bob
 holds nothing. Exits 1 at the first check that fails. Run in the governance container:
 
     docker compose exec governance python /seed/check-roles.py
@@ -44,11 +44,22 @@ def vend(user, dataset, mode):
 
 def create_table(user, name):
     """Whether the gate let the user create lakehouse.<name>, with pyiceberg."""
-    cat = RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse", token=token(user))
     try:
-        cat.create_table(name, schema=Schema(NestedField(1, "x", LongType(), required=False)))
+        catalog(user).create_table(name, schema=Schema(NestedField(1, "x", LongType(), required=False)))
         return True
     except Exception:  # noqa: BLE001 — pyiceberg raises its own error for the gate's 403
+        return False
+
+
+def catalog(user):
+    return RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse", token=token(user))
+
+
+def drop_table(user, name):
+    try:
+        catalog(user).drop_table(name)
+        return True
+    except Exception:  # noqa: BLE001 — pyiceberg raises its own error for Polaris's refusal
         return False
 
 
@@ -59,7 +70,8 @@ def check(what, ok):
 
 
 ts = str(int(time.time()))
-g, mine, ds, tbl = f"rc{ts}", f"bc{ts}", f"projx/rc{ts}", f"db.rc{ts}"
+g, mine = f"rc{ts}", f"bc{ts}"
+ds, tbl = f"{g}/data", f"{g}.t"
 
 
 def patch(user, body):
@@ -101,29 +113,16 @@ check("removing a steward from the group is refused", patch("alice", {"members":
 r = gov("DELETE", f"/groups/{g}/stewards/bob", "carol")
 check("a platform admin removes the steward", r.status_code == 200 and r.json()["stewards"] == [])
 
-# Registration: a steward of a group owning the root
-check("alice adds bob to jgi as a member", gov("PATCH", "/groups/jgi", "alice",
-                                               {"members": {"add": ["bob"]}}).status_code == 200)
-grants = {"describe": [g], "access": [g], "write": [g]}
-check("a member's registration is refused",
-      gov("POST", "/datasets", "bob", {"prefix": f"datasets/{ds}/", **grants}).status_code == 403)
-check("a steward's registration is accepted",
-      gov("POST", "/datasets", "alice", {"prefix": f"datasets/{ds}/", **grants}).status_code == 201)
-table_grants = {"id": f"lakehouse.{tbl}", "read": [g], "write": [g], "delete": [g]}
-check("a member's table registration is refused", gov("POST", "/tables", "bob", table_grants).status_code == 403)
-check("a steward's table registration is accepted",
-      gov("POST", "/tables", "alice", table_grants).status_code == 201)
-check("bob leaves jgi", gov("PATCH", "/groups/jgi", "alice", {"members": {"remove": ["bob"]}}).status_code == 200)
-
-# A viewer holds describe and read, never write
+# A viewer holds describe and read, never write: in the group's own space
+check("its owner creates the space's namespace", catalog("alice").create_namespace((g,)) is None)
 check("bob becomes a viewer", patch("alice", {"viewers": {"add": ["bob"]}}) == 200)
-check("the viewer reads the dataset", vend("bob", ds, "read") == 200)
+check("the viewer reads a folder in the space", vend("bob", ds, "read") == 200)
 check("the viewer is refused a write credential", vend("bob", ds, "write") == 403)
-check("the viewer is refused creating the table", not create_table("bob", tbl))
+check("the viewer is refused creating a table", not create_table("bob", tbl))
 check("GET /groups answers a viewer", gov("GET", f"/groups/{g}", "bob").status_code == 200)
 check("GET /groups refuses someone outside", gov("GET", "/groups/projw", "bob").status_code == 404)
 r = gov("GET", f"/datasets/{ds}", "bob")
-check("GET /datasets shows the viewer the entry", r.status_code == 200 and r.json()["can_read"]
+check("GET /datasets shows the viewer the folder", r.status_code == 200 and r.json()["can_read"]
       and r.json()["effective_read"] == [g])
 check("bob becomes a member again", patch("alice", {"members": {"add": ["bob"]}}) == 200)
 check("the member gets a write credential", vend("bob", ds, "write") == 200)
@@ -132,12 +131,13 @@ r = gov("GET", f"/tables/lakehouse.{tbl}", "bob")
 check("GET /tables shows a reader the entry", r.status_code == 200 and r.json()["grants"]["read"] == [g])
 check("GET /tables refuses someone who may not describe it",
       gov("GET", f"/tables/lakehouse.{tbl}", "carol").status_code == 404)
-RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse", token=token("bob")).drop_table(tbl)
+check("a member may not drop it: delete is the admins'", not drop_table("bob", tbl))
+check("its owner drops it", drop_table("alice", tbl))
 
 # Deleting
 check("an owner deletes a group", gov("DELETE", f"/groups/{mine}", "bob").status_code == 200)
-check("a group owning a root is not deleted", gov("DELETE", "/groups/jgi", "alice").status_code == 409)
+check("a group whose space holds data is not deleted", gov("DELETE", "/groups/jgi", "alice").status_code == 409)
 check("a non-owner may not delete", gov("DELETE", f"/groups/{g}", "bob").status_code == 403)
-check("alice deletes hers", gov("DELETE", f"/groups/{g}", "alice").status_code == 200)
-check("its name stays taken while grants name it",
+check("alice deletes hers, its space holding no data", gov("DELETE", f"/groups/{g}", "alice").status_code == 200)
+check("its name stays taken while its space has entries",
       gov("POST", "/groups", "bob", {"name": g}).status_code == 409)

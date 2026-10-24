@@ -19,11 +19,11 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    commit responses are cut the same way for everyone else (current_view_only). A view that
    would run with its owner's rights is refused (runs_as_owner).
 5. Creation. Polaris's own check for creating a table, committing a staged create, or creating
-   a namespace names only the parent, so the gate decides the name: a table or view must be
-   registered in governance, still pending, with the person in its write grant; a namespace
-   must lie under one the person's group owns. It reports each table created or dropped to
-   governance, which marks the entry live or gone. Registering and renaming tables are refused
-   (root-only in Polaris too).
+   a namespace names only the parent, so the gate decides the name: the person must hold
+   `write` on the namespace it goes in, which a group's space gives its members and above
+   (docs/HANDOFF-2026-10-22-groups.md section 3), cut by rule 3 for a table. It reports each
+   table created or dropped to governance, which records the table live or gone. Registering and
+   renaming tables are refused (root-only in Polaris too).
 6. The governance namespace. The gate answers for one namespace itself, `governance`, holding
    `datasets` (the dataset index), `sessions`, `lineage`, `derivations`, `releases` and
    `grants`. A load of one
@@ -511,12 +511,14 @@ def proxy(_):
             if n is not None and n.split(".")[1:2] == [INDEX_NS]:
                 return forbidden("the governance namespace is governance's own")
             if n is None or opa("allow_namespace", {"subject": subject, "id": n}) is not True:
-                return forbidden(f"none of your groups owns {n} or a namespace above it")
+                return forbidden(f"you may not create {n}: not in the write grant of its space "
+                                 "or a namespace above it")
         for t in new_tables:
             if t is None or opa("allow_create", {"subject": subject, "id": t}) is not True:
                 if named and named[2] and not may_view(subject, "namespace", named[1], named[2], None):
                     return not_found("namespace", named[2], None)
-                return forbidden(f"{t} is not registered for creation, or you are not in its write grant")
+                return forbidden(f"you may not create {t}: not in the write grant of its namespace, "
+                                 "or it is closed to you by what it was made from")
 
         written = writes(segments, body) if request.method == "POST" else []
         if written:

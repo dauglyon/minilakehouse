@@ -4,8 +4,13 @@ package lakehouse.tables
 # with these, so a listing shows exactly what a load would allow. The names a person holds grants
 # through and every table's grants come from governance (lakehouse.governance holder: `read` for
 # describe and read, `write` for every other grant); Polaris sends only a name. Rules that
-# governance asks about registering and changing grants also get input.platform_admin, which
+# governance asks about publishing and changing grants also get input.platform_admin, which
 # passes wherever a steward does.
+#
+# A table has no grants of its own (docs/HANDOFF-2026-10-22-groups.md section 3): its entry's
+# grants are the union of its namespace's, those of the namespaces above it and its space's
+# defaults (the space of group g is the namespace <catalog>.g). A namespace published is one
+# dataset of its tables; `published` on a table says one at or above it is.
 #
 # An id is "<catalog>.<namespace...>" for a namespace and "<catalog>.<namespace...>.<table>"
 # for a table. polaris.authz._id builds it from Polaris's input and gate/app.py from the URL,
@@ -14,7 +19,7 @@ package lakehouse.tables
 #   decide           input {subject, tables: [id], namespaces: [id]}
 #                    gate, governance: {tables: [id], namespaces: [id]}, the ones the subject
 #                    may view, and readable: [id], the tables they may read
-#   allow_create     input {subject, id}   gate: may create this table or view now
+#   allow_create     input {subject, id}   gate: may create this table or view
 #   allow_write      input {subject, id}   governance: may declare what this table was derived
 #                                          from (PROVENANCE.md 5.3)
 #   load             input {subject, id, kind: table | view, credential, properties: {key: value}}
@@ -22,11 +27,9 @@ package lakehouse.tables
 #                    metadata without one, and per view load or commit:
 #                    {write, history, properties: [key]}
 #   allow_namespace  input {subject, id}   gate: may create this namespace
-#   allow_register   input {subject, id, platform_admin}   governance: may register this table
+#   allow_publish    input {subject, id, platform_admin}   governance: may publish this namespace
 #   allow_change     input {subject, id, grants: [grant], platform_admin}
-#                                          governance: may change these grants on this table
-#   allow_change_root  input {subject, id, platform_admin}
-#                                          governance: may change who owns this namespace
+#                                          governance: may change these grants on this namespace
 #   blocking         input {subject, id}   governance's read API: the sources that refuse the
 #                                          subject this table
 #   effective_read   input {id, holders: {name: [name]}}
@@ -59,15 +62,11 @@ namespaces contains id if {
 	namespace_viewable(h, e)
 }
 
-# Creating a table or view needs its entry registered first, still pending, with one of the
-# person's groups in its write grant. Ids are never reused, so a dropped table stays gone.
+# Creating a table or view: `write` on the namespace it goes in, which governance's entry for a
+# table not created yet carries (status null), cut by rule 3 like any write.
 default allow_create := false
 
-allow_create if {
-	e := table(input.id)
-	e.status == "pending"
-	writable(governance.holder(input.subject), e)
-}
+allow_create if writable(governance.holder(input.subject), table(input.id))
 
 # Declaring what a table was derived from needs a group in its write grant.
 default allow_write := false
@@ -112,27 +111,25 @@ _load_history if {
 
 _load_properties contains k if some k, _ in input.properties
 
-# A member or above of a group owning the namespace or one above it.
+# Creating a namespace: `write` on it, which the namespaces above it and its space grant.
 default allow_namespace := false
 
-allow_namespace if {
-	namespace_owned(governance.holder(input.subject).write, namespace(input.id))
-}
+allow_namespace if _holds(governance.holder(input.subject).write, namespace(input.id).write)
 
-# Registering a table: a steward of a group owning its namespace or one above it.
-default allow_register := false
+# Publishing a namespace: a steward of the group whose space holds it.
+default allow_publish := false
 
-allow_register if _steward(namespace(_parent(input.id)).owners)
+allow_publish if _steward(namespace(input.id).space)
 
-# Changing grants (WHITEPAPER 4.4): `describe` and `read` by a group holding `manage` on the table
-# itself; a group added that may not read a source stays blocked by rule 3 until the source's
-# `manage` holders release the table to it (PROVENANCE.md 6.7). `manage`, `write`, `delete` and
-# `detach` by a steward of a group owning its namespace, the ownership registration checks:
-# `detach` decides how far the table's protection follows its data (6.5), as `manage` does.
+# Changing a namespace's grants (WHITEPAPER 4.4): `describe` and `read` by a group holding its
+# `manage`; a group added that may not read a source of a table stays blocked by rule 3 until the
+# source's `manage` holders release the table to it (PROVENANCE.md 6.7). `manage`, `write`,
+# `delete` and `detach` by a steward of the group whose space holds it: `detach` decides how
+# far its tables' protection follows their data (6.5), as `manage` does.
 default allow_change := false
 
 allow_change if {
-	e := table(input.id)
+	e := namespace(input.id)
 	h := governance.holder(input.subject)
 	count(input.grants) > 0
 	every g in input.grants {
@@ -145,25 +142,15 @@ _may_change(h, e, g) if {
 	_holds(h.write, e.manage)
 }
 
-_may_change(_, _, g) if {
+_may_change(_, e, g) if {
 	g in {"manage", "write", "delete", "detach"}
-	_steward(namespace(_parent(input.id)).owners)
+	_steward(e.space)
 }
 
-# Changing who owns a namespace: a steward of a group owning it or one above it, as for prefix
-# roots (blob.rego). Owning a namespace owns everything under it, so an owner can hand part of
-# its tree to another group and can't be shut out of it. Platform admins assign top-level ones.
-default allow_change_root := false
-
-allow_change_root if _steward(namespace(input.id).owners)
-
-# A steward of one of these groups, or a platform admin.
+# A steward of the space's group, or a platform admin.
 _steward(_) if input.platform_admin == true
 
-_steward(owners) if {
-	some g in owners
-	concat("#", [g, "steward"]) in governance.groups(input.subject)
-}
+_steward(space) if concat("#", [space, "steward"]) in governance.groups(input.subject)
 
 # The read API (governance GET /tables/<id>): the sources that refuse the subject this table,
 # and which names in its read and write pass every source with all their holders.
@@ -177,12 +164,6 @@ effective_read contains n if {
 	e := table(input.id)
 	some n, names in input.holders
 	sources_allow(names, e)
-}
-
-# The namespace holding a table: its id without the last name.
-_parent(id) := concat(".", array.slice(parts, 0, count(parts) - 1)) if {
-	parts := split(id, ".")
-	count(parts) >= 3
 }
 
 # A table's grants, and the sources its files carry (PROVENANCE.md 6, rule 3). Governance's
@@ -207,12 +188,27 @@ readable(h, e) if {
 	sources_allow(h.read, e)
 }
 
-# Governance's dataset index offers OPA only tables whose describe, read or write names one of the
-# person's groups (governance/app.py _index_rows); a change to what makes a table viewable
-# changes that too. `describe` is not cut by sources (WHITEPAPER 4.3).
+# Governance's dataset index offers OPA only tables some layer of whose describe, read or write
+# names one of the person's groups (governance/app.py _index_rows); a change to what makes a
+# table viewable changes that too. `describe` is not cut by sources (WHITEPAPER 4.3). A table in
+# no published namespace is viewable only by those holding its `read` or `write`, whatever its
+# `describe`, and by them even when rule 3 closes it (handoff section 3).
 viewable(h, e) if readable(h, e)
 
-viewable(h, e) if _holds(h.read, e.describe)
+viewable(h, e) if {
+	e.published
+	_holds(h.read, e.describe)
+}
+
+viewable(h, e) if {
+	not e.published
+	_holds(h.read, e.read)
+}
+
+viewable(h, e) if {
+	not e.published
+	_holds(h.write, e.write)
+}
 
 writable(h, e) if {
 	_holds(h.write, e.write)
@@ -242,16 +238,15 @@ _holds(groups, grant) if {
 
 droppable(h, e) if _holds(h.write, e.delete)
 
-# A namespace: its owners, and anyone who may view some table under it.
-namespace_viewable(h, e) if {
-	some g in h.read
-	g in array.concat(e.owners, e.viewers)
-}
+# A namespace: anyone holding describe, read or write on it, or on a namespace under it, so a
+# person can reach what they were granted deeper down.
+namespace_viewable(h, e) if _holds(h.read, array.concat(array.concat(e.describe, e.read), e.below))
 
-namespace_owned(groups, e) if {
-	some g in groups
-	g in e.owners
-}
+namespace_viewable(h, e) if _holds(h.write, e.write)
+
+namespace_writable(h, e) if _holds(h.write, e.write)
+
+namespace_droppable(h, e) if _holds(h.write, e.delete)
 
 table(id) := governance.get(concat("/", ["/internal/tables", urlquery.encode(id)]))
 

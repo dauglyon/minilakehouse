@@ -43,11 +43,11 @@ def current(cat):
 
 
 def read_stamped(cat):
-    """The session governance stamped a fresh read of lakehouse.db.t1 with, as lineage shows it."""
+    """The session governance stamped a fresh read of lakehouse.jgi.t1 with, as lineage shows it."""
     since = datetime.now(timezone.utc)
-    cat.load_table("db.t1")   # a credentialed load: the gate logs a read
+    cat.load_table("jgi.t1")   # a credentialed load: the gate logs a read
     return [r["session"] for r in rows(cat, "lineage")
-            if r["source"] == "lakehouse.db.t1" and r["target"] is None and r["event_time"] >= since]
+            if r["source"] == "lakehouse.jgi.t1" and r["target"] is None and r["event_time"] >= since]
 
 
 def check(what, ok):

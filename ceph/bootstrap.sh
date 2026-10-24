@@ -13,7 +13,8 @@ set -e
 mc alias set rgw "${MC_ENDPOINT}" "${MC_ACCESS_KEY}" "${MC_SECRET_KEY}"
 mc mb --ignore-existing "rgw/${S3_BUCKET}"
 
-# Seed the demo blob datasets (Flow C) under datasets/projx/{public,private}/.
+# Seed the demo blob datasets (Flow C), each in its group's space: datasets/jgi/public/ and
+# datasets/projw/private/.
 if [ -d /blobs ]; then
   echo "Seeding demo blobs into ${S3_BUCKET}/datasets/ ..."
   mc cp --recursive /blobs/ "rgw/${S3_BUCKET}/datasets/"

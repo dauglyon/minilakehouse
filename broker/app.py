@@ -9,7 +9,7 @@ Flow:
   1. verify the user's token            -> subject
   2. ask OPA about the dataset id -> {allow, prefix}: `vend` to read (the dataset's `read`
      grant), `vend_write` to write (its `write` grant), `vend_delete` to delete (its `delete`
-     grant). OPA fetches the person's groups and the dataset's grants and registered prefix
+     grant). OPA fetches the names the person holds grants through and the folder's grants and prefix
      from governance
   3. on allow: AssumeRole on `blob-vendor` (read: get and list), `blob-writer` (write: put
      and delete, no get, WHITEPAPER 4.2) or `blob-deleter` (delete: list and delete, no get
