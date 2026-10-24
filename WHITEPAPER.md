@@ -259,7 +259,13 @@ grants OPA reads are the ones the write replaces.
 - Moving a folder or a table into another group's space: the person whose personal space holds
   it, or an owner or admin of the plain group whose space does, into a group they are a member
   or above of, at a path that does not exist and is not inside a published dataset.
-- Platform admins pass every check an owner or a steward passes, outside personal spaces.
+- Platform admins pass every check on a group's people, stewards and deletion, every check that
+  asks for a steward (publishing; changing `manage`, `write`, `delete`, `detach` and `revoked`;
+  changing a collection's `manage`, `write` and `delete`), and creating a collection. A check on
+  a grant or role they would have to hold, such as a credential, a move or a change to
+  `describe` or `read`, they pass only by adding themselves to a group that holds it. None of
+  this reaches into a personal space, whose group takes no one else and in which nothing is
+  published or granted, whoever asks.
 
 ## 5. Components and trust
 

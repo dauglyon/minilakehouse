@@ -5,7 +5,7 @@ package lakehouse.collections
 # `read` reach every member through nested collections; governance folds them into each
 # member's grants, so the dataset rules decide about members unchanged. These rules decide
 # about the collection itself. Rules governance asks about changes also get
-# input.platform_admin, which passes wherever a steward does.
+# input.platform_admin, which passes allow_create and every check that asks for a steward.
 #
 #   allow_create   input {subject, group, platform_admin}              may create one owned by this group
 #   allow_write    input {subject, collection, platform_admin}         may change its description

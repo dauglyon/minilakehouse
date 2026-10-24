@@ -3,8 +3,8 @@ package lakehouse.blob
 # Blob-plane rules (Flows A and C, publishing and grant changes). Callers send the person's
 # subject and the dataset or folder ids they name; the rules fetch the names the person holds
 # grants through (lakehouse.governance holder) and the entries from governance. Rules governance
-# asks about publishing and changing also get input.platform_admin, which passes wherever a
-# steward does.
+# asks about publishing and changing also get input.platform_admin, which passes every
+# check that asks for a steward.
 #
 #   vend            input {subject, dataset: id, recursive}   broker: {allow, prefix} to read a folder
 #   vend_write      input {subject, dataset: id, recursive}   broker: {allow, prefix} to write a folder

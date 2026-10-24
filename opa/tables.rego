@@ -5,7 +5,7 @@ package lakehouse.tables
 # through and every table's grants come from governance (lakehouse.governance holder: `read` for
 # describe and read, `write` for every other grant); Polaris sends only a name. Rules that
 # governance asks about publishing and changing grants also get input.platform_admin, which
-# passes wherever a steward does.
+# passes every check that asks for a steward.
 #
 # A table has no grants of its own (docs/HANDOFF-2026-10-22-groups.md section 3): its entry's
 # grants are the union of its namespace's, those of the namespaces above it and its space's

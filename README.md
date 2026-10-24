@@ -415,8 +415,10 @@ and SpiceDB: `jgi#admin` is jgi's admins and owners, `jgi#member` its members an
   viewers. A change leaving no owner is refused.
 - Platform admins are people whose Keycloak token carries the realm role `platform-admin`
   (carol). They hold no role in any group, appoint and remove stewards
-  (`PUT` and `DELETE /groups/<name>/stewards/<person>`), and pass every check an owner or a
-  steward passes. A group with a steward is a tenant; a change leaving a steward a viewer or
+  (`PUT` and `DELETE /groups/<name>/stewards/<person>`), change any group's people and delete
+  it, and pass every check that asks for a steward. A credential, a move or a change to
+  `describe` or `read` takes a grant or role they hold only by joining a group (`WHITEPAPER.md`
+  4.4). A group with a steward is a tenant; a change leaving a steward a viewer or
   out of the group is refused until a platform admin removes the steward.
 - `DELETE /groups/<name>` is its owners', refused while its space holds data.
 - `GET /me`, `GET /groups/<name>` (its viewers and above), `GET /datasets/<id>` and
@@ -575,7 +577,7 @@ support grants on tables").
   stewards of the space's group. Group changes (`opa/groups.rego`): anyone creates a group;
   owners change owners and admins; owners, admins and stewards change members and viewers;
   platform admins change stewards. Platform admins, marked by a Keycloak realm role in the
-  token, pass every steward and owner check. Group membership and every grant come from
+  token, pass every check on a group's people and every check that asks for a steward. Group membership and every grant come from
   governance at decision time; tokens carry no groups.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Each service accepts only tokens issued for it (audience `polaris` for Trino, the gate and
