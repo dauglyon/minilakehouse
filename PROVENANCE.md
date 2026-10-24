@@ -536,10 +536,11 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   Reading the target brings in the source marked with the release, so data built from the
   target carries the mark and the group may read that too. Data that took the source by
   another path is not covered and still needs the source's `read`.
-- **Reading, and writing what it reads.** A release lets its group past the source wherever
-  rule 3 asks for the source's `read`, for writing as for reading: writing needs it only so
-  that no one writes blind, and the group can read what it writes. It does not let the group
-  release the target further.
+- **It grants no `write`.** Write permission comes only from `write` grants. Rule 3 also checks
+  sources when someone writes a dataset they hold `write` on, so that no one writes blind
+  (rule 3 above), and there a release counts as it does for reading: a member of the group
+  can write their own table built from the target although it carries the source. The group
+  cannot release the target further.
 - **Recorded, visible, withdrawable.** A release is stored with who requested and approved it
   and when, shown to the source's `share` holders, and withdrawn by any of them. A release
   stays when its approver later loses `share` on the source.
