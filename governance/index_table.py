@@ -81,6 +81,8 @@ TABLES = {
                       ("inherited_from", StringType)),   # a folder, a namespace, `space`; empty for its own
     "collection_members": _schema(("collection", StringType), ("member", StringType),
                                   ("kind", StringType)),   # files | namespace | collection
+    "drafts": _schema(("source", StringType), ("source_type", StringType), ("target", StringType),
+                      ("used", BooleanType), ("engine", StringType), ("statement_id", StringType)),
 }
 WRITABLE = {"derivations", "sessions"}
 # The updates an append makes: a snapshot, the branch moved to it, and the statistics an engine

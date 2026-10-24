@@ -2,14 +2,17 @@
 pki.py — one-shot: the certificates that let governance know its internal callers.
 
 Governance serves /internal/* on a TLS listener that accepts only client certificates from this
-CA: `opa` for the grant lookups, `gate` for its table create/drop reports, and `gate` and
-`broker` for the access log (PROVENANCE.md 4.1). Each caller presents
+CA: `opa` for the grant lookups, `gate` for its table create/drop reports, `gate` and
+`broker` for the access log (PROVENANCE.md 4.1), `broker` for transfers, and `trino` for the
+statement events its HTTP event listener sends (docs/HANDOFF-2026-10-22-groups.md section 4).
+Each caller presents
 its certificate from files it mounts; a file, unlike OPA's environment, cannot be read back
 through OPA's query API.
 
 Each party gets its own volume: /pki/ca (the CA, this job only), /pki/governance (the server
 certificate, and the Ed25519 key governance signs declarations with, PROVENANCE.md 5.3),
-/pki/opa, /pki/gate and /pki/broker (client certificates). Existing files are kept and a
+/pki/opa, /pki/gate, /pki/broker and /pki/trino (client certificates; Trino's also as one PEM
+file holding key and certificate, the key store its HTTP client reads). Existing files are kept and a
 missing certificate is added under the existing CA, so the job is safe to rerun.
 """
 import datetime
@@ -21,17 +24,19 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 CA_DIR, GOV_DIR = "/pki/ca", "/pki/governance"
-OPA_DIR, GATE_DIR, BROKER_DIR = "/pki/opa", "/pki/gate", "/pki/broker"
+OPA_DIR, GATE_DIR, BROKER_DIR, TRINO_DIR = "/pki/opa", "/pki/gate", "/pki/broker", "/pki/trino"
 DAYS = 3650
 # Each private key is readable only by the user its container runs as: governance, the gate and
-# the broker run as root, the OPA image as OPA_UID.
+# the broker run as root, the OPA image as OPA_UID, the Trino image as TRINO_UID.
 OPA_UID = int(os.environ.get("OPA_UID", "1000"))
+TRINO_UID = int(os.environ.get("TRINO_UID", "1000"))
 # directory: (file stem, certificate name, key usage, DNS names, key owner)
 PARTIES = {
     GOV_DIR: ("server", "governance", ExtendedKeyUsageOID.SERVER_AUTH, ["governance"], 0),
     OPA_DIR: ("client", "opa", ExtendedKeyUsageOID.CLIENT_AUTH, None, OPA_UID),
     GATE_DIR: ("client", "gate", ExtendedKeyUsageOID.CLIENT_AUTH, None, 0),
     BROKER_DIR: ("client", "broker", ExtendedKeyUsageOID.CLIENT_AUTH, None, 0),
+    TRINO_DIR: ("client", "trino", ExtendedKeyUsageOID.CLIENT_AUTH, None, TRINO_UID),
 }
 
 
@@ -103,6 +108,8 @@ def main():
         _write(f"{d}/ca.crt", ca.public_bytes(serialization.Encoding.PEM))
         _write(f"{d}/{stem}.crt", cert.public_bytes(serialization.Encoding.PEM))
         _write(f"{d}/{stem}.key", _pem_key(key), 0o600, owner)
+        if d == TRINO_DIR:
+            _write(f"{d}/{stem}.pem", _pem_key(key) + cert.public_bytes(serialization.Encoding.PEM), 0o600, owner)
         made.append(name)
     if not os.path.exists(f"{GOV_DIR}/signing.key"):
         key = ed25519.Ed25519PrivateKey.generate()

@@ -183,6 +183,7 @@ services:
       - pki_opa:/pki/opa
       - pki_gate:/pki/gate
       - pki_broker:/pki/broker
+      - pki_trino:/pki/trino
 
   broker:
     # Blob vending broker (Flow C: blob datasets). The true end-to-end plane: clients present
@@ -428,6 +429,8 @@ services:
         condition: service_completed_successfully
       polaris-setup:
         condition: service_completed_successfully
+      pki:
+        condition: service_completed_successfully
       keycloak:
         condition: service_healthy
       gate:
@@ -443,6 +446,11 @@ services:
     volumes:
       - ./trino/etc/config.properties:/etc/trino/config.properties:ro
       - ./trino/etc/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+      # Each completed statement's inputs and output go to governance, which drafts declarations
+      # from them (docs/HANDOFF-2026-10-22-groups.md section 4), over its internal listener with
+      # this client certificate.
+      - ./trino/etc/event-listener.properties:/etc/trino/event-listener.properties:ro
+      - pki_trino:/pki:ro
       - ./seed:/seed:ro
     ports:
       - "8083:8080"
@@ -500,3 +508,4 @@ volumes:
   pki_opa:
   pki_gate:
   pki_broker:
+  pki_trino:

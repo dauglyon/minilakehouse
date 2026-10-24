@@ -29,7 +29,7 @@ import threading
 import time
 from xml.sax.saxutils import escape
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import index_table
@@ -107,6 +107,9 @@ EXTERNAL_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Governance signs each declaration it accepts with this key (pki.py), as a DSSE envelope.
 SIGNING_KEY = os.environ.get("SIGNING_KEY", f"{os.environ.get('PKI_DIR', '/pki')}/signing.key")
 DECLARATION_TYPE = "application/vnd.minilakehouse.derivation+json"
+# Each engine catalog the event listener names, and the catalog its table ids start with:
+# Trino's `iceberg` is Polaris's `lakehouse` (docs/HANDOFF-2026-10-22-groups.md section 4).
+ENGINE_CATALOGS = dict(p.split("=", 1) for p in os.environ.get("ENGINE_CATALOGS", "iceberg=lakehouse").split(","))
 # The grants of an entry, a folder and a namespace, and `revoked`: the groups whose own copies,
 # in their personal space, carrying this as a source close to them (PROVENANCE.md 9).
 GRANTS = ("describe", "read", "manage", "write", "delete", "detach", "revoked")
@@ -439,6 +442,24 @@ CREATE TABLE IF NOT EXISTS collection_members (
     PRIMARY KEY (collection, member)
 );
 CREATE INDEX IF NOT EXISTS collection_members_member ON collection_members (member);
+-- Statements an engine reported (docs/HANDOFF-2026-10-22-groups.md section 4): each completed
+-- statement that read or wrote a table, with what it read and wrote, the session the access
+-- log puts it in, and whether it returned rows to the client. Drafts are worked out from these.
+CREATE TABLE IF NOT EXISTS engine_statements (
+    id           BIGSERIAL PRIMARY KEY,
+    engine       TEXT NOT NULL,
+    statement_id TEXT NOT NULL,
+    person       TEXT NOT NULL,
+    session      BIGINT NOT NULL REFERENCES sessions (id),
+    target       TEXT,                         -- the table it wrote, if any
+    inputs       TEXT[] NOT NULL,              -- the tables it read
+    to_client    BOOLEAN NOT NULL,             -- it wrote no table, so what it read went to the client
+    started      TIMESTAMPTZ NOT NULL,
+    ended        TIMESTAMPTZ NOT NULL,
+    event        JSONB NOT NULL,
+    UNIQUE (engine, statement_id)
+);
+CREATE INDEX IF NOT EXISTS engine_statements_person ON engine_statements (person, session);
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -629,7 +650,7 @@ internal_app = Flask("internal")
 # The certificate names that may call each internal route; every other route is a grant lookup,
 # OPA's alone.
 INTERNAL_CALLERS = {"/internal/table-events": {"gate"}, "/internal/accesses": {"gate", "broker"},
-                    "/internal/transfers": {"broker"}}
+                    "/internal/transfers": {"broker"}, "/internal/drafts": {"trino"}}
 
 
 @internal_app.before_request
@@ -1409,6 +1430,72 @@ def internal_transfers():
         _invalidate(cur, [src, dst])
     app.logger.info("TRANSFER begin %s %s -> %s (%s)", tid, src, dst, body["person"])
     return jsonify({"transfer": tid, "files": [{"key": k, "etag": e} for k, _, e in found]})
+
+
+def _engine_table(ref):
+    """A table id from an event's {catalogName, schema, table}, or None for one outside the
+    catalogs governance knows, or in the governance namespace, which the gate answers itself."""
+    if not isinstance(ref, dict) or ref.get("catalogName") not in ENGINE_CATALOGS:
+        return None
+    schema, table = ref.get("schema"), ref.get("table")
+    if not isinstance(schema, str) or not isinstance(table, str) or schema.split(".")[0] == "governance":
+        return None
+    tid = f"{ENGINE_CATALOGS[ref['catalogName']]}.{schema}.{table}"
+    return tid if TABLE_ID_RE.match(tid) else None
+
+
+def _instant(v):
+    return datetime.fromisoformat(v.replace("Z", "+00:00")) if isinstance(v, str) else None
+
+
+@internal_app.post("/internal/drafts")
+def internal_drafts():
+    # A completed statement from Trino's HTTP event listener (QueryCompletedEvent), which knows
+    # Trino by its client certificate. A statement that read or wrote a table is kept if the
+    # access log bears it out: a statement that wrote a table needs the person's write of it,
+    # logged by the gate within the statement's time, which gives its session; every table it
+    # read needs the person's read of it, logged in that session (or, for a statement that
+    # wrote nothing, within its time). Anything else is dropped and logged: an engine speaks
+    # only about reads the log shows it made. Always answers 200 for an event it understood,
+    # so the listener does not send it again.
+    ev = request.get_json(silent=True) or {}
+    meta, ctx, io = ev.get("metadata") or {}, ev.get("context") or {}, ev.get("ioMetadata") or {}
+    person, sid = ctx.get("user"), meta.get("queryId")
+    started, ended = _instant(ev.get("createTime")), _instant(ev.get("endTime"))
+    if not all(isinstance(v, str) for v in (person, sid)) or started is None or ended is None:
+        return jsonify({"error": "not a completed-statement event"}), 400
+    if meta.get("queryState") != "FINISHED":
+        return jsonify({"ok": True, "kept": False})
+    target = _engine_table(io.get("output"))
+    inputs = sorted({t for t in (_engine_table(i) for i in io.get("inputs") or []) if t and t != target})
+    if not inputs and target is None:
+        return jsonify({"ok": True, "kept": False})
+    window = {"p": person, "from": started - timedelta(seconds=CLOCK_TOLERANCE),
+              "to": ended + timedelta(seconds=CLOCK_TOLERANCE)}
+    with db(commit=True) as cur:
+        if target is not None:
+            cur.execute("SELECT session FROM accesses WHERE person = %(p)s AND dataset = %(t)s AND mode = 'write' "
+                        "AND at BETWEEN %(from)s AND %(to)s ORDER BY at DESC LIMIT 1", {**window, "t": target})
+        else:
+            cur.execute("SELECT session FROM accesses WHERE person = %(p)s AND dataset = ANY(%(i)s) AND mode = 'read' "
+                        "AND at BETWEEN %(from)s AND %(to)s ORDER BY at DESC LIMIT 1", {**window, "i": inputs})
+        row = cur.fetchone()
+        if row is None:
+            app.logger.info("DRAFT drop %s %s: no logged %s in its time", person, sid,
+                            "write of " + target if target else "read")
+            return jsonify({"ok": True, "kept": False})
+        session = row["session"]
+        cur.execute("SELECT DISTINCT dataset FROM accesses WHERE person = %s AND session = %s AND mode = 'read' "
+                    "AND dataset = ANY(%s) AND at <= %s", (person, session, inputs, window["to"]))
+        if unread := sorted(set(inputs) - {r["dataset"] for r in cur.fetchall()}):
+            app.logger.info("DRAFT drop %s %s: reads the log does not show: %s", person, sid, ", ".join(unread))
+            return jsonify({"ok": True, "kept": False})
+        cur.execute("INSERT INTO engine_statements (engine, statement_id, person, session, target, inputs, to_client, "
+                    "started, ended, event) VALUES ('trino', %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (engine, statement_id) DO NOTHING",
+                    (sid, person, session, target, inputs, target is None, started, ended, json.dumps(ev)))
+    app.logger.info("DRAFT keep %s %s -> %s from %s", person, sid, target or "client", ", ".join(inputs) or "nothing")
+    return jsonify({"ok": True, "kept": True})
 
 
 def _pointer(cur, person, sid, create=False):
@@ -2345,6 +2432,54 @@ def _index_rows(subject):
     return sorted(rows, key=lambda r: (r["kind"], r["id"]))
 
 
+def _draft_rows(subject):
+    """governance.drafts (docs/HANDOFF-2026-10-22-groups.md section 4): for each table the
+    subject wrote with a statement an engine reported, a draft of its declaration. Each of their
+    candidates for it (governance.lineage, read directly) is `used` if a statement writing it in
+    that session read it, `unused` if it is a table the engine read in that session and every
+    read of it there wrote its rows into a table, and has no row otherwise: a file read, a source
+    that arrived through a read, or a table whose rows went to the client, which only the person
+    can account for. A candidate of several sessions is used if any says so and unused only if
+    all do. A draft changes no one's access; confirming it is an insert into derivations."""
+    with db() as cur:
+        cur.execute("SELECT s.name AS session, e.statement_id, e.target, e.inputs, e.to_client, e.engine "
+                    "FROM engine_statements e JOIN sessions s ON s.id = e.session WHERE e.person = %s "
+                    "ORDER BY e.id", (subject,))
+        statements = cur.fetchall()
+    written = {}   # target -> {session: inputs of the statements writing it there}, and the last statement
+    read, shown = {}, {}   # session -> tables read by any statement; those whose rows went to the client
+    last = {}
+    for st in statements:
+        read.setdefault(st["session"], set()).update(st["inputs"])
+        if st["to_client"]:
+            shown.setdefault(st["session"], set()).update(st["inputs"])
+        if st["target"]:
+            written.setdefault(st["target"], {}).setdefault(st["session"], set()).update(st["inputs"])
+            last[st["target"]] = (st["engine"], st["statement_id"])
+    if not written:
+        return []
+    verdicts = {}   # (target, source) -> [verdict per session], source_type
+    for r in _lineage_rows(subject):
+        t, src = r["target"], r["source"]
+        if t not in written or src is None or not r["direct"]:
+            continue
+        sess = r["session"]
+        if src in written[t].get(sess, set()):
+            v = True
+        elif r["source_type"] == "table" and src in read.get(sess, set()) and src not in shown.get(sess, set()):
+            v = False
+        else:
+            v = None
+        verdicts.setdefault((t, src, r["source_type"]), []).append(v)
+    rows = []
+    for (t, src, kind), vs in sorted(verdicts.items()):
+        used = True if True in vs else (False if all(v is False for v in vs) else None)
+        if used is not None:
+            rows.append({"source": src, "source_type": kind, "target": t, "used": used,
+                         "engine": last[t][0], "statement_id": last[t][1]})
+    return rows
+
+
 def _collection_member_rows(subject):
     """governance.collection_members: for each collection the subject's index lists, the
     members it lists too."""
@@ -2844,6 +2979,8 @@ def index_load():
         rows = _grant_rows(subject)
     elif name == "collection_members":
         rows = _collection_member_rows(subject)
+    elif name == "drafts":
+        rows = _draft_rows(subject)
     else:
         return jsonify({"error": "no such table"}), 404
     table = index_table.build(subject, name, rows)

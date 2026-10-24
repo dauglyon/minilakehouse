@@ -25,8 +25,8 @@ gate — the proxy in front of Polaris (WHITEPAPER.md §5). Polaris is reachable
    table created or dropped to governance, which records the table live or gone. Registering and
    renaming tables are refused (root-only in Polaris too).
 6. The governance namespace. The gate answers for one namespace itself, `governance`, holding
-   `datasets` (the dataset index), `sessions`, `lineage`, `derivations`, `releases`, `grants`
-   and `collection_members`. A load of one
+   `datasets` (the dataset index), `sessions`, `lineage`, `derivations`, `releases`, `grants`,
+   `collection_members` and `drafts`. A load of one
    returns governance's per-person table (governance/index_table.py), whose files governance
    serves; a commit to `sessions` or `derivations` goes to governance, which accepts it only as
    one session name or a valid declaration (PROVENANCE.md 3, 5.3). Polaris holds none of them.
@@ -70,7 +70,7 @@ OWNER_RIGHTS = "trino.run-as-owner"
 SEP = "\x1f"  # Iceberg REST separator between namespace levels in a URL
 MAX_PAGES = 1000
 INDEX_NS, INDEX_TABLES = "governance", ("datasets", "sessions", "lineage", "derivations", "releases", "grants",
-                                        "collection_members")
+                                        "collection_members", "drafts")
 # Hop-by-hop headers, and ones requests recomputes after decoding the body.
 DROP = {"host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authorization", "proxy-authenticate", "content-length", "content-encoding"}

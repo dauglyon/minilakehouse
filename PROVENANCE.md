@@ -339,6 +339,42 @@ Nothing durable comes from the in-memory table. Postgres is the record; the Iceb
 a view of it that accepts writes. Other tables in the namespace accept the upload and refuse
 the commit, so the person's error names the table rather than a failed file write.
 
+### 5.6 `governance.drafts`
+
+Read only. A draft of each declaration, worked out from what the engine reports
+(`docs/HANDOFF-2026-10-22-groups.md` section 4), so a person who explored for a morning and then
+wrote one table does not account for every read by hand. Trino's HTTP event listener sends every
+completed statement to governance's internal listener, which knows Trino by its client
+certificate; governance keeps a statement that read or wrote a table when the access log bears
+it out: the person's write of its output, logged by the gate within the statement's time, gives
+the session, and every table it read must have a logged read in that session. An engine so
+speaks only about reads the log shows.
+
+| column | meaning |
+|---|---|
+| `source`, `source_type`, `target`, `used` | as in `derivations` |
+| `engine`, `statement_id` | the engine, and its id for the last statement that wrote the target |
+
+For each of the person's candidates of a target they wrote with a reported statement:
+
+- `used` if a statement writing the target in that session read it;
+- `unused` if it is a table the engine read in that session and every read of it there wrote
+  its rows into a table, so the data never left the engine's custody;
+- no row otherwise: a file read, which no engine reports, a source that arrived through a read,
+  or a table whose rows went to the client, after which only the person knows whether they came
+  back. A candidate of several sessions is used if any says so and unused only if all do.
+
+A draft changes no one's access. Confirming it is the insert of 5.3, so every check runs:
+
+```sql
+INSERT INTO governance.derivations (source, source_type, target, used)
+SELECT source, source_type, target, used FROM governance.drafts
+WHERE target = 'lakehouse.jgi.joined';
+```
+
+A candidate the draft left out is refused as any undeclared one is (`not declared: …`), which
+is the prompt: the engine could not see it, so the person says.
+
 ## 6. Sources travel with the data
 
 Agreed 2026-10-22 and built (section 10, items 11 to 13): rules 1 to 3, declarations naming an
@@ -809,6 +845,16 @@ attribution (4.2).
     sources matched what was worked out from scratch. Two runs of the checks first failed on
     reads less than two seconds after a write, which count toward it (section 8): the checks
     now wait out the slack.
+19. Drafts, run on the stack 2026-10-24 (`seed/check-drafts.py`). Trino 484's HTTP event listener
+    reached governance's internal listener with a client certificate
+    (`http-event-listener.http-client.key-store-path` to a PEM file of key and certificate). For
+    `CREATE TABLE … AS` and `INSERT` the event's `ioMetadata.output` named the table written; a
+    CTE's and a `SECURITY INVOKER` view's statements listed the base table `t1` in
+    `ioMetadata.inputs`, not the view; two statements run at once by one person were told apart,
+    each event carrying its own inputs. alice copied `t2` into a table, read the copy back to the
+    client, and built a table from `t1`: its draft marked `t1` used and `t2` unused and left the
+    copy out; inserting the draft as it was was refused ("not declared"), and with the copy
+    accounted for it was accepted, after which `t2` was no longer carried.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions

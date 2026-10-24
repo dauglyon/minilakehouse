@@ -68,7 +68,7 @@ byte path.
 | **opa** | The PDP, reachable only by its callers. Rules only (`opa/policy.rego` = Polaris's checks, `opa/tables.rego` = who may view a table or namespace, `opa/blob.rego` = blobs, `opa/groups.rego` = group administration). Every caller sends only who is asking and the ids it names; each rule fetches the person's groups and the grants it needs from governance (`opa/governance.rego`). |
 | **polaris** | Iceberg REST catalog. Validates the user's Keycloak token; delegates authorization to OPA; vends per-table STS. Holds identities, no rules. |
 | **gate** | The only way to Polaris. Verifies the token, trims listings to what the caller may view, answers "does not exist" for names they may not view, and, if Polaris refuses a table load that asked for a credential, repeats it without one, so DESCRIBE works for people who may view but not read; such a load carries only the current version, without row or file counts or the writer's name, and so does a view load by someone who may only describe the view. Refuses a view that would run with its owner's rights. Decides which tables and schemas may be created, and reports creates and drops to governance. Has governance log every table credential it passes on and every table write it forwards, and refuses the request when that fails. Answers for the `governance` namespace's tables itself. |
-| **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. |
+| **trino** | Query engine. Authenticates users by their Keycloak token, forwards it to Polaris, reads tables with the credentials Polaris vends. Reports every completed statement's inputs and output to governance, which drafts declarations from them. |
 | **loginproxy** | Sits in front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client, holds the person's refresh token, and puts a fresh token on every forwarded request as the bearer and the `token` extra credential. |
 | **broker** | Blob vending broker (Flow C). Verifies the user's own token, asks OPA about the named folder, vends a credential scoped to the prefix in OPA's decision: to read (get and list, on the dataset's `read`) to write (put and delete, no get, on its `write`, refused to anyone who may not read a source its files carry), or to delete (list and delete, no get or put, on its `delete`, which sources do not narrow). Has governance log each credential before returning it. Moves a folder into another group's space (`POST /transfers`) by server-side copy. |
 | **ceph** | Ceph RGW: S3 + native STS. Enforces the vended (table or blob) credential. |
@@ -508,6 +508,22 @@ declaration: until the writer declares, everything that could be in the data lim
 read it, and declaring widens that. The same declaration can be posted to governance as
 `POST /declarations` with `{"rows": [{source, source_type, target, used}]}`, for a client with
 no Iceberg engine; it is checked, stored and signed by the same code.
+
+Trino reports every statement to governance (its HTTP event listener, `trino/etc/event-listener.properties`),
+and `governance.drafts` drafts each declaration from what the statements writing a table read
+(`PROVENANCE.md` 5.6): `used` for what they read, `unused` for a table the engine only ever read
+into tables in that session, and no row for what only the person can account for, a file read
+or a table whose rows went to the client. A draft changes nothing; confirming it is the insert:
+
+```bash
+q alice --execute "CREATE TABLE iceberg.jgi.t3 AS SELECT x + 1 AS x FROM iceberg.jgi.t1"
+q alice --execute "SELECT source, source_type, target, used, engine FROM iceberg.governance.drafts
+  WHERE target = 'lakehouse.jgi.t3'"
+#  -> "lakehouse.jgi.t1","table","lakehouse.jgi.t3","true","trino"
+q alice --execute "INSERT INTO iceberg.governance.derivations (source, source_type, target, used)
+  SELECT source, source_type, target, used FROM iceberg.governance.drafts WHERE target = 'lakehouse.jgi.t3'"
+#  -> INSERT: 1 row
+```
 
 A release (`PROVENANCE.md` 6.7) lets a group read a dataset built from a source the group may
 not read, with the source's owners' approval. A `manage` holder of the target asks, once the
