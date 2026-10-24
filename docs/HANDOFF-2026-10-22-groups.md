@@ -430,3 +430,11 @@ except where listed here. Each item is either an extension to build or a decisio
 ## Docs to update
 - `PROVENANCE.md` 9 still says a project folder "is scratch, not a dataset"; section 3 and
   the UI supersede it.
+
+## Addendum — `governance.lineage` gains `read`
+`direct = false` on its own leaves the reader guessing which read brought a source in. Add
+`read`: the dataset the person read. A plain read is `read = source`; a source that arrived
+inside what was read has `read` = that dataset and `source` = the carried one. `direct` stays
+as the convenience `read = source`. The declaration rule reads off the row: a person answers
+for rows where `read = source`; the others need `detach` on the source (`PROVENANCE.md` 6.5).
+`PROVENANCE.md` 5.2 and the examples in 5.4 need the column added.
