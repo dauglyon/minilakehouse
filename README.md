@@ -204,7 +204,7 @@ def tok(u): return requests.post(KC, data=dict(grant_type="password", client_id=
     client_secret="trino-secret", username=u, password=u,
     scope="openid aud-broker")).json()["access_token"]
 def vend(u, ds): return requests.post("http://broker:9100/vend",
-    headers={"Authorization": f"Bearer {tok(u)}"}, json={"dataset": ds}).status_code
+    headers={"Authorization": f"Bearer {tok(u)}"}, json={"folder": ds}).status_code
 print("alice jgi/public   :", vend("alice", "jgi/public"))      # 200 -> scoped temp creds
 print("alice projw/private:", vend("alice", "projw/private"))   # 403 -> visible but not readable
 print("bob   jgi/public   :", vend("bob",   "jgi/public"))      # 403 -> bob is granted nothing
@@ -214,6 +214,18 @@ PY
 The returned credential reads `datasets/jgi/public/*` but is **denied** sibling prefixes by
 RGW — OPA's decision carries the entry's folder, and the broker scopes the session policy to
 it. A dataset id that doesn't exist gets the same 403 as a denied one.
+
+A credential covers everything under the folder, as `aws s3 sync` and `ls --recursive` need,
+unless the request says `"recursive": false`: then it covers the files directly in the folder
+and lists the folder one level at a time, showing its files and its subfolders' names. No
+credential reaches into a published dataset but its own, so a folder with one under it opens
+only that way; someone it is open to who asks for a recursive credential gets
+
+    datasets/jgi/ contains published datasets, so it can't be opened recursively. Open it with
+    "recursive": false for the files directly in it, or open its subfolders and datasets separately.
+
+What a read brings in, and which files a write is counted for, follow what the credential
+covers (`seed/check-credentials.py`).
 
 ## Registry freshness & governed ingest
 
@@ -251,7 +263,7 @@ def tok(aud): return requests.post(KC, data=dict(grant_type="password", client_i
 index = RestCatalog("gate", uri="http://gate:8182/api/catalog", warehouse="lakehouse",
                     token=tok("polaris")).load_table("governance.datasets")
 print("index:", [r["id"] for r in index.scan().to_arrow().to_pylist()])
-print("vend jgi/projz:", requests.post("http://broker:9100/vend", json={"dataset": "jgi/projz"},
+print("vend jgi/projz:", requests.post("http://broker:9100/vend", json={"folder": "jgi/projz"},
       headers={"Authorization": "Bearer " + tok("broker")}).status_code)
 print("publish projw/private (projw's space):",
       requests.patch("http://governance:8000/datasets/projw/private", json={"description": "x"},
@@ -317,7 +329,7 @@ def change(op):  # carol stewards projw
         headers=h("carol", "governance"),
         json={"changes": [{"group": "jgi", op: ["read"]}]}).json()["grants"]["read"]
 vend = lambda: requests.post("http://broker:9100/vend", headers=h("alice", "broker"),
-                             json={"dataset": "projw/private"}).status_code
+                             json={"folder": "projw/private"}).status_code
 print("grant read :", change("add"), vend())
 print("revoke read:", change("remove"), vend())
 PY
@@ -368,7 +380,7 @@ def viewers(op):  # alice owns jgi
     return requests.patch("http://governance:8000/groups/jgi",
         headers=h("alice", "governance"), json={"viewers": {op: ["bob"]}}).json()["viewers"]
 vend = lambda mode: requests.post("http://broker:9100/vend", headers=h("bob", "broker"),
-                                  json={"dataset": "projz", "mode": mode}).status_code
+                                  json={"folder": "jgi/public", "mode": mode}).status_code
 print("bob a viewer:", viewers("add"), vend("read"), vend("write"))
 print("bob removed :", viewers("remove"), vend("read"))
 PY

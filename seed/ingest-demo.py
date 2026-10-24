@@ -36,7 +36,7 @@ def token(user, audience):
 def main():
     # 1. a write credential for the folder only (put and delete, no get), then the upload
     c = requests.post(f"{BROKER}/vend", headers={"Authorization": f"Bearer {token('alice', 'broker')}"},
-                      json={"dataset": FOLDER, "mode": "write"})
+                      json={"folder": FOLDER, "mode": "write"})
     c.raise_for_status()
     c = c.json()
     s3 = boto3.client("s3", endpoint_url=c["endpoint"], aws_access_key_id=c["access_key_id"],

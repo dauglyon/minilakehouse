@@ -6,9 +6,9 @@ package lakehouse.blob
 # asks about publishing and changing also get input.platform_admin, which passes wherever a
 # steward does.
 #
-#   vend            input {subject, dataset: id}       broker: {allow, prefix} to read one folder
-#   vend_write      input {subject, dataset: id}       broker: {allow, prefix} to write one folder
-#   vend_delete     input {subject, dataset: id}       broker: {allow, prefix} to delete in one folder
+#   vend            input {subject, dataset: id, recursive}   broker: {allow, prefix} to read a folder
+#   vend_write      input {subject, dataset: id, recursive}   broker: {allow, prefix} to write a folder
+#   vend_delete     input {subject, dataset: id, recursive}   broker: {allow, prefix} to delete in a folder
 #   discover        input {subject, datasets: [id]}    governance: {visible: [id], readable: [id]}
 #   allow_publish   input {subject, dataset: id, platform_admin}
 #                                                      governance: may publish this folder
@@ -39,13 +39,23 @@ import future.keywords.if
 import future.keywords.in
 
 # The broker scopes its session policy to the returned prefix: the entry's folder, which is the
-# folder its grants were decided for. No credential reaches into a published dataset but its
-# own, so a folder inside one or containing one gets none.
+# folder its grants were decided for. A credential covers everything under the folder unless
+# `recursive` is false, when it covers the files directly in it, and the sources checked are
+# those its files carry. No credential reaches into a published dataset but its own, so a folder
+# inside one gets none and a folder containing one gets only a credential for its direct files;
+# asked for a recursive one, someone the folder is otherwise open to is told so
+# (recursive_refused), and the broker names the way round.
 default vend := {"allow": false}
 
 vend := {"allow": true, "prefix": e.prefix} if {
 	e := _entries[input.dataset]
 	_reaches_no_other(e)
+	_reads(e)
+}
+
+vend := {"allow": false, "recursive_refused": true} if {
+	e := _entries[input.dataset]
+	_only_recursion_refused(e)
 	_reads(e)
 }
 
@@ -59,6 +69,16 @@ default vend_write := {"allow": false}
 vend_write := {"allow": true, "prefix": e.prefix} if {
 	e := _entries[input.dataset]
 	_reaches_no_other(e)
+	_writes(e)
+}
+
+vend_write := {"allow": false, "recursive_refused": true} if {
+	e := _entries[input.dataset]
+	_only_recursion_refused(e)
+	_writes(e)
+}
+
+_writes(e) if {
 	_holds(_holder.write, e.write)
 	every s in object.get(e, "sources", []) {
 		tables.source_admits(_holder.read, s)
@@ -77,9 +97,28 @@ vend_delete := {"allow": true, "prefix": e.prefix} if {
 	_holds(_holder.write, e.delete)
 }
 
+vend_delete := {"allow": false, "recursive_refused": true} if {
+	e := _entries[input.dataset]
+	_only_recursion_refused(e)
+	_holds(_holder.write, e.delete)
+}
+
+_recursive := object.get(input, "recursive", true)
+
+_reaches_no_other(e) if {
+	count(e.inside_published) == 0
+	not _recursive
+}
+
 _reaches_no_other(e) if {
 	count(e.inside_published) == 0
 	count(e.contains_published) == 0
+}
+
+_only_recursion_refused(e) if {
+	count(e.inside_published) == 0
+	_recursive
+	count(e.contains_published) > 0
 }
 
 discover := {"visible": visible, "readable": readable}
@@ -174,8 +213,9 @@ effective_read contains n if {
 _ids := input.datasets if input.datasets
 else := [input.dataset]
 
-# {id: entry} for the ids named in the input that have one.
-_entries := governance.post("/internal/datasets", {"ids": _ids}).entries
+# {id: entry} for the ids named in the input that have one, each with the sources of what a
+# credential of the requested reach covers.
+_entries := governance.post("/internal/datasets", {"ids": _ids, "recursive": _recursive}).entries
 
 _holder := governance.holder(input.subject)
 

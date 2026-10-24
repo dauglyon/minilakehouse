@@ -355,6 +355,9 @@ CREATE TABLE IF NOT EXISTS namespaces (
     "delete"     TEXT[] NOT NULL DEFAULT '{}',
     detach       TEXT[] NOT NULL DEFAULT '{}'
 );
+-- A file credential covers everything under its folder unless it was asked for the files
+-- directly in the folder alone (docs/HANDOFF-2026-10-22-groups.md section 3).
+ALTER TABLE accesses ADD COLUMN IF NOT EXISTS recursive BOOLEAN NOT NULL DEFAULT true;
 -- Roots gave groups folders and namespaces to register under; spaces replace them.
 DROP TABLE IF EXISTS register_grants;
 DROP TABLE IF EXISTS namespace_owners;
@@ -654,31 +657,34 @@ _COUNTS_SQL = """(location IS NULL OR rtrim(location, '/') = rtrim(%(loc)s, '/')
 
 # The writes a table's files may come from: those logged for the table (_COUNTS_SQL).
 _TABLE_WRITES = """
-    SELECT person, session, sid, at, dataset AS wds, '' AS wprefix,
+    SELECT person, session, sid, at, dataset AS wds, '' AS wprefix, true AS recursive,
            expires IS NULL AS instant, COALESCE(expires, at) AS until
     FROM accesses WHERE dataset = %(t)s AND (mode = 'write' OR can_write)
       AND """ + _COUNTS_SQL
 
 # The writes a folder's files may come from: every write credential for a tracked folder inside
 # or containing it. Folders nest until one is published, and a credential for a folder covers
-# everything under it, so a file belongs to each credential whose folder holds it, whichever
-# folder the credential was asked for.
+# everything under it, or only the files directly in it, so a file belongs to each credential
+# that covers it, whichever folder the credential was asked for.
 _FOLDER_WRITES = """
-    SELECT a.person, a.session, a.sid, a.at, a.dataset AS wds, d.prefix AS wprefix,
+    SELECT a.person, a.session, a.sid, a.at, a.dataset AS wds, d.prefix AS wprefix, a.recursive,
            a.expires IS NULL AS instant, COALESCE(a.expires, a.at) AS until
     FROM accesses a JOIN datasets d ON d.id = a.dataset
     WHERE a.kind = 'files' AND a.mode = 'write'
       AND (starts_with(d.prefix, %(prefix)s) OR starts_with(%(prefix)s, d.prefix))"""
 
 # `wds` is the dataset a write was logged for: a writer's declaration of it covers the files
-# that write made, and so does a putting back on it (6.5).
+# that write made, and so does a putting back on it (6.5). With %(direct)s, only the files
+# directly in the folder count, as for a credential covering those alone.
 _CARRIED_SQL = """
 WITH f AS (
     SELECT key, last_modified AS lm FROM files WHERE dataset = %(t)s
+      AND (NOT %(direct)s OR strpos(substr(key, length(%(prefix)s) + 1), '/') = 0)
 ), w AS ({writes}
 ), fw AS (
     SELECT f.lm, w.person, w.session, w.sid, w.at, w.wds FROM f JOIN w
       ON starts_with(f.key, w.wprefix)
+     AND (w.recursive OR strpos(substr(f.key, length(w.wprefix) + 1), '/') = 0)
      AND f.lm BETWEEN w.at - %(tol)s * interval '1 second' AND w.until + %(tol)s * interval '1 second'
     UNION ALL
     SELECT LEAST(now(), w.until), w.person, w.session, w.sid, w.at, w.wds FROM w
@@ -711,10 +717,11 @@ GROUP BY c.source ORDER BY 1
 """
 
 
-def carried(ds_id):
-    """The sources the files in a dataset's folder carry, each with whether a declaration says it
-    was used (declared) rather than its being there because a writer has not declared yet, and
-    the paths it arrived by, each the datasets it passed through, as [{id, declared, paths}].
+def carried(ds_id, direct=False):
+    """The sources the files in a dataset's folder carry, or with direct only the files directly
+    in it, each with whether a declaration says it was used (declared) rather than its being
+    there because a writer has not declared yet, and the paths it arrived by, each the datasets
+    it passed through, as [{id, declared, paths}].
     The folder is listed first if it never has been, if a credential that could write it has
     expired since the last listing, so that what it wrote, or did not, is settled by storage
     even if a notification was lost, or if it is not tracked, since no notification lists it."""
@@ -733,7 +740,7 @@ def carried(ds_id):
                 return []
             writes, untracked, folder = _FOLDER_WRITES, row is None, prefix
         params = {"t": ds_id, "loc": location, "prefix": prefix, "tol": CLOCK_TOLERANCE,
-                  "slack": FILE_TIME_SLACK, "unlisted": folder is None}
+                  "slack": FILE_TIME_SLACK, "unlisted": folder is None, "direct": direct and prefix is not None}
         cur.execute("SELECT listed_at FROM folder_listings WHERE dataset = %s", (ds_id,))
         listed = cur.fetchone()
         stale = untracked or (listed is None and folder is not None)
@@ -922,12 +929,12 @@ def _released(target, sources):
             for c in sources}
 
 
-def _with_sources(ds_id, entry):
-    """The entry with the sources its files carry: each source's effective `read`, whether a
-    declaration says it was used, and the groups released past it on each path it arrived by.
-    OPA's rules decide what they mean (PROVENANCE.md 6, rule 3); a source with no entry has no
-    grants, so it admits no one."""
-    sources = carried(ds_id)
+def _with_sources(ds_id, entry, direct=False):
+    """The entry with the sources its files carry, or with direct those directly in its folder:
+    each source's effective `read`, whether a declaration says it was used, and the groups
+    released past it on each path it arrived by. OPA's rules decide what they mean
+    (PROVENANCE.md 6, rule 3); a source with no entry has no grants, so it admits no one."""
+    sources = carried(ds_id, direct)
     read = _source_read([c["id"] for c in sources])
     released = _released(ds_id, sources)
     return {**entry, "sources": [{"id": c["id"], "declared": c["declared"], "released": released[c["id"]],
@@ -967,12 +974,14 @@ def health():
 def internal_datasets():
     # {id: entry} for the named folders: each tracked one, and each untracked one in a group's
     # space, which a first credential would make an entry (_file_entries); any other id is
-    # absent. Each with the sources its files carry.
-    ids = (request.get_json(silent=True) or {}).get("ids")
-    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+    # absent. Each with the sources its files carry, or with "recursive": false the files
+    # directly in it, which is what a credential for those alone reaches.
+    body = request.get_json(silent=True) or {}
+    ids, recursive = body.get("ids"), body.get("recursive", True)
+    if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids) or not isinstance(recursive, bool):
         return jsonify({"error": "ids must be a list of strings"}), 400
     entries, _ = _file_entries(ids, would_be=True)
-    return jsonify({"entries": {i: _with_sources(i, e) for i, e in entries.items()}})
+    return jsonify({"entries": {i: _with_sources(i, e, direct=not recursive) for i, e in entries.items()}})
 
 
 @internal_app.post("/internal/folders")
@@ -1102,7 +1111,7 @@ def _accesses_valid(body):
             and all(isinstance(e, dict) and isinstance(e.get("dataset"), str) and e["dataset"]
                     and e.get("kind") in ("files", "table") and e.get("mode") in ("read", "write", "delete")
                     and (e.get("expires") is None or isinstance(e["expires"], int))
-                    and isinstance(e.get("can_write", False), bool)
+                    and isinstance(e.get("can_write", False), bool) and isinstance(e.get("recursive", True), bool)
                     and (e.get("location") is None or isinstance(e["location"], str))
                     for e in entries))
 
@@ -1140,7 +1149,7 @@ def record_accesses():
         if e["mode"] != "read":
             brought[i] = marks[i] = None
             continue
-        sources = carried(e["dataset"])
+        sources = carried(e["dataset"], direct=not e.get("recursive", True))
         brought[i] = [e["dataset"], *(c["id"] for c in sources)]
         marks[i] = json.dumps({c["id"]: [list(p) for p in sorted({tuple(sorted({*path, e["dataset"]}))
                                                                    for path in c["paths"]})]
@@ -1149,11 +1158,11 @@ def record_accesses():
         session = _pointer(cur, body["person"], body["sid"], create=True)
         for i, e in enumerate(body["entries"]):
             cur.execute("INSERT INTO accesses (person, sub, sid, session, dataset, kind, mode, expires, "
-                        "sources, can_write, marks, location) VALUES (%s, %s, %s, %s, %s, %s, %s, "
-                        "to_timestamp(%s / 1000.0), %s, %s, %s, %s)",
+                        "sources, can_write, marks, location, recursive) VALUES (%s, %s, %s, %s, %s, %s, %s, "
+                        "to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)",
                         (body["person"], body["sub"], body["sid"], session, e["dataset"], e["kind"],
                          e["mode"], e.get("expires"), brought[i], e.get("can_write", False), marks[i],
-                         e.get("location")))
+                         e.get("location"), e.get("recursive", True)))
         cur.execute("UPDATE sessions SET last_used = now() WHERE id = %s RETURNING name", (session,))
         name = cur.fetchone()["name"]
     app.logger.info("ACCESS person=%s session=%s %s", body["person"], name,

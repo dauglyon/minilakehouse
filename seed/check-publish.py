@@ -40,7 +40,7 @@ def gov(method, path, user, body=None):
 
 
 def vend(user, folder, mode="read"):
-    return requests.post(f"{BROKER}/vend", json={"dataset": folder, "mode": mode},
+    return requests.post(f"{BROKER}/vend", json={"folder": folder, "mode": mode},
                          headers={"Authorization": f"Bearer {token(user)}"})
 
 

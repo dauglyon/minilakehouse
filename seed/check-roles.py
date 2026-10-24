@@ -38,7 +38,7 @@ def gov(method, path, user, body=None):
 
 
 def vend(user, dataset, mode):
-    return requests.post(f"{BROKER}/vend", json={"dataset": dataset, "mode": mode},
+    return requests.post(f"{BROKER}/vend", json={"folder": dataset, "mode": mode},
                          headers={"Authorization": f"Bearer {token(user)}"}).status_code
 
 

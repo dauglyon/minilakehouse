@@ -1,16 +1,19 @@
 """
 broker — the blob vending broker (Flow C: blob datasets). The true end-to-end plane.
 
-A client presents its OWN Keycloak token and names a dataset. The broker
+A client presents its OWN Keycloak token and names a folder. The broker
 **cryptographically verifies it** (signature against Keycloak's JWKS, issuer, expiry) —
 no engine in the byte path, safe even against a compromised engine.
 
 Flow:
   1. verify the user's token            -> subject
-  2. ask OPA about the dataset id -> {allow, prefix}: `vend` to read (the dataset's `read`
-     grant), `vend_write` to write (its `write` grant), `vend_delete` to delete (its `delete`
-     grant). OPA fetches the names the person holds grants through and the folder's grants and prefix
-     from governance
+  2. ask OPA about the folder -> {allow, prefix}: `vend` to read (the folder's `read` grant),
+     `vend_write` to write (its `write` grant), `vend_delete` to delete (its `delete` grant).
+     OPA fetches the names the person holds grants through and the folder's grants and prefix
+     from governance. A credential covers everything under the folder unless the request says
+     `"recursive": false`, when it covers only the files directly in it; no recursive one is
+     issued for a folder with a published dataset under it
+     (docs/HANDOFF-2026-10-22-groups.md section 3)
   3. on allow: AssumeRole on `blob-vendor` (read: get and list), `blob-writer` (write: put
      and delete, no get, WHITEPAPER 4.2) or `blob-deleter` (delete: list and delete, no get
      or put) with an inline session policy scoped to that prefix
@@ -20,8 +23,8 @@ Flow:
      4.1); when the log refuses or cannot be reached, refuse the request
   5. return the scoped credentials; the client reads or writes those objects directly in RGW.
 
-OPA denies an unknown dataset exactly as a denied one, so the broker reveals nothing about
-which datasets exist.
+OPA denies an unknown folder exactly as a denied one, so the broker reveals nothing about
+which folders exist.
 """
 import json
 import os
@@ -51,8 +54,14 @@ TTL = int(os.environ.get("CRED_TTL_SECONDS", "900"))
 # certificate (governance/pki.py).
 GOVERNANCE_INTERNAL = os.environ["GOVERNANCE_INTERNAL_URL"]
 PKI = os.environ.get("PKI_DIR", "/pki")
-# A dataset id is a tenant-qualified name (e.g. projx/public).
+# A folder is named as a dataset id is: its path under datasets/, beginning with the group whose
+# space holds it (e.g. jgi/public).
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
+# The refusal for a recursive request over a folder with a published dataset under it. It names
+# nothing inside the folder, and goes only to someone the folder is otherwise open to.
+RECURSIVE_REFUSED = ("{prefix} contains published datasets, so it can't be opened recursively. "
+                     'Open it with "recursive": false for the files directly in it, or open its '
+                     "subfolders and datasets separately.")
 
 _jwks = jwt.PyJWKClient(KEYCLOAK_JWKS)
 _http = requests.Session()
@@ -96,29 +105,31 @@ def authed_user():
         return None, (jsonify({"error": "invalid token"}), 401)
 
 
-def opa_vend(subject, dataset, mode):
-    """OPA's {allow, prefix} for this subject reading or writing this dataset."""
+def opa_vend(subject, folder, mode, recursive):
+    """OPA's {allow, prefix} for this subject reading, writing or deleting in this folder."""
     rule = {"write": "vend_write", "delete": "vend_delete"}.get(mode, "vend")
-    r = _http.post(f"{OPA_BLOB}/{rule}", json={"input": {"subject": subject, "dataset": dataset}},
-                   timeout=5)
+    r = _http.post(f"{OPA_BLOB}/{rule}", json={"input": {"subject": subject, "dataset": folder,
+                                                         "recursive": recursive}}, timeout=5)
     r.raise_for_status()
     return r.json().get("result") or {"allow": False}
 
 
-def log_access(claims, dataset, mode, expiration):
-    """Have governance log this credential for the caller. Raises when the log refuses or cannot
-    be reached: a credential that is not logged would be missing from what the person's
-    outputs may derive from."""
+def log_access(claims, folder, mode, recursive, expiration):
+    """Have governance log this credential for the caller, against the folder it covers.
+    Raises when the log refuses or cannot be reached: a credential that is not logged would be
+    missing from what the person's outputs may derive from."""
     _http.post(f"{GOVERNANCE_INTERNAL}/internal/accesses", timeout=5,
                cert=(f"{PKI}/client.crt", f"{PKI}/client.key"), verify=f"{PKI}/ca.crt",
                json={"person": subject_of(claims), "sub": claims.get("sub") or "",
                      "sid": claims.get("sid") or "",
-                     "entries": [{"dataset": dataset, "kind": "files", "mode": mode,
+                     "entries": [{"dataset": folder, "kind": "files", "mode": mode, "recursive": recursive,
                                   "expires": int(expiration.timestamp() * 1000)}]}
                ).raise_for_status()
 
 
-def session_policy(prefix, mode):
+def session_policy(prefix, mode, recursive=True):
+    if not recursive:
+        return direct_policy(prefix, mode)
     if mode == "delete":
         return json.dumps({"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Action": ["s3:DeleteObject"],
@@ -142,6 +153,25 @@ def session_policy(prefix, mode):
     ]})
 
 
+def direct_policy(prefix, mode):
+    """A credential for the files directly in a folder: objects matching <prefix>* but not
+    <prefix>*/*, and listing only the folder itself one level at a time (prefix exactly the
+    folder, delimiter `/`), which shows its files and its subfolders' names. Its size is the
+    same for every folder. Tried on Ceph on 2026-10-24 (docs/HANDOFF-2026-10-22-groups.md
+    section 3)."""
+    actions = {"read": ["s3:GetObject"], "delete": ["s3:DeleteObject"],
+               "write": ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+                         "s3:ListMultipartUploadParts"]}[mode]
+    statements = [
+        {"Effect": "Allow", "Action": actions, "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*"]},
+        {"Effect": "Deny", "Action": actions, "Resource": [f"arn:aws:s3:::{BUCKET}/{prefix}*/*"]},
+    ]
+    if mode != "write":   # a write credential never lists (WHITEPAPER 4.2)
+        statements.append({"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": [f"arn:aws:s3:::{BUCKET}"],
+                           "Condition": {"StringEquals": {"s3:prefix": [prefix], "s3:delimiter": ["/"]}}})
+    return json.dumps({"Version": "2012-10-17", "Statement": statements})
+
+
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
@@ -155,35 +185,37 @@ def vend():
     subject = subject_of(claims)
 
     body = request.get_json(silent=True) or {}
-    dataset, mode = body.get("dataset"), body.get("mode", "read")
-    if not isinstance(dataset, str) or len(dataset) > 200 or not ID_RE.match(dataset):
-        return jsonify({"error": "invalid dataset id"}), 400
-    if mode not in ("read", "write", "delete"):
-        return jsonify({"error": "mode must be read, write or delete"}), 400
-    decision = opa_vend(subject, dataset, mode)
+    folder, mode, recursive = body.get("folder"), body.get("mode", "read"), body.get("recursive", True)
+    if not isinstance(folder, str) or len(folder) > 200 or not ID_RE.match(folder):
+        return jsonify({"error": "invalid folder"}), 400
+    if mode not in ("read", "write", "delete") or not isinstance(recursive, bool):
+        return jsonify({"error": "mode must be read, write or delete, and recursive a boolean"}), 400
+    decision = opa_vend(subject, folder, mode, recursive)
     if decision.get("allow") is not True:
-        app.logger.info("DENY %s subject=%s dataset=%s", mode, subject, dataset)
+        app.logger.info("DENY %s subject=%s folder=%s recursive=%s", mode, subject, folder, recursive)
+        if decision.get("recursive_refused") is True:
+            return jsonify({"error": RECURSIVE_REFUSED.format(prefix=f"datasets/{folder}/")}), 403
         return jsonify({"error": "forbidden"}), 403
 
-    # Governance confined the prefix at registration; it becomes an STS ARN below, so
-    # re-check rather than trust it.
+    # Governance confines every folder; the prefix becomes an STS ARN below, so re-check rather
+    # than trust it.
     prefix = decision.get("prefix", "")
     if not (prefix.startswith("datasets/") and prefix.endswith("/") and ".." not in prefix):
-        app.logger.error("refusing unconfined prefix for %s: %r", dataset, prefix)
+        app.logger.error("refusing unconfined prefix for %s: %r", folder, prefix)
         return jsonify({"error": "internal error"}), 500
 
     cr = _sts.assume_role(
         # STS caps the session-name length; truncate so a long username can't fail AssumeRole.
         RoleArn={"write": BLOB_WRITE_ROLE_ARN, "delete": BLOB_DELETE_ROLE_ARN}.get(mode, BLOB_ROLE_ARN),
         RoleSessionName=f"blob-{subject}"[:32],
-        Policy=session_policy(prefix, mode), DurationSeconds=TTL,
+        Policy=session_policy(prefix, mode, recursive), DurationSeconds=TTL,
     )["Credentials"]
     try:
-        log_access(claims, dataset, mode, cr["Expiration"])
+        log_access(claims, folder, mode, recursive, cr["Expiration"])
     except requests.RequestException as e:
-        app.logger.warning("not logged, refusing %s subject=%s dataset=%s: %s", mode, subject, dataset, e)
+        app.logger.warning("not logged, refusing %s subject=%s folder=%s: %s", mode, subject, folder, e)
         return jsonify({"error": "service unavailable"}), 503
-    app.logger.info("VEND %s subject=%s dataset=%s prefix=%s", mode, subject, dataset, prefix)
+    app.logger.info("VEND %s subject=%s folder=%s prefix=%s recursive=%s", mode, subject, folder, prefix, recursive)
     return jsonify({
         "access_key_id": cr["AccessKeyId"],
         "secret_access_key": cr["SecretAccessKey"],
@@ -193,6 +225,7 @@ def vend():
         "bucket": BUCKET,
         "prefix": prefix,
         "mode": mode,
+        "recursive": recursive,
     })
 
 
