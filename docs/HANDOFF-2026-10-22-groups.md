@@ -438,6 +438,8 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
 - BERDL's name rule and reserved names, plus `governance`, without the `ro` rule.
 - Platform admins are a Keycloak realm role, not a group.
 - A group whose space holds data cannot be deleted.
+- A space's `delete` is its admins' alone: members delete files through `write`, but only an
+  admin drops a table or removes what rule 3 has closed.
 - The governance API takes a person's token only. No service lane.
 
 ---
