@@ -793,7 +793,8 @@ publisher the lookup; the publisher still signs.
   rule in `opa/derivations.rego`; it is a trust decision made in policy, not a code path.
 
 ## Out of scope
-- Spark / OpenLineage parser (same endpoint; later).
+- Spark / OpenLineage parser (same endpoint; later; decided 2026-10-24). BERDL writes tables
+  only through Spark (findings, section 4), so drafts there wait on it.
 - Out-of-band carry through the client: a person who reads `t1`, looks at the result, and
   types the numbers into `INSERT VALUES`. The engine saw `t1`'s rows go to the client, so
   `t1` stays blank on the draft and the person must say. Same limit as today
