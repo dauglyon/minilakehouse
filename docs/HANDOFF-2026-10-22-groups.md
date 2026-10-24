@@ -438,3 +438,7 @@ inside what was read has `read` = that dataset and `source` = the carried one. `
 as the convenience `read = source`. The declaration rule reads off the row: a person answers
 for rows where `read = source`; the others need `detach` on the source (`PROVENANCE.md` 6.5).
 `PROVENANCE.md` 5.2 and the examples in 5.4 need the column added.
+- `PROVENANCE.md` 5.2: `lineage` gains a `read` column, the dataset the session read; `source`
+  is a dataset whose data it contains. They are equal for a plain read and differ for a source
+  that came in with what was read. `direct` stays as `read = source`. Reason: a reader of the
+  row could not tell what `direct = false` was relative to; now the row says.
