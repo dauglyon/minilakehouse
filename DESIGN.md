@@ -489,7 +489,7 @@ reference (the sections above are current-state).
   table without a credential and Trino stops there. A refused create's first line is Trino's
   own ("Failed to create transaction", "Failed to create namespace"); the gate's reason is
   the error's cause, which the CLI prints with `--debug`.
-- `share` carries only its change right, since derived datasets (its widening right) are
+- `share` carries only its change right, since derived datasets (its release right) are
   not built.
 - A person who may describe a table but not read it still sees, in the cut metadata, the
   current version's write time and sequence number and the metadata file's name, whose
