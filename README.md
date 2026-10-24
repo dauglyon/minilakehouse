@@ -472,7 +472,7 @@ q alice --execute "SELECT source, target, session FROM iceberg.governance.lineag
 #  -> "jgi/public","","default"
 #     "lakehouse.jgi.t1","","default"
 #     "lakehouse.jgi.t1","lakehouse.jgi.t2","default"
-q bob --execute "SELECT count(*) FROM iceberg.governance.lineage"
+q bob --execute "SELECT count(*) FROM iceberg.governance.lineage WHERE source = 'lakehouse.jgi.t1'"
 #  -> "0"     bob's refused read handed him no credential, so nothing is logged
 ```
 
@@ -516,6 +516,8 @@ into tables in that session, and no row for what only the person can account for
 or a table whose rows went to the client. A draft changes nothing; confirming it is the insert:
 
 ```bash
+# A session of its own, so what the demos above had alice read is no candidate of t3
+q alice --execute "INSERT INTO iceberg.governance.sessions (name) VALUES ('drafts')"
 q alice --execute "CREATE TABLE iceberg.jgi.t3 AS SELECT x + 1 AS x FROM iceberg.jgi.t1"
 q alice --execute "SELECT source, source_type, target, used, engine FROM iceberg.governance.drafts
   WHERE target = 'lakehouse.jgi.t3'"
