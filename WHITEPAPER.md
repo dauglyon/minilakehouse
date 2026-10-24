@@ -102,14 +102,16 @@ service.
 
 | Field | Meaning |
 |---|---|
-| `id` | Tables: catalog, namespaces and table name joined by dots, `lakehouse.db.t1`; a table any of whose names contains a dot has no id and is refused, since its id would be ambiguous. Files: the tenant-qualified folder name, `projx/public`. Never reused. Tables cannot be renamed (section 8). |
-| `kind` | `table` or `blob`. Views are `table`. |
+| `id` | Tables: catalog, namespaces and table name joined by dots, `lakehouse.jgi.t1`; a table any of whose names contains a dot has no id and is refused, since its id would be ambiguous. Files: the folder's path under `datasets/`, `jgi/public`. Tables cannot be renamed (section 8); a table created again after a drop takes its old id back. |
+| `kind` | `table` or `files`. Views are `table`. |
+| `space` | The group whose space holds it: a folder's first name, a table's namespace after the catalog. Every group has a space, `datasets/<group>/` and `<catalog>.<group>`, and a person's personal group `u_<user>` too. |
+| `published` | Whether a steward has published it: a folder, or a namespace at or above a table. A folder becomes an entry at its first credential, unpublished. |
 | `location` | Folder in the bucket. A property, not the identity. For a table, learned from Polaris when the table is created. |
 | `description`, `contact` | Human metadata. Contact carries no authority. |
-| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups. See 4.2. |
+| `describe`, `read`, `manage`, `write`, `delete`, `detach` | Six sets of groups, and `revoked` beside them (section 4.3, `PROVENANCE.md` 9). Each is a union of layers: a published folder's own, those of every folder or namespace above it, and its space's defaults; a table has none of its own. See 4.2. |
 | sources | Not stored in the entry: the datasets its stored files were built from, worked out from the access log and a listing of its folder. See 4.3. |
 | releases | Per source, the groups that source's `manage` holders let read this dataset although they may not read the source. See 4.3. |
-| `status` | `pending`, `live`, `gone`. See section 9. |
+| `status` | `live`, `gone`, `moved` with `moved_to`. See section 9. |
 
 ### 4.2 Six grants
 
@@ -225,14 +227,17 @@ Consequences, stated so they are not surprises:
 ### 4.4 Changing grants
 
 Changes to the grant model are governance operations, decided by OPA like every other request.
-For each change governance locks the dataset's row, asks OPA with the caller's subject and
-groups, the dataset id, and the change, and on allow writes. OPA fetches the entry from
-governance like any other rule; every writer of a row takes its lock, so the entry OPA reads is
-the one the write replaces.
+For each change governance locks what it changes, a dataset's row or a folder's or namespace's
+grants, asks OPA with the caller's subject and the id and the change, and on allow writes. OPA
+fetches the entry from governance like any other rule; every writer takes the same lock, so the
+grants OPA reads are the ones the write replaces.
 
-- `describe` and `read` of dataset d: callers holding `manage` on d.
-- `manage`, `write`, `delete` and `detach` of d: stewards of a group owning the folder root (a
-  file dataset) or namespace (a table) that d sits under.
+- `describe` and `read` of a published dataset, a folder or a namespace d: callers holding
+  `manage` on d.
+- `manage`, `write`, `delete`, `detach` and `revoked` of d: stewards of the group whose space
+  holds d. Who added a group to `revoked` is recorded and shown to d's `manage` holders.
+- Publishing a folder or a namespace: stewards of the group whose space holds it, never inside
+  or around another published one. Nothing in a personal space is published or granted.
 - Releasing d past source s to group x: asked by callers holding `manage` on d, once x is in
   d's `read` and d's declarations mark s used; approved, declined or withdrawn by callers
   holding `manage` on s.
@@ -244,24 +249,24 @@ the one the write replaces.
   steward is a tenant.
 - Creating a group: anyone signed in, who becomes its owner. Names follow BERDL's rule, 2 to
   64 lowercase letters and digits starting with a letter, and its reserved names plus
-  `governance`. A name any grant or ownership already uses is refused, since the new group's
-  owner would hold those grants.
-- Deleting a group: its owners, while it owns no root.
-- Owners of a folder root or namespace: stewards of a group owning it or one above it. A group
-  owning a root owns everything under it, so a steward can hand part of its tree to another
-  group and can always take it back; nothing records who delegated what.
-- Platform admins pass every check an owner or a steward passes.
+  `governance`. A name any grant already uses, or whose space has entries, is refused, since
+  the new group's owner would hold those grants.
+- Deleting a group: its owners, while its space holds no data.
+- Moving a folder or a table into another group's space: the person whose personal space holds
+  it, or an owner or admin of the plain group whose space does, into a group they are a member
+  or above of, at a path that does not exist and is not inside a published dataset.
+- Platform admins pass every check an owner or a steward passes, outside personal spaces.
 
 ## 5. Components and trust
 
 | Component | Role | Trusted for |
 |---|---|---|
 | Keycloak | Identity provider. Issues every token the system accepts, one audience per service. | Who the person is. |
-| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets as a per-person table whose files it builds and serves, accepts registration, grant changes and group changes, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
+| governance | Owns the catalog, the only copy of any grant, and group membership. Serves entries to OPA. Lists datasets as a per-person table whose files it builds and serves, tracks a folder from its first credential, accepts publishing, grant changes, group changes and transfers, receives lifecycle events. | The grant model and its administration. Availability of every decision: a governance outage denies every read. |
 | OPA | Holds policy and no grants. Each rule fetches the entries it needs from governance at decision time. Returns a decision document. Reachable only by its callers: its API evaluates any query it is sent, including one that reads its own credentials. | Every access decision. |
 | gate | A proxy in front of Polaris. Verifies the token, checks table creation against the catalog through OPA, trims list responses to what the person may see, maps denied named operations to not-found, and reports table create and drop to governance. Answers for the dataset index table itself. | The same custody of every current user's Polaris token that Trino has; the table lifecycle (section 9); correctness of list trimming. Polaris must be reachable only through it. |
 | Polaris | Iceberg REST catalog. Delegates every operation's decision to OPA. Vends a per-table credential on allow. Holds a long-lived storage credential able to assume the vending role. | Relaying the decision into a credential; custody of that storage credential. |
-| broker | Verifies a person's token, asks OPA about the named dataset, and on allow assumes a role with a session policy scoped to the folder in OPA's decision. | Relaying the decision into a credential, for files. |
+| broker | Verifies a person's token, asks OPA about the named folder, and on allow assumes a role with a session policy scoped to the folder in OPA's decision. Moves folders between spaces by server-side copy. | Relaying the decision into a credential, for files. |
 | Ceph RGW | S3 and STS. Enforces every credential. Emits bucket notifications. | Enforcement. |
 | Trino | Query engine. Authenticates users with their Keycloak token, carries that token to Polaris, reads with the credential Polaris vends. | Custody of every current user's Polaris-audience token. Not trusted to name a user: Polaris decides on the token, not on Trino's word. |
 | Postgres | Polaris metastore and the catalog. | Durability. |
@@ -276,9 +281,9 @@ Every caller of OPA sends the person's subject and groups and the ids it names, 
 grants; OPA fetches entries from governance. The entry lookup returns any dataset's grants,
 including datasets the person cannot see, so it is reachable only by OPA, which governance
 knows by its TLS client certificate. An unknown id has
-no entry and is denied exactly as a dataset the person has no grant on. A dataset's folder is
-fixed at registration, as a table's is (set-location is root-only, section 8), so the folder
-in OPA's decision is the folder the grants were written for.
+no entry and is denied exactly as a dataset the person has no grant on. A file entry is its
+folder, and a table's folder is fixed at creation (set-location is root-only, section 8), so
+the folder in OPA's decision is the folder the grants were written for.
 
 No long-lived service holds a storage admin key. A one-shot setup step configures bucket
 policy and notifications with admin rights and exits. Polaris authenticates to storage as a
@@ -378,36 +383,38 @@ account, which holds no grants.
 3. **Read a table in Trino.** Log in. Connect to Trino with the token, attach it as the extra
    credential. Query.
 4. **Read a table elsewhere.** Log in. Point the client at the gate with the token as bearer.
-5. **Read files.** Log in. Ask the broker for a credential naming the dataset. Read the folder
-   with any S3 client.
+5. **Read files.** Log in. Ask the broker for a credential naming the folder, for everything
+   under it or, with `"recursive": false`, the files directly in it. Read with any S3 client.
 
 Every read decision fetches the dataset's entry from governance, so a governance outage
 denies every read.
 
 ### Publisher
 
-6. **Publish a source dataset.** Log in. Register: id or folder, description, the grant
-   sets. Governance checks the person is a steward of a group owning that folder's root. Entry is `pending`; governance checks the folder once and sets `live` if it already
-   has objects. For files, ask the broker for a write credential, granted on `write`, then
-   upload; storage events do the rest. For tables, create the table through Polaris; the
-   gate admits the creation because the entry exists and the caller is in its `write`, and
-   reports the location back.
+6. **Publish a source dataset.** Log in. Write it into the group's space: for files, ask the
+   broker for a write credential, granted on `write` (the space's members by default), then
+   upload; the first credential makes the folder an entry and storage events do the rest. For
+   tables, create them through Polaris in a namespace of the space; the gate admits the
+   creation on `write` and reports the location back. Then a steward of the group publishes the
+   folder or the namespace: description and grants of its own.
 7. **Publish a derived dataset.** As 6. Build the output with any tool, as themselves; its
    files carry everything they read (4.3). Declare which reads were used, in
    `governance.derivations`, and ask for a release past any source some intended readers may
    not read.
 8. **Delete.** Delete the objects or drop the table. The delete events, or the gate's drop
    report, set `gone`.
-9. **Change grants.** Log in. Call governance naming the dataset and the change. Governance
-   applies 4.4.
+9. **Change grants.** Log in. Call governance naming the dataset, folder or namespace and the
+   change. Governance applies 4.4.
+10. **Move work into a group.** From a personal space or a plain group's space: a folder through
+    the broker, a table by copying it and recording the move with governance. The old entry is
+    `moved` to the new one.
 
 ### Operator
 
-10. **People and groups.** People in Keycloak; groups in governance, created by anyone and
+11. **People and groups.** People in Keycloak; groups in governance, created by anyone and
     changed by their owners, admins and stewards (4.4). Platform admins, a Keycloak realm role,
-    appoint stewards. Each person's Polaris principal is created on first use (section 5).
-11. **Which groups own which folder roots and namespaces.** Platform admins assign top-level
-    ones; stewards of the owning groups delegate below them (4.4).
+    appoint stewards, which makes a group a tenant. Each person's personal group and Polaris
+    principal are created on first use (section 5).
 
 ## 8. What OPA decides
 
@@ -420,21 +427,21 @@ everyone but root.
 | Rule | Caller | Input | Decision |
 |---|---|---|---|
 | `visible` | governance, for its listing; gate, for a Polaris listing | candidate ids | which ids have a caller group in `describe`, or the caller may read (4.3) |
-| `vend` (read) | broker | dataset id | the caller may read it (4.3); allow, plus the entry's folder for the read session policy |
-| `vend_write` | broker | dataset id | the caller may write it (4.3); allow, plus the entry's folder for the write session policy |
-| `vend_delete` | broker | dataset id | a caller group in `delete`; allow, plus the entry's folder for the delete session policy |
+| `vend` (read) | broker | folder id, recursive or not | the caller may read it (4.3); allow, plus the entry's folder for the read session policy. Refused for a moved folder, one inside a published dataset, and recursively for one holding a published dataset, each with a refusal naming the way round to those it is otherwise open to |
+| `vend_write` | broker | folder id, recursive or not | the caller may write it (4.3); allow, plus the entry's folder for the write session policy, refused as `vend` is |
+| `vend_delete` | broker | folder id, recursive or not | a caller group in `delete`; allow, plus the entry's folder for the delete session policy, refused as `vend` is |
+| `allow_transfer` | broker, governance | old and new folder or table ids | the rules of 4.4 for moving |
 | `load` | gate, once Polaris has answered a table or view load | table id, kind, whether a credential was handed out, property keys | whether that credential can write; whether a load without one keeps every version; which properties it keeps (4.2) |
 | `derivations.allowed` | governance, for a declaration | target and the sources it marks unused | which may be marked unused: a direct read always, a detach by `detach` (4.3) |
 | `derivations.may_release`, `may_reattach` | governance | source ids | which sources' releases and putting back the caller decides: a caller group in the source's `manage` |
-| `allow_create` | gate, from the create-table request body | table id | an entry with that id exists, is `pending`, and a caller group is in its `write`; unregistered names are refused |
-| `allow_register` | governance | requested folder, whether the caller is a platform admin | the caller is a steward of a group owning a root above the folder, or a platform admin |
-| `allow_change` | governance | dataset id and the requested change | the rules of 4.4 |
+| `allow_create` | gate, from the create-table request body | table id | the caller may write the table it would be (4.3): `write` on its namespace, which the space gives its members |
+| `allow_publish` | governance | folder or namespace id, whether the caller is a platform admin | a steward of the group whose space holds it, or a platform admin |
+| `allow_change` | governance | dataset, folder or namespace id and the requested change | the rules of 4.4 |
 | `groups.allow_create` | governance | | the caller is signed in; governance checks the name |
 | `groups.allow_change` | governance | group name, the roles the change touches | the rules of 4.4 for each role |
 | `groups.allow_steward` | governance | group name | the caller is a platform admin |
-| `allow_change_root` | governance | folder root or namespace | the caller is a steward of a group owning it or one above it, or a platform admin |
 | Polaris: list namespaces, list tables, list views | Polaris | namespace | allowed for any authenticated person; the gate trims the response by `visible` |
-| Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group owns the namespace or one above it, or any table in it is visible to the caller |
+| Polaris: namespace exists, load namespace metadata | Polaris | namespace | a caller group holds `describe`, `read` or `write` on it or on a namespace under it |
 | Polaris: create table, create view, commit a staged create | Polaris | namespace | the caller may view the namespace; the gate has already decided per table with `allow_create`, since Polaris names only the namespace |
 | Polaris: table exists, view exists, load table or view metadata | Polaris | table id | group in `describe`, or the caller may read it |
 | Polaris: load with a read credential | Polaris | table id | the caller may read it (4.3); `write` implies `read` for tables |
@@ -442,18 +449,19 @@ everyone but root.
 | Polaris: update, commit table or view | Polaris | table id | the caller may write it |
 | Polaris: drop table or view, with or without purging its files | Polaris | table id | group in `delete` |
 | Polaris: rename table or view, register table, set table location | Polaris | | root only. Rename would orphan the entry's id; register and set-location would let a table alias another table's folder |
-| Polaris: create or drop namespace, update namespace properties | Polaris | namespace | a caller group owns the namespace or one above it |
+| Polaris: create namespace | Polaris | namespace | any authenticated person; the gate has decided with `write` on it |
+| Polaris: drop namespace, update namespace properties | Polaris | namespace | `delete` on it; `write` on it |
 | Polaris: admin operations | Polaris | | root only |
 
-Grant changes are decided while governance holds the dataset's row lock (4.4), so the
-decision and the write see the same entry.
+Grant changes are decided while governance holds the lock on what they change (4.4), so the
+decision and the write see the same grants.
 
 The gate trims a list response in three steps: fetch every upstream page, filter once, then
 paginate the result with its own page tokens, so page size and tokens reveal nothing about
 hidden entries. This is the order Gravitino's Iceberg REST list handler uses. The filter is
-one `visible` decision over the candidate ids. A namespace is visible to its root owners always, and to
-others when any table in it is visible to them; the gate trims namespace listings by that
-rule. Every denied operation that names a table or namespace is mapped to not-found,
+one `visible` decision over the candidate ids. A namespace is visible to those holding
+`describe`, `read` or `write` on it or on one under it, so a person granted a namespace deep in
+another group's space can reach it; the gate trims namespace listings by that rule. Every denied operation that names a table or namespace is mapped to not-found,
 including create and rename conflicts against names the caller cannot see. A table created
 with an explicit location is subject to Polaris's location confinement: the location must lie
 under the namespace's base location and must not overlap another table's. Polaris has feature
@@ -475,19 +483,21 @@ second copy that lags governance.
 
 ## 9. Lifecycle
 
-An entry exists only through registration. Status changes only in response to an event about
-that entry, and the event triggers a check of that one entry:
+A folder becomes an entry at the first credential anyone is given for it, read or write; a
+table at its creation. Status changes only in response to an event about that entry, and the
+event triggers a check of that one entry:
 
-- Registration creates `pending` and checks the folder once.
-- Files: a creation or deletion event under the folder, delivered by Ceph bucket
-  notifications, triggers a listing of that folder, which also records each file's time for
-  attributing it to its writers (`PROVENANCE.md` 6.2). Non-empty sets `live`; empty after
-  having been `live` sets `gone`. Events are coalesced per folder so a bulk upload costs one
-  check. An event under a table's folder triggers the same listing; a table's status comes
-  from the gate.
+- A folder's first credential checks it once.
+- Files: a creation or deletion event under a tracked folder, delivered by Ceph bucket
+  notifications, triggers a listing of every tracked folder the key falls under, which also
+  records each file's time for attributing it to its writers (`PROVENANCE.md` 6.2). Non-empty
+  sets `live`, empty sets `gone`. An event under a table's folder triggers the same listing; a
+  table's status comes from the gate.
 - Tables: the gate reports table creation, with its location, and table drop. Creation sets
-  `live`; drop sets `gone`. A drop report for an unknown id is logged and ignored; a create
-  for an unknown id cannot occur because the gate refuses it.
+  `live`, and a table created again after a drop is `live` again at its new folder; drop sets
+  `gone`.
+- A transfer sets the old entry `moved`, naming the new one, and the old entry stays `moved`
+  whatever storage or a drop later says.
 - There is no periodic sweep. Notifications are delivered through Ceph persistent topics with
   retry. A lost event leaves a stale status until the next event for that entry: a lost
   deletion leaves a `gone` dataset listed, a lost creation leaves a `live` dataset hidden
@@ -497,7 +507,8 @@ that entry, and the event triggers a check of that one entry:
   in the endpoint's request log. A forged event can only trigger a check, never set a status
   directly.
 
-Grants are independent of status. Listings show `live` entries only.
+Grants are independent of status, but for `moved`: a moved folder gets no credential, and a
+moved table is read and written only at its new id. Listings show `live` entries only.
 
 ## 10. Limitations by design
 
@@ -506,7 +517,7 @@ Grants are independent of status. Listings show `live` entries only.
   of a dataset is a separate dataset.
 - **A dataset is one unit, as a repository is.** Every file in a dataset's folder shares its
   grants and the sources its files carry, as every file in a GitHub or GitLab repository shares
-  the repository's permissions; no file has grants of its own. Roots and namespaces nest and
+  the repository's permissions; no file has grants of its own. Folders and namespaces nest and
   hold datasets, as GitLab groups and subgroups hold projects. A dataset is a published folder
   of files or a published namespace of tables; a single file or table is not published.
   Published datasets do not nest: a folder inside one is part of it, and one can sit among
@@ -525,25 +536,25 @@ Grants are independent of status. Listings show `live` entries only.
   candidate sources is complete; which of them were used is the writer's declaration, and
   data brought in from outside the platform is invisible to it (`PROVENANCE.md` 7, 8). Content
   is never checked.
-- **Registration reveals names within a tenant.** Registering an id that exists fails, so
-  co-owners of a root can learn each other's names. Accepted: they share a root.
+- **A space reveals names to its group.** Everyone in a group may list what its space holds
+  before it is published. Accepted: they share the space.
 - **The gate is a component you run** in front of a catalog you do not control. A Polaris
   release that changes list response shapes requires a gate change.
 
 ## 11. Enforced, decided, declared
 
-**Enforced by storage.** A credential opens one dataset's folder and nothing else. The
-session policy is built by Polaris or the broker after OPA's decision, from the registered
-folder, never by the client.
+**Enforced by storage.** A credential opens one folder, or the files directly in it, and
+nothing else. The session policy is built by Polaris or the broker after OPA's decision, from
+the entry's folder, never by the client.
 
-**Enforced by the gate.** What appears in a Polaris listing, and that a table is created only
-under a registered entry by someone in its `write`.
+**Enforced by the gate.** What appears in a Polaris listing, and that a table or namespace is
+created only by someone holding `write` on the namespace it goes in.
 
 **Enforced by governance.** Every credential is logged before the broker or the gate hands it
 out, so the candidate sources of anything written through the platform are complete.
 
-**Decided by OPA.** Every decision in section 8, including registration, changes to the
-grants and rule 3 (4.3), over the entry governance holds at the time of the decision.
+**Decided by OPA.** Every decision in section 8, including publishing, transfers, changes to
+the grants and rule 3 (4.3), over the entry governance holds at the time of the decision.
 
 **Declared and trusted.** Which candidates were used. Data from outside the platform. The
 content of any dataset.
@@ -555,42 +566,45 @@ callers send OPA only who is asking and the ids they name, and every rule fetche
 and entries it needs with `http.send`; table names are
 confidential, so `describe` is enforced per table and the gate trims listings; the engine may extend an active user's token by exchange, bounded by
 Keycloak's session maximum; the catalog lists both kinds; rename, register-table, and
-set-location are root-only; platform admins, a Keycloak realm role and not a group, assign
-top-level folder roots and namespaces and appoint stewards, and stewards of the owning groups
-delegate below them; `read` implies `describe`.
+set-location are root-only; every group has a space where its members write first and its
+stewards publish after; platform admins, a Keycloak realm role and not a group, appoint
+stewards; a table has no grants of its own; `read` implies `describe`.
 
 ## 13. Status against the repository
 
 Implemented today: the catalog with `describe`, `read`, `manage`, `write`, `delete` and
-`detach` for file datasets; the file listing; the dataset index as a per-person table,
-`governance.datasets`, listing both kinds; the broker, scoping read, write and delete
-credentials to the folder in OPA's decision; Polaris delegating to OPA with per-table
-credentials, viewing a table gated on `describe` or `read` and read-write credentials on
-`write`, drops on `delete`; registration by stewards of a group owning the root; OPA holding
-policy and no grants, every rule fetching what it needs from governance with `http.send`;
-Trino authenticating people by their Keycloak token over HTTPS and forwarding it to Polaris as
-the `token` extra credential; the gate as the only way to Polaris, verifying the token,
-trimming listings (every upstream page, one filter, its own page tokens), answering not-found
-for a refused name the person may not view, repeating a refused credentialed load without the
-credential request and cutting that load to the current version, refusing views that would run
-with their owner's rights, deciding table and namespace creation, and reporting table creates
-and drops; tables registered as entries with the same six grants by group; grant changes
-through governance, decided by OPA under the entry's row lock as in 4.4; groups with each
-person's role, stewards appointed by platform admins, and root ownership, in governance, changed
-through it as in 4.4 and read back through `GET /me`, `GET /groups/<name>`, `GET /datasets/<id>`
-and `GET /tables/<id>`; each person's Polaris
-principal created on first use; a login proxy that keeps a client session past the token's
-5-minute life by holding the refresh token and forwarding a fresh token to Trino; OPA
-reachable only by its callers; persistent storage events, each checking one folder, and no
-sweep. Derivation as in 4.3 (`PROVENANCE.md` sections 6 and 10): the access log and sessions,
-`governance.lineage`, declarations in `governance.derivations` or `POST /declarations`, sources
-carried per stored file, rule 3 in OPA for reading and writing files and tables, detaching and
-putting back, releases (`POST /releases`, `governance.releases`), and `governance.grants`.
+`detach`, and `revoked`, layered from published folders' own grants, folders' and namespaces'
+grants and each space's defaults; the file listing; the dataset index as a per-person table,
+`governance.datasets`, listing both kinds with whether each is published; the broker, scoping
+read, write and delete credentials to the folder in OPA's decision, recursively or to the
+files directly in it, and moving folders between spaces by server-side copy; Polaris delegating
+to OPA with per-table credentials, viewing a table gated on `describe` or `read` and read-write
+credentials on `write`, drops on `delete`; OPA holding policy and no grants, every rule fetching
+what it needs from governance with `http.send`; Trino authenticating people by their Keycloak
+token over HTTPS and forwarding it to Polaris as the `token` extra credential, with nested
+namespaces; the gate as the only way to Polaris, verifying the token, trimming listings (every
+upstream page, one filter, its own page tokens), answering not-found for a refused name the
+person may not view, repeating a refused credentialed load without the credential request and
+cutting that load to the current version, refusing views that would run with their owner's
+rights, deciding table and namespace creation on `write`, and reporting table creates and
+drops; groups with each person's role, stewards appointed by platform admins, and a space each,
+personal groups included; writing first and publishing after, by stewards, with published
+datasets never nesting; transfers into another group's space; grant changes through governance,
+decided by OPA under a lock as in 4.4; the read routes `GET /me`, `GET /groups/<name>`,
+`GET /datasets/<id>` and `GET /tables/<id>`; each person's Polaris principal created on first
+use; a login proxy that keeps a client session past the token's 5-minute life by holding the
+refresh token and forwarding a fresh token to Trino; OPA reachable only by its callers;
+persistent storage events, each checking the folders it falls under, and no sweep. Derivation
+as in 4.3 (`PROVENANCE.md` sections 6 and 10): the access log and sessions, switched by an
+insert into `governance.sessions` or `POST /sessions`, `governance.lineage`, declarations in
+`governance.derivations` or `POST /declarations`, sources carried per stored file and stored
+per entry until what they come from changes, rule 3 in OPA for reading and writing files and
+tables, the personal-space exemption and `revoked`, detaching and putting back, releases
+(`POST /releases`, `governance.releases`), and `governance.grants`.
 
 Differs from this document: tables are entries in their own registry, not in the catalog
-with files; a dataset is registered before anything is written in it rather than published
-afterwards, and a single table has grants of its own (section 10); there are no collections;
-events are checked as each delivery arrives rather than coalesced per folder.
+with files; there are no collections; events are checked as each delivery arrives rather than
+coalesced per folder.
 
 ## 14. Questions for the reviewer
 

@@ -67,20 +67,20 @@ files/blobs over S3) under the *same* governance model as tables.
  POLICY (control plane — decides, never touches bytes)
    governance (PAP)                          OPA (PDP)
    • Postgres-backed dataset and       ◄──   • rules only, no grants: vend / discover /
-     table registries, group membership        allow_register / allow_change (blobs),
+     table registries, group membership        allow_publish / allow_change (blobs),
      and grants (the only copy)                table lanes (view/read/write/delete/
-   • serves them to OPA (/internal/*)          create/change), group and root changes
+   • serves them to OPA (/internal/*)          create/change), group changes, transfers
    • serves the dataset index                • every rule fetches the groups and grants
    • keeps the registry fresh vs storage       it needs from governance, per decision
-   • accepts grant, group and root
-     ownership changes (asks OPA)
+   • accepts publishing, grant and group
+     changes (asks OPA)
 
  ENFORCEMENT (PEPs — ask POLICY, then act)
    TABLES                                    BLOBS / FILES
    Trino ─► Polaris (Iceberg REST)           client ─► broker (verifies the user's
      loadTable: Authorizer ─► OPA                       OWN token) ─► OPA (allow?)
      on allow, mint per-table STS                       on allow, AssumeRole with a
-     scoped to the table's files                        session policy = the dataset prefix
+     scoped to the table's files                        session policy = the folder
 
  DATA PLANE (bytes — STS-scoped, no OPA in this path)
    Ceph RGW (S3 + STS) enforces the vended credential; engine/client reads directly.
@@ -93,11 +93,11 @@ files/blobs over S3) under the *same* governance model as tables.
 | **Keycloak** | OIDC IdP and the only token issuer — users (`alice`/`bob`/`carol`) and the `trino` client: users log in through it, and its service account (`service-account-trino`, granted nothing) is Trino's identity for its own catalog calls. |
 | **Trino** | Query engine. Its JWT authenticator validates the user's Keycloak token; its Iceberg connector sends the token the user attached as the extra credential `token` to Polaris as the bearer. |
 | **login-proxy** | In front of Trino so a client session outlives the 5-minute token. Speaks Trino's external-authentication (browser OAuth2) protocol to the client and holds the person's refresh token; forwards a fresh access token on every request as the bearer and the `token` extra credential. Trino is unchanged but for `http-server.process-forwarded=true`, so its nextUris point back at the proxy. |
-| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, accepts governed ingest, table registration, and grant, group, steward and root ownership changes, answers the read routes (`GET /me`, `/groups/<name>`, `/datasets/<id>`, `/tables/<id>`), records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `lineage`, `derivations`), accepts declarations as commits to `governance.derivations` and signs them, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
+| **governance** | PAP + dataset and table registries, Postgres-backed. Holds group membership and the only copy of every grant, serves them to OPA (`/internal/*`), serves the dataset index, keeps the registry fresh, makes a folder an entry at its first credential, accepts publishing and grant, group and steward changes, records transfers, answers the read routes (`GET /me`, `/groups/<name>`, `/datasets/<id>`, `/tables/<id>`), records the table lifecycle the gate reports, keeps the access log and each login's session pointer (`PROVENANCE.md`), builds and serves each person's tables in the `governance` namespace (`datasets`, `sessions`, `lineage`, `derivations`), accepts declarations as commits to `governance.derivations` and signs them, and creates each person's Polaris principal on first use. Holds only a least-privilege RGW reader. |
 | **OPA** | The PDP, reachable only by its callers. Loads only the rules from `opa/`: `policy.rego` (Polaris's checks), `tables.rego` (who may view a table or namespace, shared by Polaris's checks and the gate), `blob.rego` (blobs), `groups.rego` (group administration), and `governance.rego`, the one fetch every rule uses to get groups and grants from governance. |
 | **gate** | The only way to Polaris. Verifies the caller's token; trims listings to what the caller may view (`tables.rego`), paging the result with its own tokens; turns a refusal for a name the caller may not view into not-found; repeats a table load Polaris refused once without the credential request, so a person who may view a table but not read it gets its metadata, cut to the current version without counts unless OPA's `tables.load` allows the rest, and cuts a view's responses the same way for someone who may only describe it; refuses a view that would run with its owner's rights; decides table and namespace creation, which Polaris authorizes against the parent only; reports table creates and drops to governance; has governance log each table credential it passes on and each table write it forwards, refusing the request when the log fails; has governance create a person's Polaris principal before their first request; answers for the `governance` namespace's tables itself. Holds no permissions; Polaris and OPA decide everything it forwards. |
 | **Polaris** | Iceberg REST catalog. Validates Keycloak tokens (audience `polaris`); its Authorizer delegates every operation to OPA; vends per-table STS. Holds identities, no rules. |
-| **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named dataset, `AssumeRole`s a credential scoped to the prefix in OPA's decision: `blob-vendor` to read (get, list), `blob-writer` to write (put, delete, no get), `blob-deleter` to delete (list, delete, no get or put), and has governance log it before returning it. No engine in the byte path. |
+| **broker** | Blob vending bridge: verifies the client's own token, asks OPA about the named folder, `AssumeRole`s a credential scoped to the prefix in OPA's decision, the whole folder or with `"recursive": false` the files directly in it: `blob-vendor` to read (get, list), `blob-writer` to write (put, delete, no get), `blob-deleter` to delete (list, delete, no get or put), and has governance log it before returning it. Moves a folder into another group's space by server-side copy under `blob-mover` (`POST /transfers`). No engine in the byte path. |
 | **Ceph RGW** | Object store + native STS + bucket notifications. Enforces the vended credential. |
 | **Postgres** | Polaris metastore and the durable `governance` registry database. |
 | **rgw-setup** (one-shot) | Admin-credentialed startup step: sets the bucket policy granting the governance reader `ListBucket` on `datasets/*`, and wires bucket notifications — so the long-lived governance service never holds the admin key. |
@@ -122,11 +122,12 @@ files/blobs over S3) under the *same* governance model as tables.
    the credential on; when the log fails, the load is refused.
 5. Trino reads X's files from RGW directly — no OPA, no broker on the byte path.
 
-**Flow C — read a blob dataset** — lazy, per-dataset, true end-to-end.
-1. Client presents its **own** Keycloak token to the broker, naming dataset X.
+**Flow C — read a blob dataset** — lazy, per-folder, true end-to-end.
+1. Client presents its **own** Keycloak token to the broker, naming folder X.
 2. The broker cryptographically verifies the token → subject + groups.
-3. The broker asks OPA: may this subject read X? OPA fetches X's entry from governance and
-   returns allow plus X's registered prefix. An unknown X gets the same 403 as a denied one.
+3. The broker asks OPA: may this subject read X? OPA fetches X's entry from governance, or the
+   entry X would be if no credential has named it yet, and returns allow plus X's folder. An
+   unknown X gets the same 403 as a denied one.
 4. On allow, the broker `AssumeRole`s with an inline session policy scoped to that prefix
    (narrowing a broad role; the client can't widen it).
 5. The broker has governance log the credential against the person's current session, then
@@ -143,14 +144,18 @@ decision.
 
 ```
 rule            caller      input                              fetches                      result
-vend            broker      {subject, dataset: id}             POST /internal/datasets      {allow, prefix}
-vend_write      broker      {subject, dataset: id}             POST /internal/datasets      {allow, prefix}
-vend_delete     broker      {subject, dataset: id}             POST /internal/datasets      {allow, prefix}
+vend            broker      {subject, dataset: id,             POST /internal/datasets      {allow, prefix} or
+                             recursive}                                                       {allow: false, recursive_refused
+vend_write      broker      as vend                            POST /internal/datasets       | moved_to}
+vend_delete     broker      as vend                            POST /internal/datasets
 discover        governance  {subject, datasets: [id]}          POST /internal/datasets      {visible: [id], readable: [id]}
-allow_register  governance  {subject, prefix,                  GET /internal/register-grants  true | false
+allow_publish   governance  {subject, dataset: id,             POST /internal/datasets      true | false
                              platform_admin}
-allow_change    governance  {subject, dataset: id,             POST /internal/datasets,     true | false
-                             grants: [grant], platform_admin}    GET /internal/register-grants
+allow_change    governance  {subject, dataset: id,             POST /internal/datasets      true | false
+                             grants: [grant], platform_admin}
+allow_change_folder  governance  {subject, folder: id,         POST /internal/folders       true | false
+                                  grants: [grant], platform_admin}
+allow_transfer  broker      {subject, from: id, to: id}        POST /internal/datasets      true | false
 blocking        governance  {subject, dataset: id}             POST /internal/datasets      [id]: sources refusing the subject
 effective_read  governance  {dataset: id,                      POST /internal/datasets      [name]: names in read all of whose
                              holders: {name: [name]}}                                         holders pass every source
@@ -160,11 +165,13 @@ tables.decide   gate,       {subject, tables: [id],            POST /internal/ta
                 governance   namespaces: [id]}                   POST /internal/namespaces     readable: [id]}
 tables.allow_create     gate        {subject, id}              GET /internal/tables/<id>    true | false
 tables.allow_namespace  gate        {subject, id}              POST /internal/namespaces    true | false
-tables.allow_register   governance  {subject, id,              POST /internal/namespaces    true | false
+tables.allow_publish    governance  {subject, id,              POST /internal/namespaces    true | false
                                      platform_admin}
-tables.allow_change     governance  {subject, id,              GET /internal/tables/<id>,   true | false
-                                     grants: [grant],            POST /internal/namespaces
+tables.allow_change     governance  {subject, id (namespace),  POST /internal/namespaces    true | false
+                                     grants: [grant],
                                      platform_admin}
+tables.allow_transfer   governance  {subject, from: id,        GET /internal/tables/<id>    true | false
+                                     to: id}
 tables.blocking, tables.effective_read   as blocking and effective_read, for a table id
 tables.allow_write      governance  {subject, id}              GET /internal/tables/<id>    true | false
 tables.load             gate        {subject, id, credential,  GET /internal/tables/<id>,   {write, history,
@@ -179,36 +186,39 @@ groups.allow_change     governance  {subject, group, roles,    —              
 groups.allow_steward, allow_delete, allow_view
                         governance  {subject, group,           —                            true | false
                                      platform_admin}
-allow_change_root       governance  {subject, prefix,          GET /internal/register-grants  true | false
-                                     platform_admin}
-tables.allow_change_root  governance  {subject, id,            POST /internal/namespaces    true | false
-                                       platform_admin}
 ```
 
-Every rule also fetches `GET /internal/groups/<subject>`, except the shipped `tables.load` on a load without a credential, which fetches nothing. It returns the names the person holds grants through, `<g>` for each group and `<g>#member`, `<g>#admin`, `<g>#owner` and `<g>#steward` for their role in it and those below it, in two lists: every name, which `describe`, `read` and a source's `read` are checked against, and the names of the groups they are more than a viewer in, which every other grant is checked against (`governance.holder`). `platform_admin` is whether the caller's verified token carries the Keycloak realm role `platform-admin`; it passes every check a steward or a group's owner passes.
+Every rule also fetches `GET /internal/groups/<subject>`, except the shipped `tables.load` on a load without a credential, which fetches nothing. It returns the names the person holds grants through, `<g>` for each group and `<g>#member`, `<g>#admin`, `<g>#owner` and `<g>#steward` for their role in it and those below it, in two lists: every name, which `describe`, `read` and a source's `read` are checked against, and the names of the groups they are more than a viewer in, which every other grant is checked against (`governance.holder`), and the person's personal space. `platform_admin` is whether the caller's verified token carries the Keycloak realm role `platform-admin`; it passes every check a steward or a group's owner passes.
+
+An entry's grants are layers (`docs/HANDOFF-2026-10-22-groups.md` sections 1 to 3): a published
+folder's own, every folder's or namespace's above it, and its space's defaults; a table has none
+of its own. Governance serves their union, and answers for a folder no credential has named yet
+as for an entry, so its first credential is decided like any other.
 
 One path for every caller because it is the only one Polaris can use: Polaris builds its own
 input and cannot attach an entry. Each decision makes at most one fetch; a failed fetch
 denies. Measured: a one-table `SELECT` makes one governance read, a denied one two (Polaris
 retries a denied write-credential load as a read-credential load), and a vend request one. Governance builds every candidate list and OPA says which candidates pass.
 Entries carry the registry's grants, cut down by the sources the dataset's files carry
-(`PROVENANCE.md` 6), so a file written or removed can change who may read a dataset; a
-dataset's status never changes a decision.
+(`PROVENANCE.md` 6), so a file written or removed can change who may read a dataset. Status
+decides nothing but listing, except `moved`: a moved folder gets no credential, and a moved
+table is read and written only at its new id.
 
 ## 6. Non-tabular data & registry freshness
 
 Table catalogs have a registry by construction; raw blobs do not. Discovery splits in two:
 
-- **"What can I access right now?"** — easy: the subject's grant set (prefix roots), which
-  governance holds. List *within* a granted prefix via a scoped credential.
+- **"What can I access right now?"** — easy: the folders the subject's grants reach, which
+  governance holds. List *within* a granted folder via a scoped credential.
 - **"What exists that I could request?"** — hard: it can't come from grants (you have none
   yet) or scoped listing (you can't list it). It needs a **registry whose entries' existence
   and description are visible independent of data access** — the metadata-visibility plane.
   This is what catalogs give tables for free and nothing gives blobs, so **the registry is
   the core of this project.**
 
-The registry (`governance`) holds, per dataset: `prefix, description, steward`, and the two
-grant sets `describe` / `access`.
+The registry (`governance`) holds, per folder written into: its prefix, whether it is
+published, a published dataset's description, publisher and grants of its own, and its status;
+beside them the grants on folders and namespaces, and each group's space.
 
 ### Freshness
 
@@ -216,34 +226,39 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 
 - **Two truths, reconciled not merged.** Storage is truth for *existence*; the registry is
   truth for *meaning/grants*. A `datasets` row carries both, written by disjoint paths —
-  meaning/grants by ingest+seed, `status` by `reconcile()` only.
-- **Lifecycle `pending → live → gone`.** `reconcile()` lists a dataset's prefix, at most one
-  object, and sets `status`: non-empty → `live`; emptied-after-being-live → `gone`; a
-  never-populated dataset stays `pending`. The dataset index lists only `live` datasets.
+  meaning/grants by publishing, grant changes and the seed, `status` by `reconcile()` only.
+- **Status `live`, `gone`, `moved`.** `reconcile()` lists a folder and sets `status`: non-empty
+  → `live`, empty → `gone`; a folder moved into another group's space stays `moved`. The
+  dataset index lists only `live` entries.
 - **Events are the only trigger, and they are persistent.** RGW notifies governance of each
-  object created or deleted under `datasets/`; governance checks the dataset the key falls
-  under. The topic is persistent (`rgw_setup.py`): RGW queues each event in RADOS and retries
-  it, with no expiry or retry limit by default, until governance answers 2xx, and governance
-  answers 503 when a check fails, so an event is never dropped for governance being down or
-  storage being slow. There is no periodic sweep. Events carry no authority — they only
-  trigger a check, which reads storage itself, so a forged event can only cause a check.
-  Registration, and the first seed, check a new dataset's folder once.
-- **Register-at-ingest** brings *new* datasets in: a steward uploads objects, then registers
-  the dataset with its meaning (prefix, description, grants — only a human can supply these;
-  its id derives from the prefix). There is no auto-discovery of datasets from raw storage: a
-  dataset's boundary and meaning are human, not derivable from objects.
+  object created or deleted under `datasets/`; governance checks every tracked folder the key
+  falls under. The topic is persistent (`rgw_setup.py`): RGW queues each event in RADOS and
+  retries it, with no expiry or retry limit by default, until governance answers 2xx, and
+  governance answers 503 when a check fails, so an event is never dropped for governance being
+  down or storage being slow. There is no periodic sweep. Events carry no authority — they only
+  trigger a check, which reads storage itself, so a forged event can only cause a check. A
+  folder's first credential, and the first seed, check it once.
+- **Write, then publish** (`docs/HANDOFF-2026-10-22-groups.md` section 3). Members write into
+  their group's space with no step first; the first credential for a folder makes it an entry.
+  A steward then publishes it with its meaning (description and grants — only a human can
+  supply these; its id is its path under `datasets/`). There is no auto-discovery of datasets
+  from raw storage: a dataset's boundary and meaning are human, not derivable from objects.
+  Published datasets do not nest.
 
 ## 7. Credential vending
 
 - **Lazy, per-resource, STS.** Tables: Polaris vends on `loadTable`, scoped to the table's
-  files. Blobs: the broker vends on dataset-open, scoped to the dataset prefix.
+  files. Blobs: the broker vends on folder-open, scoped to the folder, recursively unless the
+  request says `"recursive": false`, when the credential gets and puts `<folder>*` but not
+  `<folder>*/*` and lists one level. A folder with a published dataset under it opens only that
+  way, so no credential reaches into a published dataset but its own.
 - **Why a broker is unavoidable for blobs:** OPA's yes/no must be *bound into a credential the
   client cannot forge*. Only a trusted server-side step can do that. The broker holds no
   policy logic — it is a token → OPA → `AssumeRole` bridge.
 - **A session policy can only narrow.** The role the broker assumes permits a superset (the
-  whole `datasets/` area); the per-request session policy narrows it to one dataset's prefix.
+  whole `datasets/` area); the per-request session policy narrows it to one folder.
   Safe because only the broker builds the session policy, and it builds it from a prefix
-  confined at registration.
+  governance confines (`datasets/<...>/`, no traversal).
 - **Scope in the STS role + session policy, not bucket policy** — RGW bucket policies don't
   support username interpolation (`${aws:username}`).
 
@@ -251,24 +266,24 @@ A registry beside storage drifts, so it is reconciled against storage continuous
 
 - **One policy brain, deny-by-default.** Nothing is granted that OPA didn't allow, across
   both planes. Tables (`policy.rego`), all by group: `root` / read-credential vend (`read` or
-  `write`) / viewing a table (`describe`, `read` or `write`) / viewing a namespace (its owners, or
-  any grant on a table under it) / catalog listings (anyone; the gate trims them to what the
-  two view lanes allow) / creating (the gate decides the name: a registered, pending table
-  with the person in its `write`, or a namespace under one their group owns) / writes and
-  read-write credentials (`write`) / dropping a table or view (`delete`) / dropping a
-  namespace (members and above of a group owning it) — anything unnamed, including rename,
-  register and set-location, is
-  root-only. Polaris is on a
+  `write`) / viewing a table (`describe`, `read` or `write`) / viewing a namespace
+  (`describe`, `read` or `write` on it or on one under it) / catalog listings (anyone; the gate
+  trims them to what the two view lanes allow) / creating (the gate decides the name: `write`
+  on the namespace a table or namespace goes in) / writes and read-write credentials (`write`)
+  / dropping a table or view (`delete`) / dropping a namespace (`delete`), changing its
+  properties (`write`) — anything unnamed, including rename, register and set-location, is
+  root-only. A table's grants are its namespaces' and its space's. Polaris is on a
   network only the gate and its setup jobs share, so every client call passes the gate. Blobs (`blob.rego`): `vend` (read) / `vend_write`
-  (write) / `visible` (describe or read) / `allow_register` (ingest), all by group. Governance holds group membership; tokens
-  carry no groups.
-- **Grant changes are decided like access.** `PATCH /permissions/<dataset|table>/<id>` adds
-  or removes groups from an entry's grants. OPA's `allow_change` decides it while
-  governance holds the entry's row lock, so the entry OPA fetches is the one the write
-  replaces: `describe` and `read` change only for a group holding the entry's `manage`;
-  `manage`, `write`, `delete` and `detach` only for a steward of a group owning the root (the
-  prefix root or namespace registration checks), or a platform admin. An unknown id is refused
-  exactly as a denied change.
+  (write) / `visible` (describe or read) / `allow_publish` (a steward of the space's group) /
+  `allow_transfer`, all by group. Governance holds group membership; tokens carry no groups.
+- **Grant changes are decided like access.** `PATCH /permissions/<dataset|folder|namespace>/<id>`
+  adds or removes groups from a published dataset's, a folder's or a namespace's grants.
+  OPA's `allow_change` (`allow_change_folder` for a folder) decides it while governance holds a
+  lock on what it changes, so the grants OPA fetches are the ones the write replaces:
+  `describe` and `read` change only for a group holding its `manage`; `manage`, `write`,
+  `delete`, `detach` and `revoked` only for a steward of the group whose space holds it, or a
+  platform admin. Nothing in a personal space is granted or published, by anyone. An unknown
+  or unpublished dataset is refused exactly as a denied change.
 - **Groups have roles** (`docs/HANDOFF-2026-10-22-groups.md` section 1). Each person in a group
   (`group_members`) is its owner, admin, member or viewer, and a member or above can be its
   steward. Anyone signed in creates a group (`POST /groups`) and becomes its owner; the name
@@ -279,8 +294,9 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   `DELETE /groups/<name>/stewards/<person>`). Governance refuses a change that leaves a group
   without an owner or a steward a viewer, and refuses to create a group under a name any grant
   or ownership already uses, alone or with a role: a dangling grant to that name would
-  otherwise pass to the new group's owner. `DELETE /groups/<name>` is refused while the group
-  owns a root.
+  otherwise pass to the new group's owner, and one whose space has entries. `DELETE
+  /groups/<name>` is refused while the group's space holds data. A personal group, `u_<user>`,
+  is made at the person's first appearance and has them alone.
 - **The dataset index is built per person, on demand.** The gate answers a catalog load of
   `governance.datasets` by calling governance's `POST /index/load` with the person's token.
   Governance computes that person's rows (live datasets from `discover`, live tables from
@@ -302,22 +318,23 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   `ceph`, `localhost` and `127.0.0.1` too, because RGW reads an unlisted host name as a
   bucket name.
 - **The index's work follows what a person may see.** Governance offers OPA only the live
-  entries whose viewing grants name one of the person's groups (GIN indexes on
-  `describe || access` and `describe || read || write`), which are exactly the grants OPA's
-  viewing rules test, so the narrowing drops only entries OPA would refuse and OPA still
-  decides each candidate. Measured at 50,000 live datasets with 5,003 visible to alice: a load
-  took 2.39 s offering OPA every entry and 0.25 s narrowed. `seed/check-index-narrowing.py`
+  entries some layer of whose viewing grants names one of the person's groups: entries in the
+  spaces of their groups, datasets whose own `describe` or `read` names them, and entries under
+  a folder or namespace whose grants do. Those are the grants OPA's viewing rules test, so the
+  narrowing drops only entries OPA would refuse and OPA still decides each candidate. Measured
+  at 50,000 live datasets with 5,003 visible to alice, before spaces: a load took 2.39 s
+  offering OPA every entry and 0.25 s narrowed; not measured since. `seed/check-index-narrowing.py`
   compares the narrowed rows with OPA's decision over every entry for every person in a group;
   a rule that makes an entry visible by anything other than those grants must change the
   narrowing query too. The gate's table listings still grow with the whole catalog.
-- **Root ownership delegates downward.** A group owning a prefix root (`register_grants`) or
-  a namespace (`namespace_owners`) owns everything under it. `PATCH /roots/<dataset|namespace>/<id>`
-  changes one root's owners, decided by `allow_change_root` (`blob.rego`, `tables.rego`): a
-  steward of a group owning that root or one above it, or a platform admin, who assigns
-  top-level roots (`datasets/<name>/`, `<catalog>.<namespace>`). Changes take one advisory lock, so the
-  ownership OPA reads is the ownership the write replaces. Because an owner of a root owns
-  every root below it, a delegated subtree can always be taken back from above, and nothing
-  tracks who delegated what.
+- **Spaces, publishing and transfers** (`docs/HANDOFF-2026-10-22-groups.md` sections 1 to 3).
+  Each group's space is `datasets/<group>/` and `<catalog>.<group>`; its defaults give the group
+  `describe` and `read`, its members `write`, its admins `delete`, its stewards `manage`.
+  Publishing (`PATCH /datasets/<id>`, `PATCH /namespaces/<id>`) holds one advisory lock, so two
+  published datasets never nest. A transfer moves a folder from a personal or plain group's
+  space into another group's, at a path that is empty, unpublished and holds nothing published;
+  the broker copies exactly the files governance listed, each while its ETag matches, so a file
+  written meanwhile is never copied without what it carries.
 - **Real, end-to-end identity.** Every decision is made on the user's own Keycloak token.
   Tables: Trino authenticates the token and relays it to Polaris unchanged; Trino's username
   is the token's `principal_name`, and Trino's default access control refuses impersonation,
@@ -410,10 +427,10 @@ A registry beside storage drifts, so it is reconciled against storage continuous
   `polaris-catalog` and the broker as `blob-broker`, each able only to assume its vending
   role, and governance holds a read-only RGW reader (`ListBucket` on `datasets/*`, via a
   bucket policy). Admin-only RGW setup runs in the `rgw-setup` one-shot.
-- **Governed ingest is scoped.** The caller must be a steward of a group owning a root above
-  the prefix (per-group ownership in OPA). Prefixes are confined
-  to `datasets/<...>/` with no traversal, and the overlap-check + insert are serialized (an
-  advisory lock) so two registrations can't claim overlapping prefixes.
+- **Publishing is scoped.** The caller must be a steward of the group whose space holds the
+  folder or namespace. Prefixes are confined
+  to `datasets/<...>/` with no traversal, and the overlap check and the publish are serialized
+  (an advisory lock) so two published datasets can't nest.
 
 ## 9. Prior art
 
@@ -467,7 +484,7 @@ reference (the sections above are current-state).
   dedicated `governance` database (created idempotently at runtime by a bootstrap one-shot —
   there are no init scripts and the volume persists across `down`). Reconcile's status
   transition is a single atomic `UPDATE` under a row lock (no read-modify-write race between
-  concurrent events and register); the seed and register paths use advisory locks.
+  concurrent events); the seed and publishing use advisory locks.
 - **RGW notifications on this image.** Ceph 20.2.1 supports them, but the image's `ceph.conf`
   narrows the enabled APIs and drops `notifications`; the entrypoint re-adds it. Topics are
   created via the SNS/S3 API (boto3) — `radosgw-admin` has no `topic create`.
@@ -514,8 +531,6 @@ reference (the sections above are current-state).
   table without a credential and Trino stops there. A refused create's first line is Trino's
   own ("Failed to create transaction", "Failed to create namespace"); the gate's reason is
   the error's cause, which the CLI prints with `--debug`.
-- `manage` carries only its change right, since derived datasets (its release right) are
-  not built.
 - A person who may describe a table but not read it still sees, in the cut metadata, the
   current version's write time and sequence number and the metadata file's name, whose
   leading number counts the table's commits. Kept for now (2026-10-23).

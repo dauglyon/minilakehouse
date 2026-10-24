@@ -1,7 +1,7 @@
 # Provenance transactions: server-bounded inputs, attested use
 
 Every build step in section 10 is implemented.
-Section 10 lists what was run against the stack on 2026-10-22 and what each run showed. The
+Section 10 lists what was run against the stack from 2026-10-22 on and what each run showed. The
 document extends `WHITEPAPER.md`; its derivation rule, sources that travel with the stored data
 (section 6), replaced the whitepaper's earlier rule over a list of `inputs` per dataset, and
 `WHITEPAPER.md` 4.3 now summarizes it.
@@ -199,7 +199,7 @@ column. An insert names the four columns it fills; governance fills in the other
 |---|---|
 | `source` | a candidate's id, or a hash of an input from outside the platform |
 | `source_type` | `table`, `files`, or `external`; may be left out for a candidate |
-| `target` | id of a pending dataset the caller may write |
+| `target` | id of a dataset the caller wrote and may write |
 | `used` | boolean |
 | `declared_by` | the person who declared, filled in by governance |
 | `declared_at` | when, filled in by governance |
@@ -239,8 +239,8 @@ brought in, so declaring can only widen who may read.
 
 ### 5.4 Examples
 
-All examples assume `lineage` pairs `lakehouse.db.joined` with `lakehouse.db.t1` (table),
-`projx/public` (files) and `lakehouse.db.weather` (table).
+All examples assume `lineage` pairs `lakehouse.jgi.joined` with `lakehouse.jgi.t1` (table),
+`jgi/public` (files) and `lakehouse.jgi.weather` (table).
 
 Start or resume a session:
 
@@ -252,7 +252,7 @@ The candidates:
 
 ```sql
 SELECT source, source_type, session FROM governance.lineage
-WHERE target = 'lakehouse.db.joined';
+WHERE target = 'lakehouse.jgi.joined';
 ```
 
 Everything was used:
@@ -260,49 +260,49 @@ Everything was used:
 ```sql
 INSERT INTO governance.derivations (source, source_type, target, used)
 SELECT DISTINCT source, source_type, target, true
-FROM governance.lineage WHERE target = 'lakehouse.db.joined';
+FROM governance.lineage WHERE target = 'lakehouse.jgi.joined';
 ```
 
 One dataset was not used:
 
 ```sql
 INSERT INTO governance.derivations (source, source_type, target, used)
-SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
-FROM governance.lineage WHERE target = 'lakehouse.db.joined';
+SELECT DISTINCT source, source_type, target, source <> 'lakehouse.jgi.weather'
+FROM governance.lineage WHERE target = 'lakehouse.jgi.joined';
 ```
 
 The same, plus a file from a collaborator:
 
 ```sql
 INSERT INTO governance.derivations (source, source_type, target, used)
-SELECT DISTINCT source, source_type, target, source <> 'lakehouse.db.weather'
-FROM governance.lineage WHERE target = 'lakehouse.db.joined'
+SELECT DISTINCT source, source_type, target, source <> 'lakehouse.jgi.weather'
+FROM governance.lineage WHERE target = 'lakehouse.jgi.joined'
 UNION ALL
-VALUES ('sha256:9f3c…', 'external', 'lakehouse.db.joined', true);
+VALUES ('sha256:9f3c…', 'external', 'lakehouse.jgi.joined', true);
 ```
 
 Refused:
 
 ```
-Query failed: Failed to commit: lakehouse.db.joined: not declared: projx/public, lakehouse.db.weather
-Query failed: Failed to commit: lakehouse.db.other: not a pending dataset in your write grant
+Query failed: Failed to commit: lakehouse.jgi.joined: not declared: jgi/public, lakehouse.jgi.weather
+Query failed: Failed to commit: lakehouse.jgi.other: you have not written it
 ```
 
 Looking back:
 
 ```sql
 SELECT source, source_type, used FROM governance.derivations
-WHERE target = 'lakehouse.db.joined';
+WHERE target = 'lakehouse.jgi.joined';
 ```
 
-Cleaning (section 6.4). `lakehouse.db.joined`'s files carry `lakehouse.db.weather`,
+Cleaning (section 6.4). `lakehouse.jgi.joined`'s files carry `lakehouse.jgi.weather`,
 and its rows from `weather` have been deleted, the files rewritten, and old versions removed.
 The rewrite read `joined`, which brought in `joined` and, through it, `weather`:
 
 ```sql
 INSERT INTO governance.derivations (source, source_type, target, used) VALUES
-  ('lakehouse.db.joined',  'table', 'lakehouse.db.joined', true),   -- read directly
-  ('lakehouse.db.weather', 'table', 'lakehouse.db.joined', false);  -- arrived through it; dropped
+  ('lakehouse.jgi.joined',  'table', 'lakehouse.jgi.joined', true),   -- read directly
+  ('lakehouse.jgi.weather', 'table', 'lakehouse.jgi.joined', false);  -- arrived through it; dropped
 ```
 
 ### 5.5 How an INSERT becomes the call
@@ -480,7 +480,7 @@ a record, not by approval each time.
   detached by anyone who wrote the data while the source's `detach` is empty, and by its
   members once the source's owners fill it. A deployment tightens this by editing the rule,
   with no change to governance: strict everywhere, only a `curators` group, never for sources
-  under a given root, or the declarer also holding `manage` on the target.
+  in a given space, or the declarer also holding `manage` on the target.
 - **Recorded and visible.** A detach is stored with its declarer and signed, as every
   declaration is, and everyone holding `manage` on the source sees, in
   `governance.derivations`, every declaration by anyone that detaches it, including the
@@ -502,17 +502,18 @@ authority is delegated for classified documents.
 
 ### 6.6 Lifecycle of an output
 
-Decided 2026-10-22: a write needs no declaration, and status does not wait for one.
+Decided 2026-10-22: a write needs no declaration, and status does not wait for one. Built so,
+with writing first and publishing after (`docs/HANDOFF-2026-10-22-groups.md` section 3):
 
-- Registered `pending`, created as today: the gate admits a create for a registered pending
-  table whose caller is in its `write`; a file dataset gets a write credential on `write`.
-- `live` when it exists, as before: a table once the gate reports its creation, a file
-  dataset once its folder holds a file. Listed under its `describe` grant, which no source
-  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot
-  read its sources.
+- Written into a group's space with nothing first: a folder becomes an entry at its first
+  credential, a table at its creation, by anyone holding `write` there.
+- `live` when it exists: a table once the gate reports its creation, a folder once it holds a
+  file. Listed to those holding its `read` until a steward publishes it, then also under its
+  `describe` grant, which no source cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be
+  listed for people who cannot read its sources.
 - Readable under rule 3 from its first write: until each writer declares, everything that
   writer brought in limits who may read it, so declaring is how a writer widens its readers.
-- Rejected: holding an output `pending` until every writer has declared. Status decides only
+- Rejected: holding an output back until every writer has declared. Status decides only
   listing, so it would have hidden the dataset from the index and nothing more; making it
   decide reads too would add a step to every write, where rule 3 already limits who may read
   everything that could be in it.
@@ -577,8 +578,8 @@ Extending `WHITEPAPER.md` section 11:
 platform: no credential without a record. Until declared, everything on that list limits who
 may read the output. A declaration covers the list exactly.
 
-**Decided by OPA.** Registration, grants and vends as before, and section 6's rule 3, from
-the sources governance reports with each dataset.
+**Decided by OPA.** Publishing, grants, transfers and vends as before, and section 6's rule 3,
+from the sources governance reports with each dataset.
 
 **Declared and trusted.** Which candidates were used. External inputs. The content of any
 dataset.
@@ -621,43 +622,55 @@ dataset.
 - **Every write and read now calls governance.** A governance outage already denies every
   read; it now also denies every write.
 
-## 9. Open
+## 9. Spaces
 
-**Scratch.** Scratch is any folder in a space that is not published
-(`docs/HANDOFF-2026-10-22-groups.md` sections 1 and 3), in a person's personal space or in a
-group's. Section 6 applies to scratch files like any other: a scratch file carries what its
-writer had read, and reading it brings that in, which closes the path from one session to
-another through scratch. Work in scratch becomes a dataset when a steward publishes its folder or
-namespace in a tenant's space, where it was written or after a transfer into it; publishing
-copies nothing. Published datasets do not nest, and no credential for a folder reaches into a
-published dataset under it (the handoff's section 3): otherwise the folder's write credential
-would reach the dataset's files, and a person who read the folder and then wrote the dataset
-would make the whole folder a source of it. Each folder written into is an entry of its own, so
-what follows applies folder by folder.
+Decided 2026-10-23 and 2026-10-24 and built (`docs/HANDOFF-2026-10-22-groups.md` sections 1 to
+3, `docs/PLAN-2026-10-24.md` item 3).
 
-**Personal spaces.** Decided 2026-10-23 and 2026-10-24. Each person has a group with themselves
-as its only member, which owns their personal space (the handoff's section 1; its name in a UI
-is not settled, "My Data" is a candidate). Nothing in it is published or granted to anyone
-else; the person shares a folder or table by transferring it to a group or a tenant (the
-handoff's section 1).
+**Scratch.** Scratch is any folder in a space that is not published, in a person's personal
+space or in a group's. Section 6 applies to scratch files like any other: a scratch file
+carries what its writer had read, and reading it brings that in, which closes the path from one
+session to another through scratch. Work in scratch becomes a dataset when a steward publishes
+its folder or namespace in a tenant's space, where it was written or after a transfer into it;
+publishing copies nothing. Published datasets do not nest, and no credential for a folder
+reaches into a published dataset under it: otherwise the folder's write credential would reach
+the dataset's files, and a person who read the folder and then wrote the dataset would make the
+whole folder a source of it. Each folder written into is an entry of its own, and folders nest
+until one is published, so a file carries what every write credential whose folder holds it
+brought in, whichever folder the credential was asked for; a credential for the files directly
+in a folder covers only those.
+
+**Personal spaces.** Each person has a group of their own, `u_<user>`, made at their first
+appearance with them its only owner and member, which owns their personal space. Nothing in it
+is published or granted to anyone else; the person shares a folder or table by transferring
+it to a group or a tenant.
 
 - The person's own reads and writes in their personal space are not cut by rule 3. They could
   read every source their files carry when they wrote them; losing `read` on a source later
   leaves them their own copies, as a download would. A transfer ends this for what it moves:
   in its new space rule 3 applies to them as to everyone.
 - A source's stewards can take a person's own copies back. Each source has `revoked`, a set of
-  groups; for anyone in one of them the exemption does not apply to anything carrying that
-  source, personal space included. One person is named through their group of one. Additions
-  are recorded with who made them and when, shown to the source's `manage` holders, and
-  reversible, as detaches are (6.5). Credentials already handed out last until they expire,
-  and files the person downloaded are out of reach (section 8).
-- The exemption is a rule in OPA. A deployment that wants losing `read` on a source to reach
-  every copy derived from it, as Palantir Foundry's markings do, turns it off.
+  groups beside its grants; for anyone in one of them the exemption does not apply to anything
+  carrying that source, personal space included. One person is named through their personal
+  group. Additions are recorded with who made them and when, shown to the source's `manage`
+  holders, and reversible. Credentials already handed out last until they expire, and files
+  the person downloaded are out of reach (section 8).
+- The exemption is a rule in OPA (`opa/tables.rego`, `sources_ok`). A deployment that wants
+  losing `read` on a source to reach every copy derived from it, as Palantir Foundry's markings
+  do, drops its second clause.
 
 **Group spaces.** A member who may not read a source another member's files carry is cut from
-the folders holding those files, and from no other folder in the space.
+the folders holding those files, and from no other folder in the space. A declaration marking a
+folder or table of a space unused is shown to its `manage` holders and to the space's admins,
+since a plain group's space has no `manage` holders.
 
-
+**Transfers.** A folder moved into another group's space is copied server-side by the broker,
+the copies logged as written in a session of the transfer's own after a read of the old folder,
+so each copy carries everything the old folder carried; the broker copies only the files
+governance listed when the transfer began. A table is copied by its mover with `CREATE TABLE …
+AS SELECT`, which carries what the mover's session read. The old entry stays `moved` to the new
+one, and governance looks a moved source up as the entry it moved to, so data built from the
+old folder or table is checked against the new one's grants.
 
 ## 10. Evidence and build order
 
@@ -784,6 +797,18 @@ attribution (4.2).
     `governance.sessions` showed none of hers. Through Trino, `INSERT INTO
     iceberg.governance.sessions (name) VALUES ('trino-check')` was accepted, and alice's next
     login, a new `sid`, started on `trino-check`, her most recently used session.
+18. Spaces, run on the stack 2026-10-24 (`seed/check-credentials.py`, `check-personal.py`,
+    `check-transfers.py`, `check-stored-sources.py`). bob read `top/sub` and then wrote a file
+    directly in `top` with a credential for the files directly in it: that file carried
+    `top/sub`, and `top/sub`, which the credential did not cover, carried nothing. alice's copies
+    of a projw folder, in jgi's space and in her personal space, closed and stayed open
+    respectively when jgi lost `read` on the source, and her own closed once projw's steward
+    added `u_alice` to its `revoked`. A personal folder moved into a group kept its sources, and
+    a report in the group built from the old folder opened to the group's members; the same for
+    a table moved by `CREATE TABLE … AS SELECT` and a recorded transfer. Every stored row of
+    sources matched what was worked out from scratch. Two runs of the checks first failed on
+    reads less than two seconds after a write, which count toward it (section 8): the checks
+    now wait out the slack.
 10. What a delete leaves in a table. A test table with rows `keep` and `secret`, then
     `DELETE … WHERE note = 'secret'`: the current version's data file still held both rows
     (`$files`: one data file of 2 records, one file marking 1 row deleted), both versions
