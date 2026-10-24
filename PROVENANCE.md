@@ -481,6 +481,23 @@ sources needs as many approvals. Authority given ahead of time is how Palantir F
 markings, whose administrators choose who may remove them, and how declassification
 authority is delegated for classified documents.
 
+### 6.6 Lifecycle of an output
+
+Decided 2026-10-22: a write needs no declaration, and status does not wait for one.
+
+- Registered `pending`, created as today: the gate admits a create for a registered pending
+  table whose caller is in its `write`; a file dataset gets a write credential on `write`.
+- `live` when it exists, as before: a table once the gate reports its creation, a file
+  dataset once its folder holds a file. Listed under its `describe` grant, which no source
+  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot see
+  its inputs.
+- Readable under rule 3 from its first write: until each writer declares, everything that
+  writer brought in limits who may read it, so declaring is how a writer widens its readers.
+- Rejected: holding an output `pending` until every writer has declared. Status decides only
+  listing, so it would have hidden the dataset from the index and nothing more; making it
+  decide reads too would add a step to every write, where rule 3 already limits who may read
+  everything that could be in it.
+
 ### 6.7 Releasing a dataset past a source
 
 Decided 2026-10-23. A release lets a group read a dataset built from a source although the
@@ -511,23 +528,6 @@ permission. A release is the second half of `share` (`WHITEPAPER.md` 4.2).
   and when, shown to the source's `share` holders, and withdrawn by any of them; withdrawal
   reaches the target and what was built from it at the next decision. A release stays when
   its approver later loses `share` on the source.
-
-### 6.6 Lifecycle of an output
-
-Decided 2026-10-22: a write needs no declaration, and status does not wait for one.
-
-- Registered `pending`, created as today: the gate admits a create for a registered pending
-  table whose caller is in its `write`; a file dataset gets a write credential on `write`.
-- `live` when it exists, as before: a table once the gate reports its creation, a file
-  dataset once its folder holds a file. Listed under its `describe` grant, which no source
-  cuts down, as `WHITEPAPER.md` 4.3 lets a derived dataset be listed for people who cannot see
-  its inputs.
-- Readable under rule 3 from its first write: until each writer declares, everything that
-  writer brought in limits who may read it, so declaring is how a writer widens its readers.
-- Rejected: holding an output `pending` until every writer has declared. Status decides only
-  listing, so it would have hidden the dataset from the index and nothing more; making it
-  decide reads too would add a step to every write, where rule 3 already limits who may read
-  everything that could be in it.
 
 ## 7. What this enforces, decides, declares
 
