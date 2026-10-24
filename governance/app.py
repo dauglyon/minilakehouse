@@ -1379,7 +1379,21 @@ def internal_transfers():
     #     entry is moved to the new one and the write ends now; refused, and the broker removes its
     #     copies, if the broker's credential has expired or a dataset in or around either folder
     #     was published meanwhile.
+    #   abort {transfer}: the broker stopped and removed its copies. The transfer and its session's
+    #     read and write end now, so the folders may be published again and nothing written to the
+    #     destination later is taken for a copy.
     body = request.get_json(silent=True) or {}
+    if body.get("phase") == "abort":
+        with db(commit=True) as cur:
+            cur.execute("UPDATE transfers SET expires = LEAST(expires, now()) WHERE id = %s AND kind = 'files' "
+                        "AND done_at IS NULL RETURNING from_id, to_id, session", (body.get("transfer"),))
+            t = cur.fetchone()
+            if t is None:
+                return jsonify({"error": "no such transfer under way"}), 404
+            cur.execute("UPDATE accesses SET expires = LEAST(expires, now()) WHERE session = %s", (t["session"],))
+            _invalidate(cur, [t["from_id"], t["to_id"]])
+        app.logger.info("TRANSFER abort %s -> %s", t["from_id"], t["to_id"])
+        return jsonify({"ok": True})
     if body.get("phase") == "done":
         with db(commit=True) as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (PUBLISH_LOCK_KEY,))

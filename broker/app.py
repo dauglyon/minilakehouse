@@ -255,7 +255,7 @@ def transfer():
     # copied without its sources; it deletes the originals once all are copied, and has governance
     # record the old entry as moved to the new one before deleting the originals. A failure before
     # that leaves the old folder whole: a changed file, or governance refusing to record the move,
-    # removes the copies made so far.
+    # removes the copies made so far, and governance is told the move stopped.
     claims, err = authed_user()
     if err:
         return err
@@ -279,6 +279,7 @@ def transfer():
                                "Condition": {"StringLike": {"s3:prefix": [f"{old}*"]}}},
                               {"Effect": "Allow", "Action": ["s3:PutObject", "s3:DeleteObject"],
                                "Resource": [f"arn:aws:s3:::{BUCKET}/{new}*"]}]}))["Credentials"]
+    begun = {}
     try:
         status, begun = _internal("/internal/transfers", {
             "phase": "begin", "person": subject, "sub": claims.get("sub") or "", "sid": claims.get("sid") or "",
@@ -297,17 +298,26 @@ def transfer():
         except ClientError as e:
             for k in copied:
                 s3.delete_object(Bucket=BUCKET, Key=k)
+            _internal("/internal/transfers", {"phase": "abort", "transfer": begun["transfer"]})
             app.logger.info("transfer %s -> %s stopped, a file changed: %s", src, dst, e)
             return jsonify({"error": f"{src} changed during the move; nothing was moved"}), 409
         status, done = _internal("/internal/transfers", {"phase": "done", "transfer": begun["transfer"]})
         if status != 200:
             for k in copied:
                 s3.delete_object(Bucket=BUCKET, Key=k)
+            _internal("/internal/transfers", {"phase": "abort", "transfer": begun["transfer"]})
             app.logger.info("transfer %s -> %s not recorded, copies removed: %s", src, dst, done)
             return jsonify({"error": done.get("error", "the move was not recorded; nothing was moved")}), 409
         for k in keys:
             s3.delete_object(Bucket=BUCKET, Key=k)
     except (requests.RequestException, boto3.exceptions.Boto3Error, ClientError) as e:
+        # Copies may be left at the destination; ending the transfer keeps governance from
+        # counting anything written there later as one.
+        if "transfer" in begun:
+            try:
+                _internal("/internal/transfers", {"phase": "abort", "transfer": begun["transfer"]})
+            except requests.RequestException:
+                pass
         app.logger.warning("transfer %s -> %s failed: %s", src, dst, e)
         return jsonify({"error": "transfer failed"}), 503
     app.logger.info("TRANSFER subject=%s from=%s to=%s objects=%d", subject, src, dst, len(keys))
