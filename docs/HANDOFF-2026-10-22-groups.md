@@ -93,7 +93,9 @@ Governance has no `GET` routes. Add, each narrowed by the same predicates as the
   `group-admins`.
 - `GET /groups/<name>` → members with roles, roots owned. Visible to members.
 - `GET /datasets/<id>`, `GET /tables/<id>` → the entry with declared grants, effective `read`
-  after provenance narrowing, status. Visible if `describe` passes.
+  after provenance narrowing, status. Visible if `describe` passes. For a caller who may
+  describe it but not read it, why (decided 2026-10-23): the carried sources they may not read,
+  each named only if they may describe it, and any release of it to them that was withdrawn.
 - `GET /roots/<kind>/<id>` → owning groups and immediate children. Visible to an admin of an
   owning group or one above.
 
@@ -184,10 +186,14 @@ enumeration is added.
 - Tables created later under a namespace inherit at once (Snowflake's "future grants" for free).
 - Provenance narrowing applies to effective `read`: a namespace grant does not let a group read
   a table derived from sources it may not read.
+- A group's root and namespace give its members `describe` and its admins `delete` by default
+  (decided 2026-10-23). Sources narrow neither, so a dataset in a group space that rule 3 has
+  closed, for instance after a release is withdrawn (`PROVENANCE.md` 6.7), stays listed for the
+  group's members and removable by its admins.
 
 ### Later, same shape
 - Blobs: `root_grants` on `datasets/<root>/`, unioned into `/internal/datasets` the same way.
-  Not needed for the first UI.
+  Needed for the default `describe` and `delete` above on a group's file datasets.
 
 ## Decided
 - Inheritance is computed by governance when serving the entry, not by rego fetching parents
